@@ -116,4 +116,61 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
 
 
 
+def loss_geo_smooth(xyz, obj_feat, k=5, normal_tau=0.5, weight_lambda=5.0, max_points=200000, sample_size=800):
+    """
+    :param xyz: Tensor of shape (N, 3) representing the 3D coordinates of the points.
+    :param obj_feat: Tensor of shape (N, D) representing the features of the
+    :param k: Number of nearest neighbors to consider.
+    :param normal_tau: Threshold for normal similarity.
+    :param max_points: Maximum number of points for downsampling. If the number of points exceeds this, they are randomly downsampled.
+    :param sample_size: Number of points to randomly sample for computing the loss.
+    """
+    N = xyz.size(0)
 
+    # Randomly sample points for which we'll compute the loss
+    if N > sample_size:
+        indices = torch.randperm(N)[:sample_size]
+        xyz_sub = xyz[indices]
+        feat_sub = obj_feat[indices]
+    else:
+        indices = None
+        xyz_sub = xyz
+        feat_sub = obj_feat
+    
+    M = xyz_sub.size(0) 
+
+    # [M, N]
+    dist = torch.cdist(xyz_sub, xyz)
+    
+    if indices is not None:
+        dist[torch.arange(M, device=xyz.device), indices] = 1e10
+    else:
+        eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
+        dist[:, :M][eye_mask] = 1e10
+
+    # [M, k]
+    _, neighbor_indices_tensor = dist.topk(k, largest=False)
+
+    normals_all = estimate_normals_knn()
+    normals_sub = normals_all if indices is not None else normals_all[indices]
+    normals_neighbor = normals_all[neighbor_indices_tensor]
+
+    feat_knn = obj_feat[neighbor_indices_tensor]
+
+    # [M, k]
+    normal_sim = torch.abs(torch.sum(normals_sub.unsqueeze(1) * normals_neighbor, dim=-1))
+
+    gate_mask = (normal_sim > normal_tau).float()
+
+    weights = torch.exp(-weight_lambda * (1 - normal_sim)) * gate_mask
+
+    feat_diff = feat_obj - feat_knn
+
+    feat_diff2 = torch.sum(feat_diff ** 2, dim=-1)
+
+    loss = (weights * feat_diff2).sum() / (weights.sum() + 1e-8)
+
+    return loss
+
+def estimate_normals_knn(xyz, k=10):
+    
