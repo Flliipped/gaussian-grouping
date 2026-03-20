@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+data/
+output/
+
+build/
+dist/
+*.egg-info/
+
+submodules/**/build/
+submodules/**/*.egg-info/
