@@ -151,7 +151,7 @@ def loss_geo_smooth(xyz, obj_feat, k=5, normal_tau=0.5, weight_lambda=5.0, max_p
     # [M, k]
     _, neighbor_indices_tensor = dist.topk(k, largest=False)
 
-    normals_all = estimate_normals_knn()
+    normals_all = estimate_normals_knn(xyz, k=k)
     normals_sub = normals_all if indices is not None else normals_all[indices]
     normals_neighbor = normals_all[neighbor_indices_tensor]
 
@@ -164,13 +164,49 @@ def loss_geo_smooth(xyz, obj_feat, k=5, normal_tau=0.5, weight_lambda=5.0, max_p
 
     weights = torch.exp(-weight_lambda * (1 - normal_sim)) * gate_mask
 
-    feat_diff = feat_obj - feat_knn
+    feat_diff = feat_sub.unsqueeze(1) - feat_knn
 
     feat_diff2 = torch.sum(feat_diff ** 2, dim=-1)
 
     loss = (weights * feat_diff2).sum() / (weights.sum() + 1e-8)
 
-    return loss
-
-def estimate_normals_knn(xyz, k=10):
+    gate_ratio = gate_mask.mean()
+    avg_normal_sim = normal_sim.mean()
     
+    print("xyz in geo:", xyz.shape)
+    print("obj_feat in geo:", obj_feat.shape)
+
+    return loss, gate_ratio, avg_normal_sim
+
+def estimate_normals_knn(xyz, k=10, eps=1e-8):
+    """
+    xyz: [N, 3]
+    return: 
+        normals:[N, 3]
+    """
+    N = xyz.size(0)
+    dist = torch.cdist(xyz, xyz)
+    
+    eye_mask = torch.eye(N, device=xyz.device, dtype=torch.bool)
+    dist[eye_mask] = 1e10
+    # [N, k]
+    knn_idx = dist.topk(k, largest=False).indices
+    # [N, k, 3]
+    knn_xyz = xyz[knn_idx]
+    # [N, 1, 3]
+    center = xyz.unsqueeze(1)
+    # [N, k, 3]
+    local = knn_xyz - center
+    # 协方差[N, 3, 3]
+    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)
+
+    #对每个点做特征分解
+    # [N, 3, 3]
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+
+    normals = eigvecs[:, :, 0] # [N, 3]
+
+    normals = F.normalize(normals, dim=-1)
+
+
+    return normals
