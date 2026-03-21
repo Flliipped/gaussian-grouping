@@ -48,13 +48,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):     
-        
+    for iteration in range(first_iter, opt.iterations + 1):
         if iteration == 1:
             print("xyz:", gaussians._xyz.shape)
             print("objects_dc:", gaussians._objects_dc.shape)
-            print("image:", image.shape)   
-
+    #        print("image:", image.shape)
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -108,20 +106,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj
-
+            
         loss_geo = torch.tensor(0.0, device=image.device)
+
         if iteration > opt.geo_start_iter and iteration % opt.geo_interval == 0:
             xyz = gaussians._xyz.squeeze()
             obj_feat = gaussians._objects_dc.squeeze(1)
-            
-            loss_geo, gate_ratio, avg_normal_sim = loss_geo_smooth(xyz.detach(), obj_feat, opt.geo_knn_k, opt.geo_normal_tau, opt.geo_weight_lambda, opt.geo_sample_size)
+
+            loss_geo, gate_ratio, avg_plane_residual = loss_geo_smooth(
+                xyz=xyz.detach(),
+                obj_feat=obj_feat,
+                k=opt.geo_knn_k,
+                plane_tau=opt.geo_plane_tau,
+                weight_lambda=opt.geo_weight_lambda,
+                sample_size=opt.geo_sample_size
+            )
+
             if iteration % 100 == 0:
                 print(
-                    f"[Iter {iteration}] loss_geo={loss_geo.item():.6f}, "
-                    f"gate_ratio={gate_ratio:.4f}, avg_normal_sim={avg_normal_sim:.4f}"
+                    f"[Iter {iteration}] "
+                    f"loss_geo={loss_geo.item():.6f}, "
+                    f"gate_ratio={gate_ratio:.4f}, "
+                    f"avg_plane_residual={avg_plane_residual:.6f}"
                 )
-        loss = loss + opt.lambda_geo * loss_geo
 
+        loss = loss + opt.lambda_geo * loss_geo
+        
         loss.backward()
         iter_end.record()
 
@@ -257,12 +267,14 @@ if __name__ == "__main__":
     args.reg3d_lambda_val = config.get("reg3d_lambda_val", 2)
     args.reg3d_max_points = config.get("reg3d_max_points", 300000)
     args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
-    args.geo_start_iter = config.get("geo_start_iter", 4000)
-    args.geo_knn_k = 16
-    args.geo_normal_tau = 0.8
-    args.geo_weight_lambda = 5.0
-    args.geo_sample_size = 4096
-    args.lambda_geo = 0.05
+    
+    args.geo_start_iter = config.get("geo_start_iter", 7000)
+    args.geo_interval = config.get("geo_interval", 10)
+    args.geo_knn_k = config.get("geo_knn_k", 8)
+    args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
+    args.geo_weight_lambda = config.get("geo_weight_lambda", 5.0)
+    args.geo_sample_size = config.get("geo_sample_size", 800)
+    args.lambda_geo = config.get("lambda_geo", 0.005)
 
     print("Optimizing " + args.model_path)
 

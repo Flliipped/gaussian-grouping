@@ -114,99 +114,68 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
 
     return lambda_val * normalized_loss
 
+import torch
+import torch.nn.functional as F
 
-
-def loss_geo_smooth(xyz, obj_feat, k=5, normal_tau=0.5, weight_lambda=5.0, max_points=200000, sample_size=800):
+def loss_geo_smooth(xyz, obj_feat, k=8, plane_tau=0.01, weight_lambda=5.0, sample_size=800, eps=1e-8):
     """
-    :param xyz: Tensor of shape (N, 3) representing the 3D coordinates of the points.
-    :param obj_feat: Tensor of shape (N, D) representing the features of the
-    :param k: Number of nearest neighbors to consider.
-    :param normal_tau: Threshold for normal similarity.
-    :param max_points: Maximum number of points for downsampling. If the number of points exceeds this, they are randomly downsampled.
-    :param sample_size: Number of points to randomly sample for computing the loss.
+    xyz: [N, 3]
+    obj_feat: [N, D]
     """
     N = xyz.size(0)
+    k = min(k, max(1, N - 1))
 
-    # Randomly sample points for which we'll compute the loss
+    # 随机采样中心点
     if N > sample_size:
-        indices = torch.randperm(N)[:sample_size]
-        xyz_sub = xyz[indices]
-        feat_sub = obj_feat[indices]
+        indices = torch.randperm(N, device=xyz.device)[:sample_size]
+        xyz_sub = xyz[indices]         # [M, 3]
+        feat_sub = obj_feat[indices]   # [M, D]
     else:
         indices = None
         xyz_sub = xyz
         feat_sub = obj_feat
-    
-    M = xyz_sub.size(0) 
+
+    M = xyz_sub.size(0)
 
     # [M, N]
     dist = torch.cdist(xyz_sub, xyz)
-    
+
+    # 排除自己
     if indices is not None:
         dist[torch.arange(M, device=xyz.device), indices] = 1e10
     else:
         eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
-        dist[:, :M][eye_mask] = 1e10
+        dist[eye_mask] = 1e10
 
     # [M, k]
-    _, neighbor_indices_tensor = dist.topk(k, largest=False)
+    neighbor_indices_tensor = dist.topk(k, largest=False).indices
 
-    normals_all = estimate_normals_knn(xyz, k=k)
-    normals_sub = normals_all if indices is not None else normals_all[indices]
-    normals_neighbor = normals_all[neighbor_indices_tensor]
+    # 邻域坐标和特征
+    knn_xyz = xyz[neighbor_indices_tensor]          # [M, k, 3]
+    feat_knn = obj_feat[neighbor_indices_tensor]    # [M, k, D]
 
-    feat_knn = obj_feat[neighbor_indices_tensor]
+    # 局部坐标
+    local = knn_xyz - xyz_sub.unsqueeze(1)          # [M, k, 3]
 
-    # [M, k]
-    normal_sim = torch.abs(torch.sum(normals_sub.unsqueeze(1) * normals_neighbor, dim=-1))
+    # 直接用这批邻域做 PCA 法线
+    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)   # [M, 3, 3]
+    _, eigvecs = torch.linalg.eigh(cov)
+    normals_sub = F.normalize(eigvecs[:, :, 0], dim=-1)            # [M, 3]
 
-    gate_mask = (normal_sim > normal_tau).float()
+    # 点到中心点切平面的距离
+    plane_residual = torch.abs(
+        torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
+    )   # [M, k]
 
-    weights = torch.exp(-weight_lambda * (1 - normal_sim)) * gate_mask
+    gate_mask = (plane_residual < plane_tau).float()
+    weights = torch.exp(-weight_lambda * plane_residual) * gate_mask
 
     feat_diff = feat_sub.unsqueeze(1) - feat_knn
+    feat_dist2 = torch.sum(feat_diff ** 2, dim=-1)
 
-    feat_diff2 = torch.sum(feat_diff ** 2, dim=-1)
+    loss = (weights * feat_dist2).sum() / (weights.sum() + eps)
 
-    loss = (weights * feat_diff2).sum() / (weights.sum() + 1e-8)
+    gate_ratio = gate_mask.mean().item()
+    avg_plane_residual = plane_residual.mean().item()
 
-    gate_ratio = gate_mask.mean()
-    avg_normal_sim = normal_sim.mean()
-    
-    print("xyz in geo:", xyz.shape)
-    print("obj_feat in geo:", obj_feat.shape)
-
-    return loss, gate_ratio, avg_normal_sim
-
-def estimate_normals_knn(xyz, k=10, eps=1e-8):
-    """
-    xyz: [N, 3]
-    return: 
-        normals:[N, 3]
-    """
-    N = xyz.size(0)
-    dist = torch.cdist(xyz, xyz)
-    
-    eye_mask = torch.eye(N, device=xyz.device, dtype=torch.bool)
-    dist[eye_mask] = 1e10
-    # [N, k]
-    knn_idx = dist.topk(k, largest=False).indices
-    # [N, k, 3]
-    knn_xyz = xyz[knn_idx]
-    # [N, 1, 3]
-    center = xyz.unsqueeze(1)
-    # [N, k, 3]
-    local = knn_xyz - center
-    # 协方差[N, 3, 3]
-    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)
-
-    #对每个点做特征分解
-    # [N, 3, 3]
-    eigvals, eigvecs = torch.linalg.eigh(cov)
-
-    normals = eigvecs[:, :, 0] # [N, 3]
-
-    normals = F.normalize(normals, dim=-1)
-
-
-    return normals
+    return loss, gate_ratio, avg_plane_residual
