@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 import cv2
 
-from ext.grounded_sam import grouned_sam_output, load_model_hf, select_obj_ioa
+from ext.grounded_sam import grouned_sam_output, load_model_hf, select_obj_ioa, load_model_local
 from segment_anything import sam_model_registry, SamPredictor
 
 from render import feature_to_rgb, visualize_obj
@@ -99,10 +99,14 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         # grounding-dino
         # Use this command for evaluate the Grounding DINO model
         # Or you can download the model by yourself
-        ckpt_repo_id = "ShilongLiu/GroundingDINO"
-        ckpt_filenmae = "groundingdino_swinb_cogcoor.pth"
-        ckpt_config_filename = "GroundingDINO_SwinB.cfg.py"
-        groundingdino_model = load_model_hf(ckpt_repo_id, ckpt_filenmae, ckpt_config_filename)
+        config_path = os.path.join("weights", "GroundingDINO_SwinB.cfg.py")
+        checkpoint_path = os.path.join("weights", "groundingdino_swinb_cogcoor.pth")
+
+        groundingdino_model = load_model_local(
+            config_path=config_path,
+            checkpoint_path=checkpoint_path,
+            device="cuda"
+        )
 
         # sam-hq
         sam_checkpoint = 'Tracking-Anything-with-DEVA/saves/sam_vit_h_4b8939.pth'

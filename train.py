@@ -106,7 +106,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj
-            
+        
         loss_geo = torch.tensor(0.0, device=image.device)
 
         if iteration > opt.geo_start_iter and iteration % opt.geo_interval == 0:

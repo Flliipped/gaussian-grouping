@@ -39,6 +39,25 @@ def load_model_hf(repo_id, filename, ckpt_config_filename, device='cpu'):
     _ = model.eval()
     return model   
 
+
+def load_model_local(config_path, checkpoint_path, device='cuda'):
+    assert os.path.exists(config_path), f"Config not found: {config_path}"
+    assert os.path.exists(checkpoint_path), f"Checkpoint not found: {checkpoint_path}"
+
+    args = SLConfig.fromfile(config_path)
+    args.device = device
+
+    model = build_model(args)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+    log = model.load_state_dict(clean_state_dict(state_dict), strict=False)
+
+    print(f"Model loaded from {checkpoint_path}\n => {log}")
+    model = model.to(device)
+    model.eval()
+    return model
+
 def show_mask(mask, image, random_color=True):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.8])], axis=0)

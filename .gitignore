@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.pth
 
 data/
 output/
@@ -10,3 +11,36 @@ dist/
 
 submodules/**/build/
 submodules/**/*.egg-info/
+
+# outputs
+output/
+result/
+experiments/
+
+# weights / checkpoints
+weights/
+Tracking-Anything-with-DEVA/saves/
+
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# build / cache
+build/
+dist/
+__pycache__/
+*.pyc
+*.so
+*.o
+
+# GroundingDINO build artifacts
+Tracking-Anything-with-DEVA/Grounded-Segment-Anything/GroundingDINO/build/
+
+# notebook / media cache
+.ipynb_checkpoints/
+
+# optional large media
+media/*.gif
+media/*.mp4

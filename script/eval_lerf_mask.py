@@ -6,9 +6,9 @@ import sys
 
 dataset_name = sys.argv[1]
 
-gt_folder_path = os.path.join('data/lerf_mask',dataset_name,'test_mask')
+gt_folder_path = os.path.join('data/lerf',dataset_name,'test_mask')
 # You can change pred_folder_path to your output
-pred_folder_path = os.path.join('result/lerf_mask',dataset_name)
+pred_folder_path = os.path.join('output', 'lerf', 'ramen_loss_geo', 'test', 'ours_30000_text', 'test_mask')
 
 # General util function to get the boundary of a binary mask.
 # https://gist.github.com/bowenc0221/71f7a02afee92646ca05efeeb14d687d
