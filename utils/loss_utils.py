@@ -179,3 +179,112 @@ def loss_geo_smooth(xyz, obj_feat, k=8, plane_tau=0.01, weight_lambda=5.0, sampl
     avg_plane_residual = plane_residual.mean().item()
 
     return loss, gate_ratio, avg_plane_residual
+
+def loss_geo_contrastive_v2(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smooth_weight_lambda=5.0, margin=1.0, sample_size=800, con_weight=0.1, neg_cap=2,eps=1e-8):
+    N = xyz.size(0)
+    k = min(k, max(1, N-1))
+
+    # 随机采样中心点
+    if N > sample_size:
+        indices = torch.randperm(N, device=xyz.device)[:sample_size]
+        xyz_sub = xyz[indices]
+        feat_sub = obj_feat[indices]
+        label_sub = obj_label[indices]
+    else:
+        indices = None
+        xyz_sub = xyz
+        feat_sub = obj_feat
+        label_sub = obj_label
+    
+    M = xyz_sub.size(0)
+
+    # 2.knn
+    dist =  torch.cdist(xyz_sub, xyz) # [M, N]
+
+    if indices is not None:
+        dist[torch.arange(M, device=xyz.device), indices] = 1e10
+    else:
+        eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
+        dist[eye_mask] = 1e10
+
+    neighbor_idx = dist.topk(k, largest=False).indices # [M, k]
+
+    knn_xyz = xyz[neighbor_idx]          # [M, k, 3]
+    feat_knn = obj_feat[neighbor_idx]    # [M, k, D]
+    label_knn = obj_label[neighbor_idx]  # [M, k]
+
+    # 3. 用同一批邻域估中心点法线
+    local = knn_xyz - xyz_sub.unsqueeze(1)          # [M, k, 3]
+    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)   # [M, 3, 3]
+    _, eigvecs = torch.linalg.eigh(cov)
+    normals_sub = F.normalize(eigvecs[:, :, 0], dim=-1)           # [M, 3]
+
+    # 4.几何门控：邻居点到中心点切平面的残差
+    plane_residual = torch.abs(
+        torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
+    ) # [M, k]
+
+    gate_mask = plane_residual < plane_tau
+
+    # 5.当前类别一致性
+    same_label = label_knn == label_sub.unsqueeze(1) # [M, k]
+    
+    # -------------------
+    # A.已验证有效的smooth主项
+    # -------------------
+    smooth_weights = torch.exp(-smooth_weight_lambda * plane_residual) * gate_mask.float()
+
+    feat_diff_raw = feat_sub.unsqueeze(1) - feat_knn
+    feat_dist2_raw = torch.sum(feat_diff_raw ** 2, dim=-1)  # [M, k]
+
+    loss_smooth = (smooth_weights * feat_dist2_raw).sum() / (smooth_weights.sum() + eps)
+    
+    # -------------------
+    # B.保守的contrastive辅项
+    # -------------------
+
+    # 正样本：几何连续 + 类别一致
+    pos_mask = gate_mask & same_label
+    
+    # 负样本：几何不连续 + 类别不一致
+    neg_mask = (~gate_mask) & (~same_label)
+
+    # 每个anchor最多保留neg_cap个负样本，防止负样本过强
+    if neg_cap is not None and neg_cap >0:
+        neg_mask_limited = torch.zeros_like(neg_mask)
+        for i in range(M):
+            neg_idx_i = torch.nonzero(neg_mask[i], as_tuple=False).squeeze(-1)
+            if neg_idx_i.numel()>0:
+                if neg_idx_i.numel() > neg_cap:
+                    perm = torch.randperm(neg_idx_i.numel(), device=xyz.device)[:neg_cap]
+                    neg_idx_i = neg_idx_i[perm]
+                neg_mask_limited[i, neg_idx_i] = True
+        neg_mask = neg_mask_limited
+
+    # 6.归一化feature，用平方L2做contrastive
+    feat_sub_n = F.normalize(feat_sub, dim=-1)
+    feat_knn_n = F.normalize(feat_knn, dim=-1)
+
+    feat_diff_n = feat_sub_n.unsqueeze(1) - feat_knn_n
+    feat_dist2_n = torch.sum(feat_diff_n ** 2, dim=-1)
+
+    # 7. 正样本：拉近
+    pos_weight = torch.exp(-smooth_weight_lambda * plane_residual) * pos_mask.float()
+    loss_pos = (pos_weight * feat_dist2_n).sum() / (pos_weight.sum() + eps)
+
+    # 8. 负样本：推远
+    # 只对少量保守负样本做推远，距离至少大于margin
+    neg_hinge = F.relu(margin - feat_dist2_n)
+    loss_neg = (neg_hinge * neg_mask.float()).sum() / (neg_mask.float().sum() + eps)
+
+    loss_con = loss_pos + loss_neg
+
+    # 总loss:smooth为主，contrastive为辅
+    loss_total = loss_smooth + con_weight * loss_con
+
+    pos_ratio = pos_mask.float().mean().item()
+    neg_ratio = neg_mask.float().mean().item()
+    gate_ratio = gate_mask.float().mean().item()
+    avg_plane_residual = plane_residual.mean().item()
+
+    return loss_total, loss_smooth.item(), loss_con.item(), pos_ratio, neg_ratio, gate_ratio, avg_plane_residual

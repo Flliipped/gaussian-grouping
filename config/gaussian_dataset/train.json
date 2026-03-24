@@ -1,5 +1,5 @@
 {
-    "densify_until_iter": 10000 ,
+    "densify_until_iter": 10000,
     "num_classes": 256,
     "reg3d_interval": 5,
     "reg3d_k": 5,
@@ -7,11 +7,16 @@
     "reg3d_max_points": 200000,
     "reg3d_sample_size": 1000,
 
-    "geo_start_iter": 7000,
+    "geo_start_iter": 10000,
     "geo_interval": 10,
     "geo_knn_k": 8,
     "geo_plane_tau": 0.01,
     "geo_weight_lambda": 5.0,
     "geo_sample_size": 800,
-    "lambda_geo": 0.005
+    "lambda_geo": 0.002,
+
+    "geo_con_weight": 0.1,
+    "geo_neg_cap": 2,
+    "geo_margin": 1.0
+
 }

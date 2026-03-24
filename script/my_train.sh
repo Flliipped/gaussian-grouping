@@ -75,6 +75,7 @@ train_cmd=(
     -r "${scale}"
     -m "${model_path}"
     --config_file config/gaussian_dataset/train.json
+    --train_split
 )
 
 if [ "${use_eval}" = true ]; then
