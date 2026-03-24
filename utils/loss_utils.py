@@ -288,3 +288,103 @@ def loss_geo_contrastive_v2(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smoot
     avg_plane_residual = plane_residual.mean().item()
 
     return loss_total, loss_smooth.item(), loss_con.item(), pos_ratio, neg_ratio, gate_ratio, avg_plane_residual
+
+
+    import torch
+import torch.nn.functional as F
+
+def loss_geo_contrastive_v1(
+    xyz,
+    obj_feat,
+    obj_label,
+    k=8,
+    plane_tau=0.01,
+    pos_weight_lambda=5.0,
+    margin=1.0,
+    sample_size=800,
+    eps=1e-8,
+):
+    """
+    xyz: [N, 3]
+    obj_feat: [N, D]
+    obj_label: [N]   当前 3D 预测类别（由 classifier 给出）
+    """
+    N = xyz.size(0)
+    k = min(k, max(1, N - 1))
+
+    # 1. 随机采样中心点
+    if N > sample_size:
+        indices = torch.randperm(N, device=xyz.device)[:sample_size]
+        xyz_sub = xyz[indices]            # [M, 3]
+        feat_sub = obj_feat[indices]      # [M, D]
+        label_sub = obj_label[indices]    # [M]
+    else:
+        indices = None
+        xyz_sub = xyz
+        feat_sub = obj_feat
+        label_sub = obj_label
+
+    M = xyz_sub.size(0)
+
+    # 2. KNN
+    dist = torch.cdist(xyz_sub, xyz)      # [M, N]
+
+    if indices is not None:
+        dist[torch.arange(M, device=xyz.device), indices] = 1e10
+    else:
+        eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
+        dist[eye_mask] = 1e10
+
+    neighbor_idx = dist.topk(k, largest=False).indices   # [M, k]
+
+    knn_xyz = xyz[neighbor_idx]                          # [M, k, 3]
+    feat_knn = obj_feat[neighbor_idx]                    # [M, k, D]
+    label_knn = obj_label[neighbor_idx]                  # [M, k]
+
+    # 3. 用同一批邻域估中心点法线
+    local = knn_xyz - xyz_sub.unsqueeze(1)               # [M, k, 3]
+    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)   # [M, 3, 3]
+    _, eigvecs = torch.linalg.eigh(cov)
+    normals_sub = F.normalize(eigvecs[:, :, 0], dim=-1)             # [M, 3]
+
+    # 4. 几何门控：邻居点到中心点切平面的残差
+    plane_residual = torch.abs(
+        torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
+    )   # [M, k]
+
+    gate_mask = plane_residual < plane_tau               # [M, k]
+
+    # 5. 当前类别一致性
+    same_label = label_knn == label_sub.unsqueeze(1)     # [M, k]
+
+    # 正样本：几何连续 + 类别一致
+    pos_mask = gate_mask & same_label
+
+    # 负样本：空间近邻里类别不同
+    # 第一版先这样最稳，不用把 gate 也揉进负样本
+    neg_mask = ~same_label
+
+    # 6. 归一化 feature，用平方 L2 做 contrastive
+    feat_sub_n = F.normalize(feat_sub, dim=-1)                   # [M, D]
+    feat_knn_n = F.normalize(feat_knn, dim=-1)                   # [M, k, D]
+
+    feat_diff = feat_sub_n.unsqueeze(1) - feat_knn_n             # [M, k, D]
+    feat_dist2 = torch.sum(feat_diff ** 2, dim=-1)               # [M, k], 范围大致 [0, 4]
+
+    # 7. 正样本：拉近
+    pos_weight = torch.exp(-pos_weight_lambda * plane_residual) * pos_mask.float()
+    loss_pos = (pos_weight * feat_dist2).sum() / (pos_weight.sum() + eps)
+
+    # 8. 负样本：推远
+    # 希望负样本距离至少大于 margin
+    neg_hinge = F.relu(margin - feat_dist2)
+    loss_neg = (neg_hinge * neg_mask.float()).sum() / (neg_mask.sum() + eps)
+
+    loss = loss_pos + loss_neg
+
+    pos_ratio = pos_mask.float().mean().item()
+    neg_ratio = neg_mask.float().mean().item()
+    gate_ratio = gate_mask.float().mean().item()
+    avg_plane_residual = plane_residual.mean().item()
+
+    return loss, pos_ratio, neg_ratio, gate_ratio, avg_plane_residual
