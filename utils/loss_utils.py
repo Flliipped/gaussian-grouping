@@ -180,7 +180,7 @@ def loss_geo_smooth(xyz, obj_feat, k=8, plane_tau=0.01, weight_lambda=5.0, sampl
 
     return loss, gate_ratio, avg_plane_residual
 
-def loss_geo_contrastive_v2(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smooth_weight_lambda=5.0, margin=1.0, sample_size=800, con_weight=0.1, neg_cap=2,eps=1e-8):
+def loss_geo_contrastive_v2_1_posonly(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smooth_weight_lambda=5.0, margin=1.0, sample_size=800, con_weight=0.1, neg_cap=2,eps=1e-8):
     N = xyz.size(0)
     k = min(k, max(1, N-1))
 
@@ -277,7 +277,7 @@ def loss_geo_contrastive_v2(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smoot
     neg_hinge = F.relu(margin - feat_dist2_n)
     loss_neg = (neg_hinge * neg_mask.float()).sum() / (neg_mask.float().sum() + eps)
 
-    loss_con = loss_pos + loss_neg
+    loss_con = loss_pos # + loss_neg
 
     # 总loss:smooth为主，contrastive为辅
     loss_total = loss_smooth + con_weight * loss_con
@@ -289,9 +289,6 @@ def loss_geo_contrastive_v2(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smoot
 
     return loss_total, loss_smooth.item(), loss_con.item(), pos_ratio, neg_ratio, gate_ratio, avg_plane_residual
 
-
-    import torch
-import torch.nn.functional as F
 
 def loss_geo_contrastive_v1(
     xyz,

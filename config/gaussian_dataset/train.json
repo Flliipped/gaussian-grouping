@@ -15,6 +15,7 @@
     "geo_sample_size": 800,
     "lambda_geo": 0.002,
 
-    "geo_margin": 1.0
-
+    "geo_margin": 1.0,
+    "geo_con_weight": 0.1,
+    "geo_neg_cap": 2
 }
