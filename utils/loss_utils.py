@@ -117,7 +117,78 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
 import torch
 import torch.nn.functional as F
 
-def loss_geo_smooth(xyz, obj_feat, k=8, plane_tau=0.01, weight_lambda=5.0, sample_size=800, eps=1e-8):
+
+def estimate_normals_for_query_points(
+    xyz_all,
+    query_idx,
+    k=8,
+    ref_size=4096,
+    eps=1e-8,
+):
+    """
+    xyz_all: [N, 3]
+    query_idx: [Q]
+    return: normals [Q, 3]
+    """
+    device = xyz_all.device
+    N = xyz_all.size(0)
+    Q = query_idx.numel()
+
+    # 1) 构造 reference subset
+    if N <= ref_size:
+        ref_idx = torch.arange(N, device=device)
+    else:
+        rand_idx = torch.randperm(N, device=device)[:ref_size]
+        ref_idx = torch.unique(torch.cat([rand_idx, query_idx], dim=0), sorted=False)
+
+        # 如果拼起来还是太大，就再裁一下，但尽量保留 query
+        if ref_idx.numel() > ref_size + Q:
+            extra = ref_idx[Q:] if ref_idx.numel() > Q else ref_idx[:0]
+            keep_extra = extra[:max(0, ref_size)]
+            ref_idx = torch.unique(torch.cat([query_idx, keep_extra], dim=0), sorted=False)
+
+    xyz_query = xyz_all[query_idx]   # [Q, 3]
+    xyz_ref = xyz_all[ref_idx]       # [R, 3]
+
+    # 2) query -> ref 距离
+    dist = torch.cdist(xyz_query, xyz_ref)   # [Q, R]
+
+    # 3) 如果 query 点自己也在 ref 里，需要排除自身
+    ref_map = -torch.ones(N, device=device, dtype=torch.long)
+    ref_map[ref_idx] = torch.arange(ref_idx.numel(), device=device)
+
+    self_pos = ref_map[query_idx]   # [Q]
+    valid_self = self_pos >= 0
+    if valid_self.any():
+        dist[torch.arange(Q, device=device)[valid_self], self_pos[valid_self]] = 1e10
+
+    # 4) KNN on ref
+    k_eff = min(k, max(1, ref_idx.numel() - 1))
+    knn_ref_pos = dist.topk(k_eff, largest=False).indices   # [Q, k_eff]
+    knn_idx = ref_idx[knn_ref_pos]                          # [Q, k_eff]
+
+    knn_xyz = xyz_all[knn_idx]                              # [Q, k_eff, 3]
+    local = knn_xyz - xyz_query.unsqueeze(1)               # [Q, k_eff, 3]
+
+    cov = torch.matmul(local.transpose(1, 2), local) / (k_eff + eps)   # [Q, 3, 3]
+    _, eigvecs = torch.linalg.eigh(cov)
+    normals = F.normalize(eigvecs[:, :, 0], dim=-1)        # [Q, 3]
+
+    return normals
+
+def loss_geo_smooth(
+    xyz,
+    obj_feat,
+    k=8,
+    plane_tau1=0.35,
+    plane_tau2=0.75,
+    normal_tau1=0.90,
+    normal_tau2=0.75,
+    weak_weight=0.3,
+    weight_lambda=5.0,
+    sample_size=800,
+    eps=1e-8,
+): 
     """
     xyz: [N, 3]
     obj_feat: [N, D]
@@ -150,6 +221,26 @@ def loss_geo_smooth(xyz, obj_feat, k=8, plane_tau=0.01, weight_lambda=5.0, sampl
     # [M, k]
     neighbor_indices_tensor = dist.topk(k, largest=False).indices
 
+    if indices is not None:
+        touched_idx = torch.cat([indices, neighbor_indices_tensor.reshape(-1)], dim=0)
+    else:
+        center_idx = torch.arange(M, device=xyz.device)
+        touched_idx = torch.cat([center_idx, neighbor_indices_tensor.reshape(-1)], dim=0)
+
+    touched_unique = torch.unique(touched_idx, sorted=False)
+    normals_touched = estimate_normals_for_query_points(xyz, touched_unique, k=k, ref_size=4096, eps=eps)
+
+    index_map = -torch.ones(N, device=xyz.device, dtype=torch.long)
+    index_map[touched_unique] = torch.arange(touched_unique.numel(), device=xyz.device)
+
+    if indices is not None:
+        normals_sub = normals_touched[index_map[indices]]          # [M, 3]
+    else:
+        center_idx = torch.arange(M, device=xyz.device)
+        normals_sub = normals_touched[index_map[center_idx]]       # [M, 3]
+    normals_knn = normals_touched[index_map[neighbor_indices_tensor]]  # [M*k, 3] -> [M, k, 3]
+
+    normal_sim = torch.abs(torch.sum(normals_sub.unsqueeze(1) * normals_knn, dim=-1))  # [M, k]
     # 邻域坐标和特征
     knn_xyz = xyz[neighbor_indices_tensor]          # [M, k, 3]
     feat_knn = obj_feat[neighbor_indices_tensor]    # [M, k, D]
@@ -157,28 +248,32 @@ def loss_geo_smooth(xyz, obj_feat, k=8, plane_tau=0.01, weight_lambda=5.0, sampl
     # 局部坐标
     local = knn_xyz - xyz_sub.unsqueeze(1)          # [M, k, 3]
 
-    # 直接用这批邻域做 PCA 法线
-    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)   # [M, 3, 3]
-    _, eigvecs = torch.linalg.eigh(cov)
-    normals_sub = F.normalize(eigvecs[:, :, 0], dim=-1)            # [M, 3]
-
     # 点到中心点切平面的距离
     plane_residual = torch.abs(
         torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
     )   # [M, k]
 
-    gate_mask = (plane_residual < plane_tau).float()
-    weights = torch.exp(-weight_lambda * plane_residual) * gate_mask
+    local_scale = local.norm(dim=-1).mean(dim=-1, keepdim=True)  # [M, 1] 
+    plane_residual_norm = plane_residual / (local_scale + eps)
+
+    strong_mask = (plane_residual_norm < plane_tau1) & (normal_sim > normal_tau1)
+    weak_mask = (plane_residual_norm < plane_tau2) & (normal_sim > normal_tau2) & (~strong_mask)
+
+    weights = strong_mask.float() + weak_mask.float() * weak_weight
+    weights = weights * torch.exp(-weight_lambda * plane_residual_norm)
 
     feat_diff = feat_sub.unsqueeze(1) - feat_knn
     feat_dist2 = torch.sum(feat_diff ** 2, dim=-1)
 
     loss = (weights * feat_dist2).sum() / (weights.sum() + eps)
 
-    gate_ratio = gate_mask.mean().item()
+    strong_ratio = strong_mask.float().mean().item()
+    weak_ratio = weak_mask.float().mean().item()
     avg_plane_residual = plane_residual.mean().item()
+    avg_plane_residual_norm = plane_residual_norm.mean().item()
+    avg_normal_sim = normal_sim.mean().item()
 
-    return loss, gate_ratio, avg_plane_residual
+    return loss, strong_ratio, weak_ratio, avg_plane_residual, avg_plane_residual_norm, avg_normal_sim
 
 def loss_geo_contrastive_v2_1_posonly(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smooth_weight_lambda=5.0, margin=1.0, sample_size=800, con_weight=0.1, neg_cap=2,eps=1e-8):
     N = xyz.size(0)

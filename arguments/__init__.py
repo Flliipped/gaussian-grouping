@@ -102,10 +102,13 @@ class OptimizationParams(ParamGroup):
         self.geo_weight_lambda = 5.0
         self.geo_sample_size = 800
         self.lambda_geo = 0.005
-        
-        self.geo_con_weight = 0.1
-        self.geo_neg_cap = 2
-        self.geo_margin = 1.0
+        self.geo_plane_tau1 = 0.35
+
+        self.geo_plane_tau2 = 0.75
+        self.geo_normal_tau1 = 0.90
+        self.geo_normal_tau2 = 0.75
+        self.geo_weak_weight = 0.3
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -109,37 +109,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj          
 
         loss_geo = torch.tensor(0.0, device=image.device)
-        loss_geo_smooth_val, loss_geo_con_val = 0.0, 0.0
-        pos_ratio, neg_ratio, gate_ratio, avg_plane_residual = 0.0, 0.0, 0.0, 0.0
+        strong_ratio, weak_ratio = 0.0, 0.0
+        avg_plane_residual = 0.0
+        avg_plane_residual_norm = 0.0
+        avg_normal_sim = 0.0
 
         if iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0:
             xyz = gaussians._xyz.squeeze()
             obj_feat = gaussians._objects_dc.squeeze(1)
 
-            # 当前 3D 预测类别，作为 contrastive 的弱监督
-            with torch.no_grad():
-                logits_geo = classifier(gaussians._objects_dc.permute(2, 0, 1))
-                pred_label3d = torch.argmax(logits_geo, dim=0).squeeze().long()
-
             (
                 loss_geo,
-                loss_geo_smooth_val,
-                loss_geo_con_val,
-                pos_ratio,
-                neg_ratio,
-                gate_ratio,
+                strong_ratio,
+                weak_ratio,
                 avg_plane_residual,
-            ) = loss_geo_contrastive_v2_1_posonly(
+                avg_plane_residual_norm,
+                avg_normal_sim,
+            ) = loss_geo_smooth(
                 xyz=xyz.detach(),
                 obj_feat=obj_feat,
-                obj_label=pred_label3d,
                 k=opt.geo_knn_k,
-                plane_tau=opt.geo_plane_tau,
-                smooth_weight_lambda=opt.geo_weight_lambda,
-                margin=opt.geo_margin,
+                plane_tau1=opt.geo_plane_tau1,
+                plane_tau2=opt.geo_plane_tau2,
+                normal_tau1=opt.geo_normal_tau1,
+                normal_tau2=opt.geo_normal_tau2,
+                weak_weight=opt.geo_weak_weight,
+                weight_lambda=opt.geo_weight_lambda,
                 sample_size=opt.geo_sample_size,
-                con_weight=opt.geo_con_weight,
-                neg_cap=opt.geo_neg_cap,
             )
 
         loss = loss + opt.lambda_geo * loss_geo
@@ -148,15 +144,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(
                 f"[Iter {iteration}] "
                 f"loss_geo={loss_geo.item():.6f}, "
-                f"geo_smooth={loss_geo_smooth_val:.6f}, "
-                f"geo_con={loss_geo_con_val:.6f}, "
-                f"pos_ratio={pos_ratio:.4f}, "
-                f"neg_ratio={neg_ratio:.4f}, "
-                f"gate_ratio={gate_ratio:.4f}, "
-                f"avg_plane_residual={avg_plane_residual:.6f}"
+                f"strong_ratio={strong_ratio:.4f}, "
+                f"weak_ratio={weak_ratio:.4f}, "
+                f"avg_plane_residual={avg_plane_residual:.6f}, "
+                f"avg_plane_residual_norm={avg_plane_residual_norm:.6f}, "
+                f"avg_normal_sim={avg_normal_sim:.6f}"
             )
-        
-        
         loss.backward()
         iter_end.record()
 
@@ -297,14 +290,16 @@ if __name__ == "__main__":
     args.geo_start_iter = config.get("geo_start_iter", 7000)
     args.geo_interval = config.get("geo_interval", 10)
     args.geo_knn_k = config.get("geo_knn_k", 8)
-    args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
     args.geo_weight_lambda = config.get("geo_weight_lambda", 5.0)
     args.geo_sample_size = config.get("geo_sample_size", 800)
-    args.lambda_geo = config.get("lambda_geo", 0.005)
 
-    args.geo_con_weight = config.get("geo_con_weight", 0.1)
-    args.geo_neg_cap = config.get("geo_neg_cap", 2)
-    args.geo_margin = config.get("geo_margin", 1.0)
+    args.geo_plane_tau1 = config.get("geo_plane_tau1", 0.35)
+    args.geo_plane_tau2 = config.get("geo_plane_tau2", 0.75)
+    args.geo_normal_tau1 = config.get("geo_normal_tau1", 0.90)
+    args.geo_normal_tau2 = config.get("geo_normal_tau2", 0.75)
+    args.geo_weak_weight = config.get("geo_weak_weight", 0.3)
+
+    args.lambda_geo = config.get("lambda_geo", 0.005)
     print("Optimizing " + args.model_path)
 
     if args.use_wandb:
