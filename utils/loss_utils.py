@@ -194,6 +194,7 @@ def loss_geo_contrastive_boundary(
     alpha=2.0,
     beta=1.0,
     gamma=1.0,
+    weight_power=2.0,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -205,12 +206,12 @@ def loss_geo_contrastive_boundary(
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero
 
     indices = torch.randperm(num_points, device=features.device)[:sample_count]
     sample_xyz = xyz[indices]
@@ -241,7 +242,8 @@ def loss_geo_contrastive_boundary(
     log_boundary_weight = alpha * plane_residual - beta * feat_dist - gamma * xyz_dist
     log_boundary_weight = log_boundary_weight - log_boundary_weight.max().detach()
     boundary_weight = torch.exp(log_boundary_weight)
-    boundary_weight = boundary_weight / (boundary_weight.mean() + eps)
+    boundary_weight = boundary_weight / (boundary_weight.max() + eps)
+    boundary_weight = boundary_weight ** weight_power
 
     neg_mask = 1.0 - pos_mask
     neg_weight = boundary_weight * neg_mask
@@ -253,6 +255,17 @@ def loss_geo_contrastive_boundary(
     gate_ratio = pos_mask.mean()
     avg_plane_residual = plane_residual.mean()
     avg_boundary_weight = boundary_weight.mean()
+    max_boundary_weight = boundary_weight.max()
+    std_boundary_weight = boundary_weight.std(unbiased=False)
 
-    return lambda_val * loss, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_boundary_weight
+    return (
+        lambda_val * loss,
+        gate_ratio,
+        avg_plane_residual,
+        pos_loss,
+        neg_loss,
+        avg_boundary_weight,
+        max_boundary_weight,
+        std_boundary_weight,
+    )
     

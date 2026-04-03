@@ -18,5 +18,6 @@
     "geo_hard_neg_k": 2,
     "geo_alpha": 2.0,
     "geo_beta": 1.0,
-    "geo_gamma": 1.0
+    "geo_gamma": 1.0,
+    "geo_weight_power": 2.0
 }

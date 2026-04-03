@@ -107,6 +107,7 @@ class OptimizationParams(ParamGroup):
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0
+        self.geo_weight_power = 2.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
