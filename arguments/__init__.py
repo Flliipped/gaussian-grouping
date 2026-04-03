@@ -104,6 +104,9 @@ class OptimizationParams(ParamGroup):
         self.geo_plane_tau = 0.01
         self.geo_margin = 0.3
         self.geo_hard_neg_k = 2
+        self.geo_alpha = 2.0
+        self.geo_beta = 1.0
+        self.geo_gamma = 1.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
