@@ -32,6 +32,7 @@ model_path="output/${dataset_name}"
 
 # 默认开启 eval
 use_eval=true
+use_wandb=false
 
 # 解析剩余参数
 while [ "$#" -gt 0 ]; do
@@ -49,6 +50,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --eval)
             use_eval=true
+            shift
+            ;;
+         --wandb)
+            use_wandb=true
             shift
             ;;
         -*)
@@ -81,11 +86,13 @@ train_cmd=(
 if [ "${use_eval}" = true ]; then
     train_cmd+=(--eval)
 fi
-
+if [ "${use_wandb}" = true ]; then
+    train_cmd+=(--use_wandb)
+fi
 echo "Running training command:"
 printf ' %q' "${train_cmd[@]}"
 echo
-
+echo "Wandb enabled: ${use_wandb}"
 "${train_cmd[@]}"
 
 # 渲染命令

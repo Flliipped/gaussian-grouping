@@ -114,369 +114,70 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
 
     return lambda_val * normalized_loss
 
-import torch
-import torch.nn.functional as F
+def loss_geo_contrastive(xyz, features, k=5, lambda_val=2.0, lambda_pos=1.0, lambda_neg=3000, max_points=200000, plane_tau = 0.01, normal_tau=0.9, sample_size=800, margin=1.0, hard_neg_k=2 ,eps=1e-8):
+    if features.size(0) > max_points:
+        indices = torch.randperm(features.size(0))[:max_points]
+        xyz = xyz[indices]
+        features = features[indices]
 
+    indices = torch.randperm(features.size(0))[:sample_size]
+    sample_xyz = xyz[indices]
+    sample_features = features[indices]
 
-def estimate_normals_for_query_points(
-    xyz_all,
-    query_idx,
-    k=8,
-    ref_size=4096,
-    eps=1e-8,
-):
-    """
-    xyz_all: [N, 3]
-    query_idx: [Q]
-    return: normals [Q, 3]
-    """
-    device = xyz_all.device
-    N = xyz_all.size(0)
-    Q = query_idx.numel()
+    dists = torch.cdist(sample_xyz, xyz)
+    _, neighbor_indices_tensor = dists.topk(k + 1, largest=False)
+    neighbor_indices_tensor = neighbor_indices_tensor[:, 1:]
 
-    # 1) 构造 reference subset
-    if N <= ref_size:
-        ref_idx = torch.arange(N, device=device)
-    else:
-        rand_idx = torch.randperm(N, device=device)[:ref_size]
-        ref_idx = torch.unique(torch.cat([rand_idx, query_idx], dim=0), sorted=False)
+    neighbor_xyz = xyz[neighbor_indices_tensor]
+    neighbor_features = features[neighbor_indices_tensor]
 
-        # 如果拼起来还是太大，就再裁一下，但尽量保留 query
-        if ref_idx.numel() > ref_size + Q:
-            extra = ref_idx[Q:] if ref_idx.numel() > Q else ref_idx[:0]
-            keep_extra = extra[:max(0, ref_size)]
-            ref_idx = torch.unique(torch.cat([query_idx, keep_extra], dim=0), sorted=False)
+    local_center = neighbor_xyz.mean(dim=1, keepdim=True)
+    local_xyz = neighbor_xyz - local_center
 
-    xyz_query = xyz_all[query_idx]   # [Q, 3]
-    xyz_ref = xyz_all[ref_idx]       # [R, 3]
+    cov = torch.matmul(local_xyz.transpose(1, 2), local_xyz) / (k + eps)
 
-    # 2) query -> ref 距离
-    dist = torch.cdist(xyz_query, xyz_ref)   # [Q, R]
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    normals = eigvecs[:, :, 0]
 
-    # 3) 如果 query 点自己也在 ref 里，需要排除自身
-    ref_map = -torch.ones(N, device=device, dtype=torch.long)
-    ref_map[ref_idx] = torch.arange(ref_idx.numel(), device=device)
+    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
+    plane_residual = torch.abs((rel_xyz * normals.unsqueeze(1)).sum(dim=-1))
 
-    self_pos = ref_map[query_idx]   # [Q]
-    valid_self = self_pos >= 0
-    if valid_self.any():
-        dist[torch.arange(Q, device=device)[valid_self], self_pos[valid_self]] = 1e10
+    gate = (plane_residual < plane_tau).float()
 
-    # 4) KNN on ref
-    k_eff = min(k, max(1, ref_idx.numel() - 1))
-    knn_ref_pos = dist.topk(k_eff, largest=False).indices   # [Q, k_eff]
-    knn_idx = ref_idx[knn_ref_pos]                          # [Q, k_eff]
+    feat_dist = torch.norm(neighbor_features - sample_features.unsqueeze(1), dim=-1)
 
-    knn_xyz = xyz_all[knn_idx]                              # [Q, k_eff, 3]
-    local = knn_xyz - xyz_query.unsqueeze(1)               # [Q, k_eff, 3]
+    pos_loss = (gate * (feat_dist ** 2)).sum() / (gate.sum() + eps)
 
-    cov = torch.matmul(local.transpose(1, 2), local) / (k_eff + eps)   # [Q, 3, 3]
-    _, eigvecs = torch.linalg.eigh(cov)
-    normals = F.normalize(eigvecs[:, :, 0], dim=-1)        # [Q, 3]
+    # -------------------------
+    # Hard negative mining
+    # -------------------------
+    neg_mask = (1.0 - gate)                                    # [M, k]
 
-    return normals
+    # For hard negatives:
+    # among negative neighbors, smaller feat_dist => harder
+    masked_neg_dist = feat_dist.clone()
 
-def loss_geo_smooth(
-    xyz,
-    obj_feat,
-    k=8,
-    plane_tau1=0.35,
-    plane_tau2=0.75,
-    normal_tau1=0.90,
-    normal_tau2=0.75,
-    weak_weight=0.3,
-    weight_lambda=5.0,
-    sample_size=800,
-    eps=1e-8,
-): 
-    """
-    xyz: [N, 3]
-    obj_feat: [N, D]
-    """
-    N = xyz.size(0)
-    k = min(k, max(1, N - 1))
+    # set positive positions to large value so they won't be selected
+    masked_neg_dist[neg_mask == 0] = 1e6
 
-    # 随机采样中心点
-    if N > sample_size:
-        indices = torch.randperm(N, device=xyz.device)[:sample_size]
-        xyz_sub = xyz[indices]         # [M, 3]
-        feat_sub = obj_feat[indices]   # [M, D]
-    else:
-        indices = None
-        xyz_sub = xyz
-        feat_sub = obj_feat
+    # select top hard_neg_k smallest negative distances per anchor
+    hard_neg_vals, hard_neg_idx = masked_neg_dist.topk(hard_neg_k, largest=False)
 
-    M = xyz_sub.size(0)
+    # build hard negative mask
+    hard_neg_mask = torch.zeros_like(neg_mask)                 # [M, k]
+    hard_neg_mask.scatter_(1, hard_neg_idx, 1.0)
 
-    # [M, N]
-    dist = torch.cdist(xyz_sub, xyz)
+    # but only keep truly negative positions
+    hard_neg_mask = hard_neg_mask * neg_mask
 
-    # 排除自己
-    if indices is not None:
-        dist[torch.arange(M, device=xyz.device), indices] = 1e10
-    else:
-        eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
-        dist[eye_mask] = 1e10
+    # negative margin loss
+    neg_term = torch.clamp(margin - feat_dist, min=0.0)
+    neg_loss = (hard_neg_mask * (neg_term ** 2)).sum() / (hard_neg_mask.sum() + eps)
 
-    # [M, k]
-    neighbor_indices_tensor = dist.topk(k, largest=False).indices
-
-    if indices is not None:
-        touched_idx = torch.cat([indices, neighbor_indices_tensor.reshape(-1)], dim=0)
-    else:
-        center_idx = torch.arange(M, device=xyz.device)
-        touched_idx = torch.cat([center_idx, neighbor_indices_tensor.reshape(-1)], dim=0)
-
-    touched_unique = torch.unique(touched_idx, sorted=False)
-    normals_touched = estimate_normals_for_query_points(xyz, touched_unique, k=k, ref_size=4096, eps=eps)
-
-    index_map = -torch.ones(N, device=xyz.device, dtype=torch.long)
-    index_map[touched_unique] = torch.arange(touched_unique.numel(), device=xyz.device)
-
-    if indices is not None:
-        normals_sub = normals_touched[index_map[indices]]          # [M, 3]
-    else:
-        center_idx = torch.arange(M, device=xyz.device)
-        normals_sub = normals_touched[index_map[center_idx]]       # [M, 3]
-    normals_knn = normals_touched[index_map[neighbor_indices_tensor]]  # [M*k, 3] -> [M, k, 3]
-
-    normal_sim = torch.abs(torch.sum(normals_sub.unsqueeze(1) * normals_knn, dim=-1))  # [M, k]
-    # 邻域坐标和特征
-    knn_xyz = xyz[neighbor_indices_tensor]          # [M, k, 3]
-    feat_knn = obj_feat[neighbor_indices_tensor]    # [M, k, D]
-
-    # 局部坐标
-    local = knn_xyz - xyz_sub.unsqueeze(1)          # [M, k, 3]
-
-    # 点到中心点切平面的距离
-    plane_residual = torch.abs(
-        torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
-    )   # [M, k]
-
-    local_scale = local.norm(dim=-1).mean(dim=-1, keepdim=True)  # [M, 1] 
-    plane_residual_norm = plane_residual / (local_scale + eps)
-
-    strong_mask = (plane_residual_norm < plane_tau1) & (normal_sim > normal_tau1)
-    weak_mask = (plane_residual_norm < plane_tau2) & (normal_sim > normal_tau2) & (~strong_mask)
-
-    weights = strong_mask.float() + weak_mask.float() * weak_weight
-    weights = weights * torch.exp(-weight_lambda * plane_residual_norm)
-
-    feat_diff = feat_sub.unsqueeze(1) - feat_knn
-    feat_dist2 = torch.sum(feat_diff ** 2, dim=-1)
-
-    loss = (weights * feat_dist2).sum() / (weights.sum() + eps)
-
-    strong_ratio = strong_mask.float().mean().item()
-    weak_ratio = weak_mask.float().mean().item()
-    avg_plane_residual = plane_residual.mean().item()
-    avg_plane_residual_norm = plane_residual_norm.mean().item()
-    avg_normal_sim = normal_sim.mean().item()
-
-    return loss, strong_ratio, weak_ratio, avg_plane_residual, avg_plane_residual_norm, avg_normal_sim
-
-def loss_geo_contrastive_v2_1_posonly(xyz, obj_feat, obj_label, k=8, plane_tau=0.01, smooth_weight_lambda=5.0, margin=1.0, sample_size=800, con_weight=0.1, neg_cap=2,eps=1e-8):
-    N = xyz.size(0)
-    k = min(k, max(1, N-1))
-
-    # 随机采样中心点
-    if N > sample_size:
-        indices = torch.randperm(N, device=xyz.device)[:sample_size]
-        xyz_sub = xyz[indices]
-        feat_sub = obj_feat[indices]
-        label_sub = obj_label[indices]
-    else:
-        indices = None
-        xyz_sub = xyz
-        feat_sub = obj_feat
-        label_sub = obj_label
+    loss = lambda_pos * pos_loss + lambda_neg * neg_loss
     
-    M = xyz_sub.size(0)
+    gate_ratio = gate.mean()
+    avg_plane_residual = plane_residual.mean()
 
-    # 2.knn
-    dist =  torch.cdist(xyz_sub, xyz) # [M, N]
-
-    if indices is not None:
-        dist[torch.arange(M, device=xyz.device), indices] = 1e10
-    else:
-        eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
-        dist[eye_mask] = 1e10
-
-    neighbor_idx = dist.topk(k, largest=False).indices # [M, k]
-
-    knn_xyz = xyz[neighbor_idx]          # [M, k, 3]
-    feat_knn = obj_feat[neighbor_idx]    # [M, k, D]
-    label_knn = obj_label[neighbor_idx]  # [M, k]
-
-    # 3. 用同一批邻域估中心点法线
-    local = knn_xyz - xyz_sub.unsqueeze(1)          # [M, k, 3]
-    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)   # [M, 3, 3]
-    _, eigvecs = torch.linalg.eigh(cov)
-    normals_sub = F.normalize(eigvecs[:, :, 0], dim=-1)           # [M, 3]
-
-    # 4.几何门控：邻居点到中心点切平面的残差
-    plane_residual = torch.abs(
-        torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
-    ) # [M, k]
-
-    gate_mask = plane_residual < plane_tau
-
-    # 5.当前类别一致性
-    same_label = label_knn == label_sub.unsqueeze(1) # [M, k]
+    return lambda_val * loss, gate_ratio, avg_plane_residual, pos_loss, neg_loss
     
-    # -------------------
-    # A.已验证有效的smooth主项
-    # -------------------
-    smooth_weights = torch.exp(-smooth_weight_lambda * plane_residual) * gate_mask.float()
-
-    feat_diff_raw = feat_sub.unsqueeze(1) - feat_knn
-    feat_dist2_raw = torch.sum(feat_diff_raw ** 2, dim=-1)  # [M, k]
-
-    loss_smooth = (smooth_weights * feat_dist2_raw).sum() / (smooth_weights.sum() + eps)
-    
-    # -------------------
-    # B.保守的contrastive辅项
-    # -------------------
-
-    # 正样本：几何连续 + 类别一致
-    pos_mask = gate_mask & same_label
-    
-    # 负样本：几何不连续 + 类别不一致
-    neg_mask = (~gate_mask) & (~same_label)
-
-    # 每个anchor最多保留neg_cap个负样本，防止负样本过强
-    if neg_cap is not None and neg_cap >0:
-        neg_mask_limited = torch.zeros_like(neg_mask)
-        for i in range(M):
-            neg_idx_i = torch.nonzero(neg_mask[i], as_tuple=False).squeeze(-1)
-            if neg_idx_i.numel()>0:
-                if neg_idx_i.numel() > neg_cap:
-                    perm = torch.randperm(neg_idx_i.numel(), device=xyz.device)[:neg_cap]
-                    neg_idx_i = neg_idx_i[perm]
-                neg_mask_limited[i, neg_idx_i] = True
-        neg_mask = neg_mask_limited
-
-    # 6.归一化feature，用平方L2做contrastive
-    feat_sub_n = F.normalize(feat_sub, dim=-1)
-    feat_knn_n = F.normalize(feat_knn, dim=-1)
-
-    feat_diff_n = feat_sub_n.unsqueeze(1) - feat_knn_n
-    feat_dist2_n = torch.sum(feat_diff_n ** 2, dim=-1)
-
-    # 7. 正样本：拉近
-    pos_weight = torch.exp(-smooth_weight_lambda * plane_residual) * pos_mask.float()
-    loss_pos = (pos_weight * feat_dist2_n).sum() / (pos_weight.sum() + eps)
-
-    # 8. 负样本：推远
-    # 只对少量保守负样本做推远，距离至少大于margin
-    neg_hinge = F.relu(margin - feat_dist2_n)
-    loss_neg = (neg_hinge * neg_mask.float()).sum() / (neg_mask.float().sum() + eps)
-
-    loss_con = loss_pos # + loss_neg
-
-    # 总loss:smooth为主，contrastive为辅
-    loss_total = loss_smooth + con_weight * loss_con
-
-    pos_ratio = pos_mask.float().mean().item()
-    neg_ratio = neg_mask.float().mean().item()
-    gate_ratio = gate_mask.float().mean().item()
-    avg_plane_residual = plane_residual.mean().item()
-
-    return loss_total, loss_smooth.item(), loss_con.item(), pos_ratio, neg_ratio, gate_ratio, avg_plane_residual
-
-
-def loss_geo_contrastive_v1(
-    xyz,
-    obj_feat,
-    obj_label,
-    k=8,
-    plane_tau=0.01,
-    pos_weight_lambda=5.0,
-    margin=1.0,
-    sample_size=800,
-    eps=1e-8,
-):
-    """
-    xyz: [N, 3]
-    obj_feat: [N, D]
-    obj_label: [N]   当前 3D 预测类别（由 classifier 给出）
-    """
-    N = xyz.size(0)
-    k = min(k, max(1, N - 1))
-
-    # 1. 随机采样中心点
-    if N > sample_size:
-        indices = torch.randperm(N, device=xyz.device)[:sample_size]
-        xyz_sub = xyz[indices]            # [M, 3]
-        feat_sub = obj_feat[indices]      # [M, D]
-        label_sub = obj_label[indices]    # [M]
-    else:
-        indices = None
-        xyz_sub = xyz
-        feat_sub = obj_feat
-        label_sub = obj_label
-
-    M = xyz_sub.size(0)
-
-    # 2. KNN
-    dist = torch.cdist(xyz_sub, xyz)      # [M, N]
-
-    if indices is not None:
-        dist[torch.arange(M, device=xyz.device), indices] = 1e10
-    else:
-        eye_mask = torch.eye(M, device=xyz.device, dtype=torch.bool)
-        dist[eye_mask] = 1e10
-
-    neighbor_idx = dist.topk(k, largest=False).indices   # [M, k]
-
-    knn_xyz = xyz[neighbor_idx]                          # [M, k, 3]
-    feat_knn = obj_feat[neighbor_idx]                    # [M, k, D]
-    label_knn = obj_label[neighbor_idx]                  # [M, k]
-
-    # 3. 用同一批邻域估中心点法线
-    local = knn_xyz - xyz_sub.unsqueeze(1)               # [M, k, 3]
-    cov = torch.matmul(local.transpose(1, 2), local) / (k + eps)   # [M, 3, 3]
-    _, eigvecs = torch.linalg.eigh(cov)
-    normals_sub = F.normalize(eigvecs[:, :, 0], dim=-1)             # [M, 3]
-
-    # 4. 几何门控：邻居点到中心点切平面的残差
-    plane_residual = torch.abs(
-        torch.sum(local * normals_sub.unsqueeze(1), dim=-1)
-    )   # [M, k]
-
-    gate_mask = plane_residual < plane_tau               # [M, k]
-
-    # 5. 当前类别一致性
-    same_label = label_knn == label_sub.unsqueeze(1)     # [M, k]
-
-    # 正样本：几何连续 + 类别一致
-    pos_mask = gate_mask & same_label
-
-    # 负样本：空间近邻里类别不同
-    # 第一版先这样最稳，不用把 gate 也揉进负样本
-    neg_mask = ~same_label
-
-    # 6. 归一化 feature，用平方 L2 做 contrastive
-    feat_sub_n = F.normalize(feat_sub, dim=-1)                   # [M, D]
-    feat_knn_n = F.normalize(feat_knn, dim=-1)                   # [M, k, D]
-
-    feat_diff = feat_sub_n.unsqueeze(1) - feat_knn_n             # [M, k, D]
-    feat_dist2 = torch.sum(feat_diff ** 2, dim=-1)               # [M, k], 范围大致 [0, 4]
-
-    # 7. 正样本：拉近
-    pos_weight = torch.exp(-pos_weight_lambda * plane_residual) * pos_mask.float()
-    loss_pos = (pos_weight * feat_dist2).sum() / (pos_weight.sum() + eps)
-
-    # 8. 负样本：推远
-    # 希望负样本距离至少大于 margin
-    neg_hinge = F.relu(margin - feat_dist2)
-    loss_neg = (neg_hinge * neg_mask.float()).sum() / (neg_mask.sum() + eps)
-
-    loss = loss_pos + loss_neg
-
-    pos_ratio = pos_mask.float().mean().item()
-    neg_ratio = neg_mask.float().mean().item()
-    gate_ratio = gate_mask.float().mean().item()
-    avg_plane_residual = plane_residual.mean().item()
-
-    return loss, pos_ratio, neg_ratio, gate_ratio, avg_plane_residual

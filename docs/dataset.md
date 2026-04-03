@@ -34,9 +34,9 @@ For semantic information of each mask output, since SAM masks are class-agnostic
 We test our segmentation with a simple strategy using grounded-sam on the first frame for text-prompt. You can use the following command with the provided checkpoints on [hugging face](https://huggingface.co/mqye/Gaussian-Grouping/tree/main/checkpoint) or your own training result. In the future we can also explore better detectors and prompt formats.
 
 ```
-python render_lerf_mask.py -m output/lerf_pretrain/figurines --skip_train
-python render_lerf_mask.py -m output/lerf_pretrain/ramen --skip_train
-python render_lerf_mask.py -m output/lerf_pretrain/teatime --skip_train
+python render_lerf_mask.py -m output/lerf/figurines --skip_train
+python render_lerf_mask.py -m output/lerf/ramen --skip_train
+python render_lerf_mask.py -m output/lerf/teatime --skip_train
 ```
 
 

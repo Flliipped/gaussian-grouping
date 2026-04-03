@@ -95,20 +95,15 @@ class OptimizationParams(ParamGroup):
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
         
-        self.geo_start_iter = 7000
+        self.geo_start_iter = 1000
         self.geo_interval = 10
         self.geo_knn_k = 8
-        self.geo_plane_tau = 0.01
-        self.geo_weight_lambda = 5.0
+        self.geo_weight_lambda = 1.0
+        self.geo_max_points = 200000
         self.geo_sample_size = 800
-        self.lambda_geo = 0.005
-        self.geo_plane_tau1 = 0.35
-
-        self.geo_plane_tau2 = 0.75
-        self.geo_normal_tau1 = 0.90
-        self.geo_normal_tau2 = 0.75
-        self.geo_weak_weight = 0.3
-
+        self.geo_plane_tau = 0.01
+        self.geo_margin = 0.3
+        self.geo_hard_neg_k = 2
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

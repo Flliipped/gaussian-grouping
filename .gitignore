@@ -16,7 +16,7 @@ submodules/**/*.egg-info/
 output/
 result/
 experiments/
-
+wandb/
 # weights / checkpoints
 weights/
 Tracking-Anything-with-DEVA/saves/
