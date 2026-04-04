@@ -268,4 +268,92 @@ def loss_geo_contrastive_boundary(
         max_boundary_weight,
         std_boundary_weight,
     )
+
+
+def loss_geo_contrastive_cosine(
+    xyz,
+    features,
+    k=8,
+    lambda_val=1.0,
+    lambda_pos=1.0,
+    lambda_neg=1.0,
+    max_points=200000,
+    sample_size=800,
+    plane_tau=0.01,
+    neg_margin=0.2,
+    eps=1e-8,
+):
+    zero = features.new_tensor(0.0)
+
+    if features.size(0) > max_points:
+        indices = torch.randperm(features.size(0), device=features.device)[:max_points]
+        xyz = xyz[indices]
+        features = features[indices]
+
+    num_points = features.size(0)
+    if num_points < 2:
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero
+
+    sample_count = min(sample_size, num_points)
+    effective_k = min(k, num_points - 1)
+    if sample_count <= 0 or effective_k <= 0:
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero
+
+    raw_feature_norm = torch.norm(features, dim=-1)
+    normalized_features = F.normalize(features, dim=-1, eps=eps)
+
+    indices = torch.randperm(num_points, device=features.device)[:sample_count]
+    sample_xyz = xyz[indices]
+    sample_features = normalized_features[indices]
+
+    dists = torch.cdist(sample_xyz, xyz)
+    _, neighbor_indices_tensor = dists.topk(effective_k + 1, largest=False)
+    neighbor_indices_tensor = neighbor_indices_tensor[:, 1:]
+
+    neighbor_xyz = xyz[neighbor_indices_tensor]
+    neighbor_features = normalized_features[neighbor_indices_tensor]
+
+    local_center = neighbor_xyz.mean(dim=1, keepdim=True)
+    local_xyz = neighbor_xyz - local_center
+    cov = torch.matmul(local_xyz.transpose(1, 2), local_xyz) / (effective_k + eps)
+
+    _, eigvecs = torch.linalg.eigh(cov)
+    normals = eigvecs[:, :, 0]
+
+    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
+    plane_residual = torch.abs((rel_xyz * normals.unsqueeze(1)).sum(dim=-1))
+    cosine_sim = (neighbor_features * sample_features.unsqueeze(1)).sum(dim=-1).clamp(-1.0, 1.0)
+
+    pos_mask = (plane_residual < plane_tau).to(cosine_sim.dtype)
+    neg_mask = 1.0 - pos_mask
+
+    pos_count = pos_mask.sum()
+    neg_count = neg_mask.sum()
+
+    pos_loss = (pos_mask * (1.0 - cosine_sim)).sum() / (pos_count + eps)
+
+    neg_term = torch.clamp(cosine_sim - neg_margin, min=0.0)
+    neg_loss = (neg_mask * (neg_term ** 2)).sum() / (neg_count + eps)
+
+    loss = lambda_pos * pos_loss + lambda_neg * neg_loss
+    gate_ratio = pos_mask.mean()
+    avg_plane_residual = plane_residual.mean()
+    avg_feature_norm = raw_feature_norm.mean()
+    avg_pos_cosine = (pos_mask * cosine_sim).sum() / (pos_count + eps)
+    avg_neg_cosine = (neg_mask * cosine_sim).sum() / (neg_count + eps)
+    active_neg_ratio = (
+        neg_mask * (cosine_sim > neg_margin).to(cosine_sim.dtype)
+    ).sum() / (neg_count + eps)
+
+    return (
+        lambda_val * loss,
+        gate_ratio,
+        avg_plane_residual,
+        pos_loss,
+        neg_loss,
+        avg_feature_norm,
+        avg_pos_cosine,
+        avg_neg_cosine,
+        active_neg_ratio,
+    )
     

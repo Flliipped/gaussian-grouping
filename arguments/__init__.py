@@ -95,13 +95,17 @@ class OptimizationParams(ParamGroup):
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
         
-        self.geo_start_iter = 1000
+        self.geo_start_iter = 17_000
         self.geo_interval = 10
         self.geo_knn_k = 8
         self.geo_weight_lambda = 1.0
+        self.geo_warmup_iters = 4000
+        self.geo_lambda_pos = 1.0
+        self.geo_lambda_neg = 1.0
         self.geo_max_points = 200000
         self.geo_sample_size = 800
         self.geo_plane_tau = 0.01
+        self.geo_neg_margin = 0.2
         self.geo_margin = 0.3
         self.geo_hard_neg_k = 2
         self.geo_alpha = 2.0

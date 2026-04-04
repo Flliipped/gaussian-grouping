@@ -9,7 +9,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_boundary
+from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_cosine
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -107,30 +107,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj          
 
+        loss_geo_raw = torch.tensor(0.0, device=image.device)
         loss_geo = torch.tensor(0.0, device=image.device)
-        gate_ratio = 0.0
-        avg_plane_residual = 0.0
+        geo_coeff = torch.tensor(0.0, device=image.device)
+        gate_ratio = torch.tensor(0.0, device=image.device)
+        avg_plane_residual = torch.tensor(0.0, device=image.device)
         pos_loss = torch.tensor(0.0, device=image.device)
         neg_loss = torch.tensor(0.0, device=image.device)
-        avg_boundary_weight = torch.tensor(0.0, device=image.device)
-        max_boundary_weight = torch.tensor(0.0, device=image.device)
-        std_boundary_weight = torch.tensor(0.0, device=image.device)
+        avg_feature_norm = torch.tensor(0.0, device=image.device)
+        avg_pos_cosine = torch.tensor(0.0, device=image.device)
+        avg_neg_cosine = torch.tensor(0.0, device=image.device)
+        active_neg_ratio = torch.tensor(0.0, device=image.device)
+        geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
 
-        if iteration > opt.geo_start_iter and iteration % opt.geo_interval == 0:
-            loss_geo, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_boundary_weight, max_boundary_weight, std_boundary_weight = loss_geo_contrastive_boundary(
+        if geo_active:
+            warmup_iters = max(1, opt.geo_warmup_iters)
+            geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
+            geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
+
+            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, active_neg_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
                 k=opt.geo_knn_k,
-                lambda_val=opt.geo_weight_lambda,
+                lambda_val=1.0,
+                lambda_pos=opt.geo_lambda_pos,
+                lambda_neg=opt.geo_lambda_neg,
                 max_points=opt.geo_max_points,
                 sample_size=opt.geo_sample_size,
-                margin=opt.geo_margin,
                 plane_tau=opt.geo_plane_tau,
-                alpha=opt.geo_alpha,
-                beta=opt.geo_beta,
-                gamma=opt.geo_gamma,
-                weight_power=opt.geo_weight_power
+                neg_margin=opt.geo_neg_margin
             )
+            loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
 
             if iteration % 100 == 0:
@@ -139,14 +146,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"[Iter {iteration}] "
                     f"loss_obj={loss_obj.item():.6f}, "
                     f"loss_obj_3d={loss_obj_3d_value:.6f}, "
+                    f"geo_coeff={geo_coeff.item():.6f}, "
+                    f"loss_geo_raw={loss_geo_raw.item():.6f}, "
                     f"loss_geo={loss_geo.item():.6f}, "
                     f"pos_loss={pos_loss.item():.6f}, "
                     f"neg_loss={neg_loss.item():.6f}, "
                     f"gate_ratio={gate_ratio.item():.4f}, "
                     f"avg_plane_residual={avg_plane_residual.item():.6f}, "
-                    f"avg_boundary_weight={avg_boundary_weight.item():.6f}, "
-                    f"max_boundary_weight={max_boundary_weight.item():.6f}, "
-                    f"std_boundary_weight={std_boundary_weight.item():.6f}"
+                    f"avg_feature_norm={avg_feature_norm.item():.6f}, "
+                    f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
+                    f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
+                    f"active_neg_ratio={active_neg_ratio.item():.6f}"
                 )
 
 
@@ -164,7 +174,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_boundary_weight, max_boundary_weight, std_boundary_weight, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, active_neg_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -209,39 +219,36 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_boundary_weight, max_boundary_weight, std_boundary_weight, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, active_neg_ratio, use_wandb):
 
     if use_wandb:
-        if loss_geo and loss_obj_3d:
-             wandb.log({
+        log_data = {
             "train_loss_patches/l1_loss": Ll1.item(),
             "train_loss_patches/total_loss": loss.item(),
-            "train_loss_patches/loss_obj_3d": loss_obj_3d.item(),
-            "train_loss_patches/loss_geo": loss_geo.item(),
-            "train_loss_patches/pos_loss": pos_loss.item(),
-            "train_loss_patches/neg_loss": neg_loss.item(),
-            "train_loss_patches/gate_ratio": gate_ratio.item(),
-            "train_loss_patches/avg_plane_residual": avg_plane_residual.item(),
-            "train_loss_patches/avg_boundary_weight": avg_boundary_weight.item(),
-            "train_loss_patches/max_boundary_weight": max_boundary_weight.item(),
-            "train_loss_patches/std_boundary_weight": std_boundary_weight.item(),
+            "train_loss_patches/geo_active": float(geo_active),
+            "train_loss_patches/geo_coeff": geo_coeff.item(),
             "iter_time": elapsed,
             "iter": iteration
-        })
-        elif loss_obj_3d:
-            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(), "train_loss_patches/loss_obj_3d": loss_obj_3d.item(), "iter_time": elapsed, "iter": iteration})
-        else:
-            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(), "iter_time": elapsed, "iter": iteration})
+        }
 
-    if use_wandb:
-        if loss_geo is not None:
-            wandb.log({
+        if loss_obj_3d is not None:
+            log_data["train_loss_patches/loss_obj_3d"] = loss_obj_3d.item()
+
+        if geo_active:
+            log_data.update({
+                "train_loss_patches/loss_geo_raw": loss_geo_raw.item(),
                 "train_loss_patches/loss_geo": loss_geo.item(),
-                "train_loss_patches/avg_boundary_weight": avg_boundary_weight.item(),
-                "train_loss_patches/max_boundary_weight": max_boundary_weight.item(),
-                "train_loss_patches/std_boundary_weight": std_boundary_weight.item(),
-                "iter": iteration
+                "train_loss_patches/pos_loss": pos_loss.item(),
+                "train_loss_patches/neg_loss": neg_loss.item(),
+                "train_loss_patches/gate_ratio": gate_ratio.item(),
+                "train_loss_patches/avg_plane_residual": avg_plane_residual.item(),
+                "train_loss_patches/avg_feature_norm": avg_feature_norm.item(),
+                "train_loss_patches/avg_pos_cosine": avg_pos_cosine.item(),
+                "train_loss_patches/avg_neg_cosine": avg_neg_cosine.item(),
+                "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
             })
+
+        wandb.log(log_data)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -313,14 +320,17 @@ if __name__ == "__main__":
     args.reg3d_max_points = config.get("reg3d_max_points", 300000)
     args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
 
-    args.geo_start_iter = config.get("geo_start_iter", 10000)
+    args.geo_start_iter = config.get("geo_start_iter", args.densify_until_iter + 2000)
     args.geo_interval = config.get("geo_interval", 10)
     args.geo_knn_k = config.get("geo_knn_k", 8)
     args.geo_weight_lambda = config.get("geo_weight_lambda", 1.0)
+    args.geo_warmup_iters = config.get("geo_warmup_iters", 4000)
+    args.geo_lambda_pos = config.get("geo_lambda_pos", 1.0)
+    args.geo_lambda_neg = config.get("geo_lambda_neg", 1.0)
     args.geo_max_points = config.get("geo_max_points", 200000)
     args.geo_sample_size = config.get("geo_sample_size", 800)
     args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
-    args.geo_margin = config.get("geo_margin", 1.0)
+    args.geo_neg_margin = config.get("geo_neg_margin", 0.2)
     args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
     args.geo_alpha = config.get("geo_alpha", 2.0)
     args.geo_beta = config.get("geo_beta", 1.0)

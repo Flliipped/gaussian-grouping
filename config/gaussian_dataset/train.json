@@ -7,17 +7,15 @@
     "reg3d_max_points": 200000,
     "reg3d_sample_size": 1000,
 
-    "geo_start_iter" : 10000,
+    "geo_start_iter" : 12000,
     "geo_interval": 10,
     "geo_knn_k": 8,
     "geo_weight_lambda": 1.0,
+    "geo_warmup_iters": 4000,
+    "geo_lambda_pos": 1.0,
+    "geo_lambda_neg": 1.0,
     "geo_max_points": 200000,
     "geo_sample_size": 800,
     "geo_plane_tau": 0.01,
-    "geo_margin": 1.5,
-    "geo_hard_neg_k": 2,
-    "geo_alpha": 2.0,
-    "geo_beta": 1.0,
-    "geo_gamma": 1.0,
-    "geo_weight_power": 2.0
+    "geo_neg_margin": 0.2
 }
