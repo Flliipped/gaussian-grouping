@@ -17,5 +17,6 @@
     "geo_max_points": 200000,
     "geo_sample_size": 800,
     "geo_plane_tau": 0.01,
-    "geo_neg_margin": 0.2
+    "geo_neg_margin": 0.2,
+    "geo_hard_neg_k": 2
 }

@@ -281,6 +281,7 @@ def loss_geo_contrastive_cosine(
     sample_size=800,
     plane_tau=0.01,
     neg_margin=0.2,
+    hard_neg_k=2,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -292,12 +293,12 @@ def loss_geo_contrastive_cosine(
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     raw_feature_norm = torch.norm(features, dim=-1)
     normalized_features = F.normalize(features, dim=-1, eps=eps)
@@ -332,8 +333,22 @@ def loss_geo_contrastive_cosine(
 
     pos_loss = (pos_mask * (1.0 - cosine_sim)).sum() / (pos_count + eps)
 
+    effective_hard_neg_k = min(max(int(hard_neg_k), 0), effective_k)
+    if effective_hard_neg_k > 0:
+        hard_neg_scores = cosine_sim.masked_fill(neg_mask == 0, -1e6)
+        _, hard_neg_idx = hard_neg_scores.topk(effective_hard_neg_k, dim=1, largest=True)
+        hard_neg_mask = torch.zeros_like(neg_mask)
+        hard_neg_mask.scatter_(1, hard_neg_idx, 1.0)
+        hard_neg_mask = hard_neg_mask * neg_mask
+    else:
+        hard_neg_mask = neg_mask
+
     neg_term = torch.clamp(cosine_sim - neg_margin, min=0.0)
-    neg_loss = (neg_mask * (neg_term ** 2)).sum() / (neg_count + eps)
+    active_hard_neg_mask = hard_neg_mask * (cosine_sim > neg_margin).to(cosine_sim.dtype)
+    hard_neg_count = hard_neg_mask.sum()
+    active_hard_neg_count = active_hard_neg_mask.sum()
+
+    neg_loss = (active_hard_neg_mask * (neg_term ** 2)).sum() / (active_hard_neg_count + eps)
 
     loss = lambda_pos * pos_loss + lambda_neg * neg_loss
     gate_ratio = pos_mask.mean()
@@ -341,9 +356,8 @@ def loss_geo_contrastive_cosine(
     avg_feature_norm = raw_feature_norm.mean()
     avg_pos_cosine = (pos_mask * cosine_sim).sum() / (pos_count + eps)
     avg_neg_cosine = (neg_mask * cosine_sim).sum() / (neg_count + eps)
-    active_neg_ratio = (
-        neg_mask * (cosine_sim > neg_margin).to(cosine_sim.dtype)
-    ).sum() / (neg_count + eps)
+    avg_hard_neg_cosine = (hard_neg_mask * cosine_sim).sum() / (hard_neg_count + eps)
+    active_neg_ratio = active_hard_neg_count / (hard_neg_count + eps)
 
     return (
         lambda_val * loss,
@@ -354,6 +368,7 @@ def loss_geo_contrastive_cosine(
         avg_feature_norm,
         avg_pos_cosine,
         avg_neg_cosine,
+        avg_hard_neg_cosine,
         active_neg_ratio,
     )
     
