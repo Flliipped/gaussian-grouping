@@ -280,6 +280,7 @@ def loss_geo_contrastive_cosine(
     max_points=200000,
     sample_size=800,
     plane_tau=0.01,
+    neg_plane_tau=None,
     neg_margin=0.2,
     hard_neg_k=2,
     eps=1e-8,
@@ -293,12 +294,12 @@ def loss_geo_contrastive_cosine(
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     raw_feature_norm = torch.norm(features, dim=-1)
     normalized_features = F.normalize(features, dim=-1, eps=eps)
@@ -325,23 +326,32 @@ def loss_geo_contrastive_cosine(
     plane_residual = torch.abs((rel_xyz * normals.unsqueeze(1)).sum(dim=-1))
     cosine_sim = (neighbor_features * sample_features.unsqueeze(1)).sum(dim=-1).clamp(-1.0, 1.0)
 
+    # Dual-threshold geometry gate:
+    # positives live on the local surface, clear negatives stay beyond a looser boundary,
+    # and the ambiguous band between them is ignored.
     pos_mask = (plane_residual < plane_tau).to(cosine_sim.dtype)
-    neg_mask = 1.0 - pos_mask
+    if neg_plane_tau is None or neg_plane_tau <= plane_tau:
+        neg_candidate_mask = 1.0 - pos_mask
+        ignore_mask = torch.zeros_like(pos_mask)
+    else:
+        neg_candidate_mask = (plane_residual > neg_plane_tau).to(cosine_sim.dtype)
+        ignore_mask = 1.0 - pos_mask - neg_candidate_mask
 
     pos_count = pos_mask.sum()
-    neg_count = neg_mask.sum()
+    neg_candidate_count = neg_candidate_mask.sum()
+    ignore_count = ignore_mask.sum()
 
     pos_loss = (pos_mask * (1.0 - cosine_sim)).sum() / (pos_count + eps)
 
     effective_hard_neg_k = min(max(int(hard_neg_k), 0), effective_k)
     if effective_hard_neg_k > 0:
-        hard_neg_scores = cosine_sim.masked_fill(neg_mask == 0, -1e6)
+        hard_neg_scores = cosine_sim.masked_fill(neg_candidate_mask == 0, -1e6)
         _, hard_neg_idx = hard_neg_scores.topk(effective_hard_neg_k, dim=1, largest=True)
-        hard_neg_mask = torch.zeros_like(neg_mask)
+        hard_neg_mask = torch.zeros_like(neg_candidate_mask)
         hard_neg_mask.scatter_(1, hard_neg_idx, 1.0)
-        hard_neg_mask = hard_neg_mask * neg_mask
+        hard_neg_mask = hard_neg_mask * neg_candidate_mask
     else:
-        hard_neg_mask = neg_mask
+        hard_neg_mask = neg_candidate_mask
 
     neg_term = torch.clamp(cosine_sim - neg_margin, min=0.0)
     active_hard_neg_mask = hard_neg_mask * (cosine_sim > neg_margin).to(cosine_sim.dtype)
@@ -355,9 +365,11 @@ def loss_geo_contrastive_cosine(
     avg_plane_residual = plane_residual.mean()
     avg_feature_norm = raw_feature_norm.mean()
     avg_pos_cosine = (pos_mask * cosine_sim).sum() / (pos_count + eps)
-    avg_neg_cosine = (neg_mask * cosine_sim).sum() / (neg_count + eps)
+    avg_neg_cosine = (neg_candidate_mask * cosine_sim).sum() / (neg_candidate_count + eps)
     avg_hard_neg_cosine = (hard_neg_mask * cosine_sim).sum() / (hard_neg_count + eps)
     active_neg_ratio = active_hard_neg_count / (hard_neg_count + eps)
+    neg_candidate_ratio = neg_candidate_count / (pos_mask.numel() + eps)
+    ignore_ratio = ignore_count / (pos_mask.numel() + eps)
 
     return (
         lambda_val * loss,
@@ -370,5 +382,7 @@ def loss_geo_contrastive_cosine(
         avg_neg_cosine,
         avg_hard_neg_cosine,
         active_neg_ratio,
+        neg_candidate_ratio,
+        ignore_ratio,
     )
     

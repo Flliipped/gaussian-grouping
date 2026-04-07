@@ -119,6 +119,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         avg_neg_cosine = torch.tensor(0.0, device=image.device)
         avg_hard_neg_cosine = torch.tensor(0.0, device=image.device)
         active_neg_ratio = torch.tensor(0.0, device=image.device)
+        neg_candidate_ratio = torch.tensor(0.0, device=image.device)
+        ignore_ratio = torch.tensor(0.0, device=image.device)
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
 
         if geo_active:
@@ -126,7 +128,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
             geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
 
-            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio = loss_geo_contrastive_cosine(
+            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
                 k=opt.geo_knn_k,
@@ -136,6 +138,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 max_points=opt.geo_max_points,
                 sample_size=opt.geo_sample_size,
                 plane_tau=opt.geo_plane_tau,
+                neg_plane_tau=opt.geo_neg_plane_tau,
                 neg_margin=opt.geo_neg_margin,
                 hard_neg_k=opt.geo_hard_neg_k
             )
@@ -159,7 +162,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
                     f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
                     f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
-                    f"active_neg_ratio={active_neg_ratio.item():.6f}"
+                    f"active_neg_ratio={active_neg_ratio.item():.6f}, "
+                    f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
+                    f"ignore_ratio={ignore_ratio.item():.6f}"
                 )
 
 
@@ -177,7 +182,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -222,7 +227,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -250,6 +255,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/avg_neg_cosine": avg_neg_cosine.item(),
                 "train_loss_patches/avg_hard_neg_cosine": avg_hard_neg_cosine.item(),
                 "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
+                "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
+                "train_loss_patches/ignore_ratio": ignore_ratio.item(),
             })
 
         wandb.log(log_data)
@@ -334,7 +341,8 @@ if __name__ == "__main__":
     args.geo_max_points = config.get("geo_max_points", 200000)
     args.geo_sample_size = config.get("geo_sample_size", 800)
     args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
-    args.geo_neg_margin = config.get("geo_neg_margin", 0.2)
+    args.geo_neg_plane_tau = config.get("geo_neg_plane_tau", 0.02)
+    args.geo_neg_margin = config.get("geo_neg_margin", 0.8)
     args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
     args.geo_alpha = config.get("geo_alpha", 2.0)
     args.geo_beta = config.get("geo_beta", 1.0)

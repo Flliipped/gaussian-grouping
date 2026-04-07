@@ -105,7 +105,8 @@ class OptimizationParams(ParamGroup):
         self.geo_max_points = 200000
         self.geo_sample_size = 800
         self.geo_plane_tau = 0.01
-        self.geo_neg_margin = 0.2
+        self.geo_neg_plane_tau = 0.02
+        self.geo_neg_margin = 0.8
         self.geo_margin = 0.3
         self.geo_hard_neg_k = 2
         self.geo_alpha = 2.0
