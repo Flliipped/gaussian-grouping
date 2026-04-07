@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 from scipy.spatial import cKDTree
+from utils.multiview_utils import collect_multiview_labels
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -283,30 +284,34 @@ def loss_geo_contrastive_cosine(
     neg_plane_tau=None,
     neg_margin=0.2,
     hard_neg_k=2,
+    support_cameras=None,
+    sem_pos_ratio=0.7,
+    sem_min_views=2,
+    sem_ignore_label=-1,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
 
     if features.size(0) > max_points:
-        indices = torch.randperm(features.size(0), device=features.device)[:max_points]
-        xyz = xyz[indices]
-        features = features[indices]
+        selected_indices = torch.randperm(features.size(0), device=features.device)[:max_points]
+        xyz = xyz[selected_indices]
+        features = features[selected_indices]
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     raw_feature_norm = torch.norm(features, dim=-1)
     normalized_features = F.normalize(features, dim=-1, eps=eps)
 
-    indices = torch.randperm(num_points, device=features.device)[:sample_count]
-    sample_xyz = xyz[indices]
-    sample_features = normalized_features[indices]
+    sample_indices = torch.randperm(num_points, device=features.device)[:sample_count]
+    sample_xyz = xyz[sample_indices]
+    sample_features = normalized_features[sample_indices]
 
     dists = torch.cdist(sample_xyz, xyz)
     _, neighbor_indices_tensor = dists.topk(effective_k + 1, largest=False)
@@ -329,13 +334,55 @@ def loss_geo_contrastive_cosine(
     # Dual-threshold geometry gate:
     # positives live on the local surface, clear negatives stay beyond a looser boundary,
     # and the ambiguous band between them is ignored.
-    pos_mask = (plane_residual < plane_tau).to(cosine_sim.dtype)
+    geom_pos_mask = (plane_residual < plane_tau).to(cosine_sim.dtype)
     if neg_plane_tau is None or neg_plane_tau <= plane_tau:
-        neg_candidate_mask = 1.0 - pos_mask
-        ignore_mask = torch.zeros_like(pos_mask)
+        neg_candidate_mask = 1.0 - geom_pos_mask
+        ignore_mask = torch.zeros_like(geom_pos_mask)
     else:
         neg_candidate_mask = (plane_residual > neg_plane_tau).to(cosine_sim.dtype)
-        ignore_mask = 1.0 - pos_mask - neg_candidate_mask
+        ignore_mask = 1.0 - geom_pos_mask - neg_candidate_mask
+
+    avg_joint_valid_views = zero
+    semantic_pos_keep_ratio = zero
+    pos_mask = geom_pos_mask
+
+    if support_cameras is not None and len(support_cameras) > 0:
+        flat_point_ids = torch.cat([sample_indices, neighbor_indices_tensor.reshape(-1)], dim=0)
+        unique_point_ids, inverse_ids = torch.unique(flat_point_ids, sorted=False, return_inverse=True)
+        unique_xyz = xyz[unique_point_ids]
+        view_labels, view_valid = collect_multiview_labels(
+            support_cameras,
+            unique_xyz,
+            ignore_label=sem_ignore_label,
+        )
+
+        if view_labels.shape[0] > 0:
+            sample_local = inverse_ids[:sample_count]
+            neighbor_local = inverse_ids[sample_count:].view(sample_count, effective_k)
+            neighbor_local_flat = neighbor_local.reshape(-1)
+
+            sample_labels = view_labels[:, sample_local]
+            sample_valid = view_valid[:, sample_local]
+            neighbor_labels = view_labels[:, neighbor_local_flat].view(view_labels.shape[0], sample_count, effective_k)
+            neighbor_valid = view_valid[:, neighbor_local_flat].view(view_valid.shape[0], sample_count, effective_k)
+
+            joint_valid = sample_valid.unsqueeze(-1) & neighbor_valid
+            same_label = (sample_labels.unsqueeze(-1) == neighbor_labels) & joint_valid
+
+            joint_valid_count = joint_valid.to(cosine_sim.dtype).sum(dim=0)
+            same_ratio = same_label.to(cosine_sim.dtype).sum(dim=0) / (joint_valid_count + eps)
+            semantic_pos_mask = (
+                (joint_valid_count >= max(int(sem_min_views), 1))
+                & (same_ratio >= sem_pos_ratio)
+            ).to(cosine_sim.dtype)
+
+            geom_pos_count = geom_pos_mask.sum()
+            kept_pos_mask = geom_pos_mask * semantic_pos_mask
+            avg_joint_valid_views = (geom_pos_mask * joint_valid_count).sum() / (geom_pos_count + eps)
+            semantic_pos_keep_ratio = kept_pos_mask.sum() / (geom_pos_count + eps)
+
+            pos_mask = kept_pos_mask
+            ignore_mask = torch.clamp(ignore_mask + (geom_pos_mask - kept_pos_mask), min=0.0, max=1.0)
 
     pos_count = pos_mask.sum()
     neg_candidate_count = neg_candidate_mask.sum()
@@ -384,5 +431,7 @@ def loss_geo_contrastive_cosine(
         active_neg_ratio,
         neg_candidate_ratio,
         ignore_ratio,
+        avg_joint_valid_views,
+        semantic_pos_keep_ratio,
     )
     

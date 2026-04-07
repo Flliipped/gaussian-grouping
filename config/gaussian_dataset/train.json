@@ -19,5 +19,10 @@
     "geo_plane_tau": 0.01,
     "geo_neg_plane_tau": 0.02,
     "geo_neg_margin": 0.8,
-    "geo_hard_neg_k": 2
+    "geo_hard_neg_k": 2,
+    "geo_use_multiview_semantics": false,
+    "geo_support_views": 3,
+    "geo_sem_pos_ratio": 0.7,
+    "geo_sem_min_views": 2,
+    "geo_sem_ignore_label": -1
 }

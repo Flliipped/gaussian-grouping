@@ -109,6 +109,11 @@ class OptimizationParams(ParamGroup):
         self.geo_neg_margin = 0.8
         self.geo_margin = 0.3
         self.geo_hard_neg_k = 2
+        self.geo_use_multiview_semantics = False
+        self.geo_support_views = 3
+        self.geo_sem_pos_ratio = 0.7
+        self.geo_sem_min_views = 2
+        self.geo_sem_ignore_label = -1
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0
