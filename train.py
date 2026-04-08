@@ -121,8 +121,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         active_neg_ratio = torch.tensor(0.0, device=image.device)
         neg_candidate_ratio = torch.tensor(0.0, device=image.device)
         ignore_ratio = torch.tensor(0.0, device=image.device)
-        avg_joint_valid_views = torch.tensor(0.0, device=image.device)
+        avg_sem_valid_views = torch.tensor(0.0, device=image.device)
+        avg_sem_confidence = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
+        semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
 
         if geo_active:
@@ -147,7 +149,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             visibility_masks.append(support_render_pkg["visibility_filter"].detach())
                 support_visibility = torch.stack(visibility_masks, dim=0)
 
-            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_joint_valid_views, semantic_pos_keep_ratio = loss_geo_contrastive_cosine(
+            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
                 point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
@@ -163,8 +165,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 hard_neg_k=opt.geo_hard_neg_k,
                 support_cameras=support_cameras,
                 support_visibility=support_visibility,
-                sem_pos_ratio=opt.geo_sem_pos_ratio,
                 sem_min_views=opt.geo_sem_min_views,
+                sem_conf_tau=opt.geo_sem_conf_tau,
+                sem_num_classes=num_classes,
                 sem_ignore_label=opt.geo_sem_ignore_label,
             )
             loss_geo = geo_coeff * loss_geo_raw
@@ -190,8 +193,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"active_neg_ratio={active_neg_ratio.item():.6f}, "
                     f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
                     f"ignore_ratio={ignore_ratio.item():.6f}, "
-                    f"avg_joint_valid_views={avg_joint_valid_views.item():.6f}, "
-                    f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}"
+                    f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
+                    f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
+                    f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
+                    f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}"
                 )
 
 
@@ -209,7 +214,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_joint_valid_views, semantic_pos_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -254,7 +259,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_joint_valid_views, semantic_pos_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -284,8 +289,10 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
                 "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
                 "train_loss_patches/ignore_ratio": ignore_ratio.item(),
-                "train_loss_patches/avg_joint_valid_views": avg_joint_valid_views.item(),
+                "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
+                "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
                 "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
+                "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
             })
 
         wandb.log(log_data)
@@ -377,6 +384,7 @@ if __name__ == "__main__":
     args.geo_support_views = config.get("geo_support_views", 3)
     args.geo_sem_pos_ratio = config.get("geo_sem_pos_ratio", 0.7)
     args.geo_sem_min_views = config.get("geo_sem_min_views", 2)
+    args.geo_sem_conf_tau = config.get("geo_sem_conf_tau", args.geo_sem_pos_ratio)
     args.geo_sem_ignore_label = config.get("geo_sem_ignore_label", -1)
     args.geo_alpha = config.get("geo_alpha", 2.0)
     args.geo_beta = config.get("geo_beta", 1.0)

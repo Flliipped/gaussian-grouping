@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 from scipy.spatial import cKDTree
-from utils.multiview_utils import collect_multiview_labels
+from utils.multiview_utils import collect_multiview_labels, compute_point_label_consensus
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -287,8 +287,9 @@ def loss_geo_contrastive_cosine(
     hard_neg_k=2,
     support_cameras=None,
     support_visibility=None,
-    sem_pos_ratio=0.7,
     sem_min_views=2,
+    sem_conf_tau=0.7,
+    sem_num_classes=None,
     sem_ignore_label=-1,
     eps=1e-8,
 ):
@@ -303,12 +304,12 @@ def loss_geo_contrastive_cosine(
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     raw_feature_norm = torch.norm(features, dim=-1)
     normalized_features = F.normalize(features, dim=-1, eps=eps)
@@ -340,15 +341,18 @@ def loss_geo_contrastive_cosine(
     # and the ambiguous band between them is ignored.
     geom_pos_mask = (plane_residual < plane_tau).to(cosine_sim.dtype)
     if neg_plane_tau is None or neg_plane_tau <= plane_tau:
-        neg_candidate_mask = 1.0 - geom_pos_mask
+        geom_neg_mask = 1.0 - geom_pos_mask
         ignore_mask = torch.zeros_like(geom_pos_mask)
     else:
-        neg_candidate_mask = (plane_residual > neg_plane_tau).to(cosine_sim.dtype)
-        ignore_mask = 1.0 - geom_pos_mask - neg_candidate_mask
+        geom_neg_mask = (plane_residual > neg_plane_tau).to(cosine_sim.dtype)
+        ignore_mask = 1.0 - geom_pos_mask - geom_neg_mask
 
-    avg_joint_valid_views = zero
+    avg_sem_valid_views = zero
+    avg_sem_confidence = zero
     semantic_pos_keep_ratio = zero
+    semantic_neg_keep_ratio = zero
     pos_mask = geom_pos_mask
+    neg_candidate_mask = geom_neg_mask
 
     if support_cameras is not None and len(support_cameras) > 0:
         flat_point_ids = torch.cat([sample_indices, neighbor_indices_tensor.reshape(-1)], dim=0)
@@ -364,32 +368,41 @@ def loss_geo_contrastive_cosine(
         )
 
         if view_labels.shape[0] > 0:
+            point_sem_label, point_sem_valid, point_sem_confidence, point_valid_view_count = compute_point_label_consensus(
+                view_labels,
+                view_valid,
+                num_classes=sem_num_classes,
+                min_views=sem_min_views,
+                conf_tau=sem_conf_tau,
+            )
+
             sample_local = inverse_ids[:sample_count]
             neighbor_local = inverse_ids[sample_count:].view(sample_count, effective_k)
             neighbor_local_flat = neighbor_local.reshape(-1)
 
-            sample_labels = view_labels[:, sample_local]
-            sample_valid = view_valid[:, sample_local]
-            neighbor_labels = view_labels[:, neighbor_local_flat].view(view_labels.shape[0], sample_count, effective_k)
-            neighbor_valid = view_valid[:, neighbor_local_flat].view(view_valid.shape[0], sample_count, effective_k)
+            sample_labels = point_sem_label[sample_local]
+            sample_valid = point_sem_valid[sample_local]
+            neighbor_labels = point_sem_label[neighbor_local_flat].view(sample_count, effective_k)
+            neighbor_valid = point_sem_valid[neighbor_local_flat].view(sample_count, effective_k)
 
-            joint_valid = sample_valid.unsqueeze(-1) & neighbor_valid
-            same_label = (sample_labels.unsqueeze(-1) == neighbor_labels) & joint_valid
+            sample_pair_valid = sample_valid.unsqueeze(-1)
+            sem_pair_valid = sample_pair_valid & neighbor_valid
+            semantic_pos_mask = (sem_pair_valid & (sample_labels.unsqueeze(-1) == neighbor_labels)).to(cosine_sim.dtype)
+            semantic_neg_mask = (sem_pair_valid & (sample_labels.unsqueeze(-1) != neighbor_labels)).to(cosine_sim.dtype)
 
-            joint_valid_count = joint_valid.to(cosine_sim.dtype).sum(dim=0)
-            same_ratio = same_label.to(cosine_sim.dtype).sum(dim=0) / (joint_valid_count + eps)
-            semantic_pos_mask = (
-                (joint_valid_count >= max(int(sem_min_views), 1))
-                & (same_ratio >= sem_pos_ratio)
-            ).to(cosine_sim.dtype)
-
+            sem_valid_point_count = point_sem_valid.to(cosine_sim.dtype).sum()
+            avg_sem_valid_views = (point_sem_valid.to(point_valid_view_count.dtype) * point_valid_view_count).sum() / (sem_valid_point_count + eps)
+            avg_sem_confidence = (point_sem_valid.to(point_sem_confidence.dtype) * point_sem_confidence).sum() / (sem_valid_point_count + eps)
             geom_pos_count = geom_pos_mask.sum()
-            kept_pos_mask = geom_pos_mask * semantic_pos_mask
-            avg_joint_valid_views = (geom_pos_mask * joint_valid_count).sum() / (geom_pos_count + eps)
-            semantic_pos_keep_ratio = kept_pos_mask.sum() / (geom_pos_count + eps)
+            geom_neg_count = geom_neg_mask.sum()
+            pos_mask = geom_pos_mask * semantic_pos_mask
+            neg_candidate_mask = geom_neg_mask * semantic_neg_mask
+            semantic_pos_keep_ratio = pos_mask.sum() / (geom_pos_count + eps)
+            semantic_neg_keep_ratio = neg_candidate_mask.sum() / (geom_neg_count + eps)
 
-            pos_mask = kept_pos_mask
-            ignore_mask = torch.clamp(ignore_mask + (geom_pos_mask - kept_pos_mask), min=0.0, max=1.0)
+            covered_geom_mask = geom_pos_mask + geom_neg_mask
+            accepted_pair_mask = pos_mask + neg_candidate_mask
+            ignore_mask = torch.clamp(ignore_mask + (covered_geom_mask - accepted_pair_mask), min=0.0, max=1.0)
 
     pos_count = pos_mask.sum()
     neg_candidate_count = neg_candidate_mask.sum()
@@ -438,7 +451,9 @@ def loss_geo_contrastive_cosine(
         active_neg_ratio,
         neg_candidate_ratio,
         ignore_ratio,
-        avg_joint_valid_views,
+        avg_sem_valid_views,
+        avg_sem_confidence,
         semantic_pos_keep_ratio,
+        semantic_neg_keep_ratio,
     )
     

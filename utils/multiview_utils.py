@@ -103,3 +103,52 @@ def collect_multiview_labels(cameras, points, point_ids=None, visibility_masks=N
         valid_masks.append(cam_valid)
 
     return torch.stack(labels, dim=0), torch.stack(valid_masks, dim=0)
+
+
+def compute_point_label_consensus(view_labels, view_valid, num_classes=None, min_views=2, conf_tau=0.7):
+    """
+    Build a Gaussian-level pseudo label from multi-view votes.
+
+    Returns:
+        consensus_label: [P] long
+        consensus_valid: [P] bool
+        consensus_confidence: [P] float in [0, 1]
+        valid_view_count: [P] float
+    """
+    device = view_labels.device
+    num_points = view_labels.shape[1]
+
+    consensus_label = torch.full((num_points,), -1, device=device, dtype=torch.long)
+    consensus_valid = torch.zeros((num_points,), device=device, dtype=torch.bool)
+    consensus_confidence = torch.zeros((num_points,), device=device, dtype=torch.float32)
+    valid_view_count = view_valid.to(torch.float32).sum(dim=0)
+
+    if view_labels.numel() == 0 or num_points == 0:
+        return consensus_label, consensus_valid, consensus_confidence, valid_view_count
+
+    valid_mask = view_valid.bool()
+    if not valid_mask.any():
+        return consensus_label, consensus_valid, consensus_confidence, valid_view_count
+
+    valid_labels = view_labels[valid_mask]
+    if num_classes is None:
+        num_classes = int(valid_labels.max().item()) + 1 if valid_labels.numel() > 0 else 1
+    num_classes = max(int(num_classes), 1)
+
+    point_ids = torch.arange(num_points, device=device).unsqueeze(0).expand_as(view_labels)
+    flat_point_ids = point_ids[valid_mask]
+    flat_labels = valid_labels.long().clamp(min=0, max=num_classes - 1)
+
+    vote_bins = flat_point_ids * num_classes + flat_labels
+    vote_counts = torch.bincount(vote_bins, minlength=num_points * num_classes)
+    vote_counts = vote_counts.view(num_points, num_classes).to(torch.float32)
+
+    max_votes, best_labels = vote_counts.max(dim=1)
+    confidence = max_votes / valid_view_count.clamp_min(1.0)
+    is_confident = (valid_view_count >= max(int(min_views), 1)) & (confidence >= conf_tau)
+
+    consensus_label[is_confident] = best_labels[is_confident]
+    consensus_valid = is_confident
+    consensus_confidence = confidence
+
+    return consensus_label, consensus_valid, consensus_confidence, valid_view_count
