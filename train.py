@@ -131,6 +131,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
 
             support_cameras = None
+            support_visibility = None
             if opt.geo_use_multiview_semantics:
                 candidate_cameras = [cam for cam in scene.getTrainCameras() if cam.uid != viewpoint_cam.uid]
                 num_support = min(max(int(opt.geo_support_views), 0), len(candidate_cameras))
@@ -138,9 +139,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if num_support > 0:
                     support_cameras.extend(sample(candidate_cameras, num_support))
 
+                visibility_masks = [visibility_filter.detach()]
+                if len(support_cameras) > 1:
+                    with torch.no_grad():
+                        for support_cam in support_cameras[1:]:
+                            support_render_pkg = render(support_cam, gaussians, pipe, background)
+                            visibility_masks.append(support_render_pkg["visibility_filter"].detach())
+                support_visibility = torch.stack(visibility_masks, dim=0)
+
             loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_joint_valid_views, semantic_pos_keep_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
+                point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
                 k=opt.geo_knn_k,
                 lambda_val=1.0,
                 lambda_pos=opt.geo_lambda_pos,
@@ -152,6 +162,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 neg_margin=opt.geo_neg_margin,
                 hard_neg_k=opt.geo_hard_neg_k,
                 support_cameras=support_cameras,
+                support_visibility=support_visibility,
                 sem_pos_ratio=opt.geo_sem_pos_ratio,
                 sem_min_views=opt.geo_sem_min_views,
                 sem_ignore_label=opt.geo_sem_ignore_label,

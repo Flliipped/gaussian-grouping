@@ -274,6 +274,7 @@ def loss_geo_contrastive_boundary(
 def loss_geo_contrastive_cosine(
     xyz,
     features,
+    point_ids=None,
     k=8,
     lambda_val=1.0,
     lambda_pos=1.0,
@@ -285,6 +286,7 @@ def loss_geo_contrastive_cosine(
     neg_margin=0.2,
     hard_neg_k=2,
     support_cameras=None,
+    support_visibility=None,
     sem_pos_ratio=0.7,
     sem_min_views=2,
     sem_ignore_label=-1,
@@ -296,6 +298,8 @@ def loss_geo_contrastive_cosine(
         selected_indices = torch.randperm(features.size(0), device=features.device)[:max_points]
         xyz = xyz[selected_indices]
         features = features[selected_indices]
+        if point_ids is not None:
+            point_ids = point_ids[selected_indices]
 
     num_points = features.size(0)
     if num_points < 2:
@@ -350,9 +354,12 @@ def loss_geo_contrastive_cosine(
         flat_point_ids = torch.cat([sample_indices, neighbor_indices_tensor.reshape(-1)], dim=0)
         unique_point_ids, inverse_ids = torch.unique(flat_point_ids, sorted=False, return_inverse=True)
         unique_xyz = xyz[unique_point_ids]
+        unique_global_point_ids = unique_point_ids if point_ids is None else point_ids[unique_point_ids]
         view_labels, view_valid = collect_multiview_labels(
             support_cameras,
             unique_xyz,
+            point_ids=unique_global_point_ids,
+            visibility_masks=support_visibility,
             ignore_label=sem_ignore_label,
         )
 

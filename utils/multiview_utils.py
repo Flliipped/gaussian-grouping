@@ -41,7 +41,7 @@ def project_points_to_camera(points, camera):
     return u, v, valid
 
 
-def sample_camera_labels(camera, points, ignore_label=-1):
+def sample_camera_labels(camera, points, point_ids=None, visibility_mask=None, ignore_label=-1):
     """
     Sample per-point pseudo labels from a camera's 2D object mask using nearest
     pixel lookup after projection.
@@ -55,6 +55,8 @@ def sample_camera_labels(camera, points, ignore_label=-1):
         return labels, valid
 
     u, v, proj_valid = project_points_to_camera(points, camera)
+    if visibility_mask is not None and point_ids is not None:
+        proj_valid = proj_valid & visibility_mask[point_ids]
     if not proj_valid.any():
         return labels, valid
 
@@ -74,7 +76,7 @@ def sample_camera_labels(camera, points, ignore_label=-1):
     return labels, valid
 
 
-def collect_multiview_labels(cameras, points, ignore_label=-1):
+def collect_multiview_labels(cameras, points, point_ids=None, visibility_masks=None, ignore_label=-1):
     """
     Gather per-camera labels and visibility flags for a shared set of 3D points.
     """
@@ -86,8 +88,17 @@ def collect_multiview_labels(cameras, points, ignore_label=-1):
 
     labels = []
     valid_masks = []
-    for camera in cameras:
-        cam_labels, cam_valid = sample_camera_labels(camera, points, ignore_label=ignore_label)
+    for view_idx, camera in enumerate(cameras):
+        visibility_mask = None
+        if visibility_masks is not None and view_idx < len(visibility_masks):
+            visibility_mask = visibility_masks[view_idx]
+        cam_labels, cam_valid = sample_camera_labels(
+            camera,
+            points,
+            point_ids=point_ids,
+            visibility_mask=visibility_mask,
+            ignore_label=ignore_label,
+        )
         labels.append(cam_labels)
         valid_masks.append(cam_valid)
 
