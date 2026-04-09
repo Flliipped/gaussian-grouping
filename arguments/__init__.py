@@ -106,6 +106,9 @@ class OptimizationParams(ParamGroup):
         self.geo_sample_size = 800
         self.geo_plane_tau = 0.01
         self.geo_neg_plane_tau = 0.02
+        self.geo_spatial_pos_scale = 0.75
+        self.geo_normal_pos_tau = 0.75
+        self.geo_normal_neg_tau = 0.4
         self.geo_neg_margin = 0.8
         self.geo_margin = 0.3
         self.geo_hard_neg_k = 2
@@ -113,7 +116,12 @@ class OptimizationParams(ParamGroup):
         self.geo_support_views = 3
         self.geo_sem_pos_ratio = 0.7
         self.geo_sem_min_views = 2
+        self.geo_sem_conf_tau = 0.7
         self.geo_sem_ignore_label = -1
+        self.geo_normal_weight_lambda = 5.0
+        self.geo_sem_same_boost = 1.0
+        self.geo_sem_neg_boost = 1.0
+        self.geo_sem_conflict_penalty = 0.75
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0

@@ -112,7 +112,7 @@ def compute_point_label_consensus(view_labels, view_valid, num_classes=None, min
     Returns:
         consensus_label: [P] long
         consensus_valid: [P] bool
-        consensus_confidence: [P] float in [0, 1]
+        consensus_confidence: [P] float in [0, 1], softened instead of hard-thresholded
         valid_view_count: [P] float
     """
     device = view_labels.device
@@ -145,10 +145,18 @@ def compute_point_label_consensus(view_labels, view_valid, num_classes=None, min
 
     max_votes, best_labels = vote_counts.max(dim=1)
     confidence = max_votes / valid_view_count.clamp_min(1.0)
-    is_confident = (valid_view_count >= max(int(min_views), 1)) & (confidence >= conf_tau)
+    is_supported = valid_view_count >= max(int(min_views), 1)
 
-    consensus_label[is_confident] = best_labels[is_confident]
-    consensus_valid = is_confident
-    consensus_confidence = confidence
+    # Keep a soft confidence instead of hard-rejecting low-confidence votes.
+    # This matches the training strategy of downweighting noisy pseudo labels.
+    confidence_soft = confidence * torch.sigmoid((confidence - conf_tau) / 0.1)
+
+    consensus_label[is_supported] = best_labels[is_supported]
+    consensus_valid = is_supported
+    consensus_confidence = torch.where(
+        is_supported,
+        confidence_soft,
+        torch.zeros_like(confidence_soft),
+    )
 
     return consensus_label, consensus_valid, consensus_confidence, valid_view_count

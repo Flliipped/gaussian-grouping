@@ -115,6 +115,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         pos_loss = torch.tensor(0.0, device=image.device)
         neg_loss = torch.tensor(0.0, device=image.device)
         avg_feature_norm = torch.tensor(0.0, device=image.device)
+        avg_normal_cosine = torch.tensor(0.0, device=image.device)
         avg_pos_cosine = torch.tensor(0.0, device=image.device)
         avg_neg_cosine = torch.tensor(0.0, device=image.device)
         avg_hard_neg_cosine = torch.tensor(0.0, device=image.device)
@@ -149,7 +150,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             visibility_masks.append(support_render_pkg["visibility_filter"].detach())
                 support_visibility = torch.stack(visibility_masks, dim=0)
 
-            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
+            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
                 point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
@@ -161,6 +162,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sample_size=opt.geo_sample_size,
                 plane_tau=opt.geo_plane_tau,
                 neg_plane_tau=opt.geo_neg_plane_tau,
+                spatial_pos_scale=opt.geo_spatial_pos_scale,
+                normal_pos_tau=opt.geo_normal_pos_tau,
+                normal_neg_tau=opt.geo_normal_neg_tau,
                 neg_margin=opt.geo_neg_margin,
                 hard_neg_k=opt.geo_hard_neg_k,
                 support_cameras=support_cameras,
@@ -169,6 +173,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sem_conf_tau=opt.geo_sem_conf_tau,
                 sem_num_classes=num_classes,
                 sem_ignore_label=opt.geo_sem_ignore_label,
+                normal_weight_lambda=opt.geo_normal_weight_lambda,
+                sem_same_boost=opt.geo_sem_same_boost,
+                sem_neg_boost=opt.geo_sem_neg_boost,
+                sem_conflict_penalty=opt.geo_sem_conflict_penalty,
             )
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
@@ -187,6 +195,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"gate_ratio={gate_ratio.item():.4f}, "
                     f"avg_plane_residual={avg_plane_residual.item():.6f}, "
                     f"avg_feature_norm={avg_feature_norm.item():.6f}, "
+                    f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
                     f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
                     f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
                     f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
@@ -214,7 +223,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -259,7 +268,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -283,6 +292,7 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/gate_ratio": gate_ratio.item(),
                 "train_loss_patches/avg_plane_residual": avg_plane_residual.item(),
                 "train_loss_patches/avg_feature_norm": avg_feature_norm.item(),
+                "train_loss_patches/avg_normal_cosine": avg_normal_cosine.item(),
                 "train_loss_patches/avg_pos_cosine": avg_pos_cosine.item(),
                 "train_loss_patches/avg_neg_cosine": avg_neg_cosine.item(),
                 "train_loss_patches/avg_hard_neg_cosine": avg_hard_neg_cosine.item(),
@@ -378,6 +388,9 @@ if __name__ == "__main__":
     args.geo_sample_size = config.get("geo_sample_size", 800)
     args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
     args.geo_neg_plane_tau = config.get("geo_neg_plane_tau", 0.02)
+    args.geo_spatial_pos_scale = config.get("geo_spatial_pos_scale", 0.75)
+    args.geo_normal_pos_tau = config.get("geo_normal_pos_tau", 0.75)
+    args.geo_normal_neg_tau = config.get("geo_normal_neg_tau", 0.4)
     args.geo_neg_margin = config.get("geo_neg_margin", 0.8)
     args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
     args.geo_use_multiview_semantics = config.get("geo_use_multiview_semantics", False)
@@ -386,6 +399,10 @@ if __name__ == "__main__":
     args.geo_sem_min_views = config.get("geo_sem_min_views", 2)
     args.geo_sem_conf_tau = config.get("geo_sem_conf_tau", args.geo_sem_pos_ratio)
     args.geo_sem_ignore_label = config.get("geo_sem_ignore_label", -1)
+    args.geo_normal_weight_lambda = config.get("geo_normal_weight_lambda", 5.0)
+    args.geo_sem_same_boost = config.get("geo_sem_same_boost", 1.0)
+    args.geo_sem_neg_boost = config.get("geo_sem_neg_boost", 1.0)
+    args.geo_sem_conflict_penalty = config.get("geo_sem_conflict_penalty", 0.75)
     args.geo_alpha = config.get("geo_alpha", 2.0)
     args.geo_beta = config.get("geo_beta", 1.0)
     args.geo_gamma = config.get("geo_gamma", 1.0)
