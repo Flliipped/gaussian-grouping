@@ -272,6 +272,21 @@ def loss_geo_contrastive_boundary(
     )
 
 
+def extract_surface_axis_and_flatness(scaling, rotation, eps=1e-8):
+    rotation_matrix = build_rotation(rotation)
+    min_axis_idx = torch.argmin(scaling, dim=-1)
+    surface_axis = torch.gather(
+        rotation_matrix,
+        2,
+        min_axis_idx.view(-1, 1, 1).expand(-1, 3, 1),
+    ).squeeze(-1)
+    surface_axis = F.normalize(surface_axis, dim=-1, eps=eps)
+
+    sorted_scaling, _ = torch.sort(scaling, dim=-1)
+    flat_ratio = sorted_scaling[:, 0] / (0.5 * (sorted_scaling[:, 1] + sorted_scaling[:, 2]) + eps)
+    return surface_axis, flat_ratio
+
+
 def loss_sugar_surface_alignment(
     xyz,
     scaling,
@@ -322,14 +337,7 @@ def loss_sugar_surface_alignment(
     _, eigvecs = torch.linalg.eigh(cov)
     pca_normals = eigvecs[:, :, 0].detach()
 
-    rotation_matrix = build_rotation(sample_rotation)
-    min_axis_idx = torch.argmin(sample_scaling, dim=-1)
-    surface_axis = torch.gather(
-        rotation_matrix,
-        2,
-        min_axis_idx.view(-1, 1, 1).expand(-1, 3, 1),
-    ).squeeze(-1)
-    surface_axis = F.normalize(surface_axis, dim=-1, eps=eps)
+    surface_axis, flat_ratio = extract_surface_axis_and_flatness(sample_scaling, sample_rotation, eps=eps)
 
     axis_align_cosine = torch.abs((surface_axis * pca_normals).sum(dim=-1)).clamp(0.0, 1.0)
     axis_loss = (1.0 - axis_align_cosine).mean()
@@ -339,9 +347,6 @@ def loss_sugar_surface_alignment(
     local_radius = neighbor_dists[:, -1:].clamp_min(eps)
     normalized_plane_residual = plane_residual / local_radius
     plane_loss = normalized_plane_residual.mean()
-
-    sorted_scaling, _ = torch.sort(sample_scaling, dim=-1)
-    flat_ratio = sorted_scaling[:, 0] / (0.5 * (sorted_scaling[:, 1] + sorted_scaling[:, 2]) + eps)
     flat_loss = flat_ratio.mean()
 
     loss = lambda_axis * axis_loss + lambda_plane * plane_loss + lambda_flat * flat_loss
@@ -358,6 +363,8 @@ def loss_sugar_surface_alignment(
 def loss_geo_contrastive_cosine(
     xyz,
     features,
+    scaling=None,
+    rotation=None,
     point_ids=None,
     k=8,
     lambda_val=1.0,
@@ -382,6 +389,9 @@ def loss_geo_contrastive_cosine(
     sem_same_boost=1.0,
     sem_neg_boost=1.0,
     sem_conflict_penalty=0.75,
+    surface_align_tau=0.6,
+    surface_flat_tau=0.2,
+    surface_fusion_temperature=10.0,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -390,17 +400,21 @@ def loss_geo_contrastive_cosine(
         selected_indices = torch.randperm(features.size(0), device=features.device)[:max_points]
         xyz = xyz[selected_indices]
         features = features[selected_indices]
+        if scaling is not None:
+            scaling = scaling[selected_indices]
+        if rotation is not None:
+            rotation = rotation[selected_indices]
         if point_ids is not None:
             point_ids = point_ids[selected_indices]
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
 
     raw_feature_norm = torch.norm(features, dim=-1)
     normalized_features = F.normalize(features, dim=-1, eps=eps)
@@ -430,7 +444,33 @@ def loss_geo_contrastive_cosine(
     unique_cov = torch.matmul(unique_local_xyz.transpose(1, 2), unique_local_xyz) / (effective_k + eps)
 
     _, unique_eigvecs = torch.linalg.eigh(unique_cov)
-    unique_normals = unique_eigvecs[:, :, 0]
+    unique_pca_normals = unique_eigvecs[:, :, 0]
+
+    avg_surface_confidence = zero
+    avg_surface_axis_align = zero
+    if scaling is not None and rotation is not None:
+        unique_scaling = scaling[unique_point_ids]
+        unique_rotation = rotation[unique_point_ids]
+        unique_surface_axis, unique_flat_ratio = extract_surface_axis_and_flatness(unique_scaling, unique_rotation, eps=eps)
+        surface_dot = (unique_surface_axis * unique_pca_normals).sum(dim=-1)
+        aligned_surface_axis = torch.where(surface_dot.unsqueeze(-1) < 0, -unique_surface_axis, unique_surface_axis)
+        unique_axis_align_cosine = torch.abs(surface_dot).clamp(0.0, 1.0)
+
+        align_conf = torch.sigmoid(surface_fusion_temperature * (unique_axis_align_cosine - surface_align_tau))
+        flat_conf = torch.sigmoid(surface_fusion_temperature * (surface_flat_tau - unique_flat_ratio))
+        unique_surface_confidence = align_conf * flat_conf
+
+        unique_normals = F.normalize(
+            unique_surface_confidence.unsqueeze(-1) * aligned_surface_axis
+            + (1.0 - unique_surface_confidence).unsqueeze(-1) * unique_pca_normals,
+            dim=-1,
+            eps=eps,
+        )
+        avg_surface_confidence = unique_surface_confidence.mean()
+        avg_surface_axis_align = unique_axis_align_cosine.mean()
+    else:
+        unique_normals = unique_pca_normals
+
     sample_local = inverse_ids[:sample_count]
     neighbor_local = inverse_ids[sample_count:].view(sample_count, effective_k)
     sample_normals = unique_normals[sample_local]
@@ -589,6 +629,8 @@ def loss_geo_contrastive_cosine(
         avg_pos_cosine,
         avg_neg_cosine,
         avg_hard_neg_cosine,
+        avg_surface_confidence,
+        avg_surface_axis_align,
         active_neg_ratio,
         neg_candidate_ratio,
         ignore_ratio,

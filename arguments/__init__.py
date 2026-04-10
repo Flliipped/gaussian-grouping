@@ -122,6 +122,9 @@ class OptimizationParams(ParamGroup):
         self.geo_sem_same_boost = 1.0
         self.geo_sem_neg_boost = 1.0
         self.geo_sem_conflict_penalty = 0.75
+        self.geo_surface_align_tau = 0.6
+        self.geo_surface_flat_tau = 0.2
+        self.geo_surface_fusion_temperature = 10.0
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0
