@@ -46,5 +46,9 @@
     "geo_sem_conflict_penalty": 0.75,
     "geo_surface_align_tau": 0.6,
     "geo_surface_flat_tau": 0.2,
-    "geo_surface_fusion_temperature": 10.0
+    "geo_surface_fusion_temperature": 10.0,
+    "geo_surface_boundary_tau": 1.0,
+    "geo_surface_axis_tau": 0.85,
+    "geo_surface_pos_damp": 0.5,
+    "geo_surface_neg_boost": 0.75
 }

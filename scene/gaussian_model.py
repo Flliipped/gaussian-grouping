@@ -105,6 +105,25 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    @property
+    def get_surface_axis(self):
+        rotation_matrix = build_rotation(self._rotation)
+        min_axis_idx = torch.argmin(self.get_scaling, dim=-1)
+        return torch.gather(
+            rotation_matrix,
+            2,
+            min_axis_idx.view(-1, 1, 1).expand(-1, 3, 1),
+        ).squeeze(-1)
+
+    @property
+    def get_surface_flat_ratio(self):
+        sorted_scaling, _ = torch.sort(self.get_scaling, dim=-1)
+        return sorted_scaling[:, 0] / (0.5 * (sorted_scaling[:, 1] + sorted_scaling[:, 2]) + 1e-8)
+
+    @property
+    def get_surface_thickness(self):
+        return torch.min(self.get_scaling, dim=-1).values
     
     @property
     def get_features(self):
