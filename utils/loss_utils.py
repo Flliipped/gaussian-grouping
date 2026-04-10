@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 from scipy.spatial import cKDTree
+from utils.general_utils import build_rotation
 from utils.multiview_utils import collect_multiview_labels, compute_point_label_consensus
 
 def l1_loss(network_output, gt):
@@ -268,6 +269,89 @@ def loss_geo_contrastive_boundary(
         avg_boundary_weight,
         max_boundary_weight,
         std_boundary_weight,
+    )
+
+
+def loss_sugar_surface_alignment(
+    xyz,
+    scaling,
+    rotation,
+    k=8,
+    lambda_val=1.0,
+    lambda_axis=1.0,
+    lambda_plane=0.5,
+    lambda_flat=0.1,
+    max_points=200000,
+    sample_size=800,
+    eps=1e-8,
+):
+    zero = xyz.new_tensor(0.0)
+
+    if xyz.size(0) > max_points:
+        selected_indices = torch.randperm(xyz.size(0), device=xyz.device)[:max_points]
+        xyz = xyz[selected_indices]
+        scaling = scaling[selected_indices]
+        rotation = rotation[selected_indices]
+
+    num_points = xyz.size(0)
+    if num_points < 2:
+        return zero, zero, zero, zero, zero
+
+    sample_count = min(sample_size, num_points)
+    effective_k = min(k, num_points - 1)
+    if sample_count <= 0 or effective_k <= 0:
+        return zero, zero, zero, zero, zero
+
+    sample_indices = torch.randperm(num_points, device=xyz.device)[:sample_count]
+    detached_xyz = xyz.detach()
+    sample_xyz_detached = detached_xyz[sample_indices]
+    dists = torch.cdist(sample_xyz_detached, detached_xyz)
+    _, neighbor_indices = dists.topk(effective_k + 1, largest=False)
+    neighbor_indices = neighbor_indices[:, 1:]
+    neighbor_dists = torch.take_along_dim(dists, neighbor_indices, dim=1)
+
+    sample_xyz = xyz[sample_indices]
+    neighbor_xyz = xyz[neighbor_indices]
+    sample_scaling = scaling[sample_indices]
+    sample_rotation = rotation[sample_indices]
+
+    neighbor_xyz_detached = detached_xyz[neighbor_indices]
+    local_center = neighbor_xyz_detached.mean(dim=1, keepdim=True)
+    local_xyz = neighbor_xyz_detached - local_center
+    cov = torch.matmul(local_xyz.transpose(1, 2), local_xyz) / (effective_k + eps)
+    _, eigvecs = torch.linalg.eigh(cov)
+    pca_normals = eigvecs[:, :, 0].detach()
+
+    rotation_matrix = build_rotation(sample_rotation)
+    min_axis_idx = torch.argmin(sample_scaling, dim=-1)
+    surface_axis = torch.gather(
+        rotation_matrix,
+        2,
+        min_axis_idx.view(-1, 1, 1).expand(-1, 3, 1),
+    ).squeeze(-1)
+    surface_axis = F.normalize(surface_axis, dim=-1, eps=eps)
+
+    axis_align_cosine = torch.abs((surface_axis * pca_normals).sum(dim=-1)).clamp(0.0, 1.0)
+    axis_loss = (1.0 - axis_align_cosine).mean()
+
+    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
+    plane_residual = torch.abs((rel_xyz * surface_axis.unsqueeze(1)).sum(dim=-1))
+    local_radius = neighbor_dists[:, -1:].clamp_min(eps)
+    normalized_plane_residual = plane_residual / local_radius
+    plane_loss = normalized_plane_residual.mean()
+
+    sorted_scaling, _ = torch.sort(sample_scaling, dim=-1)
+    flat_ratio = sorted_scaling[:, 0] / (0.5 * (sorted_scaling[:, 1] + sorted_scaling[:, 2]) + eps)
+    flat_loss = flat_ratio.mean()
+
+    loss = lambda_axis * axis_loss + lambda_plane * plane_loss + lambda_flat * flat_loss
+
+    return (
+        lambda_val * loss,
+        axis_align_cosine.mean(),
+        plane_residual.mean(),
+        flat_ratio.mean(),
+        loss,
     )
 
 

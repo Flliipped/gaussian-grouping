@@ -126,6 +126,17 @@ class OptimizationParams(ParamGroup):
         self.geo_beta = 1.0
         self.geo_gamma = 1.0
         self.geo_weight_power = 2.0
+
+        self.sugar_start_iter = 15_000
+        self.sugar_interval = 10
+        self.sugar_warmup_iters = 2000
+        self.sugar_weight_lambda = 0.2
+        self.sugar_lambda_axis = 1.0
+        self.sugar_lambda_plane = 0.5
+        self.sugar_lambda_flat = 0.1
+        self.sugar_knn_k = 8
+        self.sugar_max_points = 200000
+        self.sugar_sample_size = 800
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

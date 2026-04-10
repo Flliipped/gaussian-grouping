@@ -9,7 +9,7 @@
 import os
 import torch
 from random import randint, sample
-from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_cosine
+from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_cosine, loss_sugar_surface_alignment
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -110,6 +110,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_geo_raw = torch.tensor(0.0, device=image.device)
         loss_geo = torch.tensor(0.0, device=image.device)
         geo_coeff = torch.tensor(0.0, device=image.device)
+        loss_sugar_raw = torch.tensor(0.0, device=image.device)
+        loss_sugar = torch.tensor(0.0, device=image.device)
+        sugar_coeff = torch.tensor(0.0, device=image.device)
+        sugar_axis_align_cosine = torch.tensor(0.0, device=image.device)
+        sugar_plane_residual = torch.tensor(0.0, device=image.device)
+        sugar_flat_ratio = torch.tensor(0.0, device=image.device)
         gate_ratio = torch.tensor(0.0, device=image.device)
         avg_plane_residual = torch.tensor(0.0, device=image.device)
         pos_loss = torch.tensor(0.0, device=image.device)
@@ -126,7 +132,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         avg_sem_confidence = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
         semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
+        sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
+
+        if sugar_active:
+            sugar_warmup_iters = max(1, opt.sugar_warmup_iters)
+            sugar_progress = min(max((iteration - opt.sugar_start_iter) / sugar_warmup_iters, 0.0), 1.0)
+            sugar_coeff = image.new_tensor(opt.sugar_weight_lambda * sugar_progress)
+            loss_sugar_raw, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, _ = loss_sugar_surface_alignment(
+                xyz=gaussians._xyz.squeeze(),
+                scaling=gaussians.get_scaling,
+                rotation=gaussians._rotation,
+                k=opt.sugar_knn_k,
+                lambda_val=1.0,
+                lambda_axis=opt.sugar_lambda_axis,
+                lambda_plane=opt.sugar_lambda_plane,
+                lambda_flat=opt.sugar_lambda_flat,
+                max_points=opt.sugar_max_points,
+                sample_size=opt.sugar_sample_size,
+            )
+            loss_sugar = sugar_coeff * loss_sugar_raw
+            loss = loss + loss_sugar
 
         if geo_active:
             warmup_iters = max(1, opt.geo_warmup_iters)
@@ -181,32 +207,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
 
-            if iteration % 100 == 0:
-                loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
-                print(
-                    f"[Iter {iteration}] "
-                    f"loss_obj={loss_obj.item():.6f}, "
-                    f"loss_obj_3d={loss_obj_3d_value:.6f}, "
-                    f"geo_coeff={geo_coeff.item():.6f}, "
-                    f"loss_geo_raw={loss_geo_raw.item():.6f}, "
-                    f"loss_geo={loss_geo.item():.6f}, "
-                    f"pos_loss={pos_loss.item():.6f}, "
-                    f"neg_loss={neg_loss.item():.6f}, "
-                    f"gate_ratio={gate_ratio.item():.4f}, "
-                    f"avg_plane_residual={avg_plane_residual.item():.6f}, "
-                    f"avg_feature_norm={avg_feature_norm.item():.6f}, "
-                    f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
-                    f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
-                    f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
-                    f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
-                    f"active_neg_ratio={active_neg_ratio.item():.6f}, "
-                    f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
-                    f"ignore_ratio={ignore_ratio.item():.6f}, "
-                    f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
-                    f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
-                    f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
-                    f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}"
+        if iteration % 100 == 0 and (sugar_active or geo_active):
+            loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
+            message = (
+                f"[Iter {iteration}] "
+                f"loss_obj={loss_obj.item():.6f}, "
+                f"loss_obj_3d={loss_obj_3d_value:.6f}, "
+            )
+            if sugar_active:
+                message += (
+                    f"sugar_coeff={sugar_coeff.item():.6f}, "
+                    f"loss_sugar_raw={loss_sugar_raw.item():.6f}, "
+                    f"loss_sugar={loss_sugar.item():.6f}, "
+                    f"sugar_axis_align_cosine={sugar_axis_align_cosine.item():.6f}, "
+                    f"sugar_plane_residual={sugar_plane_residual.item():.6f}, "
+                    f"sugar_flat_ratio={sugar_flat_ratio.item():.6f}, "
                 )
+            if geo_active:
+                print(
+                    message
+                    + f"geo_coeff={geo_coeff.item():.6f}, "
+                    + f"loss_geo_raw={loss_geo_raw.item():.6f}, "
+                    + f"loss_geo={loss_geo.item():.6f}, "
+                    + f"pos_loss={pos_loss.item():.6f}, "
+                    + f"neg_loss={neg_loss.item():.6f}, "
+                    + f"gate_ratio={gate_ratio.item():.4f}, "
+                    + f"avg_plane_residual={avg_plane_residual.item():.6f}, "
+                    + f"avg_feature_norm={avg_feature_norm.item():.6f}, "
+                    + f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
+                    + f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
+                    + f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
+                    + f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
+                    + f"active_neg_ratio={active_neg_ratio.item():.6f}, "
+                    + f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
+                    + f"ignore_ratio={ignore_ratio.item():.6f}, "
+                    + f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
+                    + f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
+                    + f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
+                    + f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}"
+                )
+            else:
+                print(message.rstrip(", "))
 
 
         loss.backward()
@@ -223,7 +264,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -268,12 +309,14 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
             "train_loss_patches/l1_loss": Ll1.item(),
             "train_loss_patches/total_loss": loss.item(),
+            "train_loss_patches/sugar_active": float(sugar_active),
+            "train_loss_patches/sugar_coeff": sugar_coeff.item(),
             "train_loss_patches/geo_active": float(geo_active),
             "train_loss_patches/geo_coeff": geo_coeff.item(),
             "iter_time": elapsed,
@@ -282,6 +325,15 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
 
         if loss_obj_3d is not None:
             log_data["train_loss_patches/loss_obj_3d"] = loss_obj_3d.item()
+
+        if sugar_active:
+            log_data.update({
+                "train_loss_patches/loss_sugar_raw": loss_sugar_raw.item(),
+                "train_loss_patches/loss_sugar": loss_sugar.item(),
+                "train_loss_patches/sugar_axis_align_cosine": sugar_axis_align_cosine.item(),
+                "train_loss_patches/sugar_plane_residual": sugar_plane_residual.item(),
+                "train_loss_patches/sugar_flat_ratio": sugar_flat_ratio.item(),
+            })
 
         if geo_active:
             log_data.update({
@@ -407,6 +459,16 @@ if __name__ == "__main__":
     args.geo_beta = config.get("geo_beta", 1.0)
     args.geo_gamma = config.get("geo_gamma", 1.0)
     args.geo_weight_power = config.get("geo_weight_power", 2.0)
+    args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
+    args.sugar_interval = config.get("sugar_interval", 10)
+    args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
+    args.sugar_weight_lambda = config.get("sugar_weight_lambda", 0.2)
+    args.sugar_lambda_axis = config.get("sugar_lambda_axis", 1.0)
+    args.sugar_lambda_plane = config.get("sugar_lambda_plane", 0.5)
+    args.sugar_lambda_flat = config.get("sugar_lambda_flat", 0.1)
+    args.sugar_knn_k = config.get("sugar_knn_k", 8)
+    args.sugar_max_points = config.get("sugar_max_points", 200000)
+    args.sugar_sample_size = config.get("sugar_sample_size", 800)
     print("Optimizing " + args.model_path)
 
     if args.use_wandb:

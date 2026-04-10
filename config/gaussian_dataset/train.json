@@ -7,6 +7,17 @@
     "reg3d_max_points": 200000,
     "reg3d_sample_size": 1000,
 
+    "sugar_start_iter": 10000,
+    "sugar_interval": 10,
+    "sugar_warmup_iters": 2000,
+    "sugar_weight_lambda": 0.2,
+    "sugar_lambda_axis": 1.0,
+    "sugar_lambda_plane": 0.5,
+    "sugar_lambda_flat": 0.1,
+    "sugar_knn_k": 8,
+    "sugar_max_points": 200000,
+    "sugar_sample_size": 800,
+
     "geo_start_iter" : 12000,
     "geo_interval": 10,
     "geo_knn_k": 8,
