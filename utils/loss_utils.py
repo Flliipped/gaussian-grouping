@@ -410,10 +410,13 @@ def loss_geo_contrastive_cosine(
     surface_align_tau=0.6,
     surface_flat_tau=0.2,
     surface_fusion_temperature=10.0,
+    surface_conf_tau=0.35,
     surface_boundary_tau=1.0,
     surface_axis_tau=0.85,
-    surface_pos_damp=0.5,
-    surface_neg_boost=0.75,
+    surface_depth_weight=1.0,
+    surface_axis_weight=0.0,
+    surface_pos_damp=0.0,
+    surface_neg_boost=0.25,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -523,6 +526,9 @@ def loss_geo_contrastive_cosine(
     pair_surface_confidence = torch.sqrt(
         torch.clamp(sample_surface_confidence.unsqueeze(-1) * neighbor_surface_confidence, min=0.0)
     )
+    surface_conf_gate = torch.sigmoid(
+        surface_fusion_temperature * (pair_surface_confidence - surface_conf_tau)
+    )
     thickness_normalized_residual = plane_residual / sample_surface_thickness
     surface_depth_score = torch.sigmoid(
         surface_fusion_temperature * (thickness_normalized_residual - surface_boundary_tau)
@@ -530,7 +536,12 @@ def loss_geo_contrastive_cosine(
     surface_axis_score = torch.sigmoid(
         surface_fusion_temperature * (surface_axis_tau - surface_axis_cosine)
     )
-    surface_boundary_score = pair_surface_confidence * 0.5 * (surface_depth_score + surface_axis_score)
+    surface_score_norm = max(surface_depth_weight + surface_axis_weight, eps)
+    surface_boundary_raw = (
+        surface_depth_weight * surface_depth_score
+        + surface_axis_weight * surface_axis_score
+    ) / surface_score_norm
+    surface_boundary_score = pair_surface_confidence * surface_conf_gate * surface_boundary_raw
     avg_surface_axis_cosine = surface_axis_cosine.mean()
     avg_surface_boundary_score = surface_boundary_score.mean()
 

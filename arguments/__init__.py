@@ -125,10 +125,13 @@ class OptimizationParams(ParamGroup):
         self.geo_surface_align_tau = 0.6
         self.geo_surface_flat_tau = 0.2
         self.geo_surface_fusion_temperature = 10.0
+        self.geo_surface_conf_tau = 0.35
         self.geo_surface_boundary_tau = 1.0
         self.geo_surface_axis_tau = 0.85
-        self.geo_surface_pos_damp = 0.5
-        self.geo_surface_neg_boost = 0.75
+        self.geo_surface_depth_weight = 1.0
+        self.geo_surface_axis_weight = 0.0
+        self.geo_surface_pos_damp = 0.0
+        self.geo_surface_neg_boost = 0.25
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0

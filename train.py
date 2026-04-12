@@ -212,8 +212,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 surface_align_tau=opt.geo_surface_align_tau,
                 surface_flat_tau=opt.geo_surface_flat_tau,
                 surface_fusion_temperature=opt.geo_surface_fusion_temperature,
+                surface_conf_tau=opt.geo_surface_conf_tau,
                 surface_boundary_tau=opt.geo_surface_boundary_tau,
                 surface_axis_tau=opt.geo_surface_axis_tau,
+                surface_depth_weight=opt.geo_surface_depth_weight,
+                surface_axis_weight=opt.geo_surface_axis_weight,
                 surface_pos_damp=opt.geo_surface_pos_damp,
                 surface_neg_boost=opt.geo_surface_neg_boost,
             )
@@ -479,10 +482,13 @@ if __name__ == "__main__":
     args.geo_surface_align_tau = config.get("geo_surface_align_tau", 0.6)
     args.geo_surface_flat_tau = config.get("geo_surface_flat_tau", 0.2)
     args.geo_surface_fusion_temperature = config.get("geo_surface_fusion_temperature", 10.0)
+    args.geo_surface_conf_tau = config.get("geo_surface_conf_tau", 0.35)
     args.geo_surface_boundary_tau = config.get("geo_surface_boundary_tau", 1.0)
     args.geo_surface_axis_tau = config.get("geo_surface_axis_tau", 0.85)
-    args.geo_surface_pos_damp = config.get("geo_surface_pos_damp", 0.5)
-    args.geo_surface_neg_boost = config.get("geo_surface_neg_boost", 0.75)
+    args.geo_surface_depth_weight = config.get("geo_surface_depth_weight", 1.0)
+    args.geo_surface_axis_weight = config.get("geo_surface_axis_weight", 0.0)
+    args.geo_surface_pos_damp = config.get("geo_surface_pos_damp", 0.0)
+    args.geo_surface_neg_boost = config.get("geo_surface_neg_boost", 0.25)
     args.geo_alpha = config.get("geo_alpha", 2.0)
     args.geo_beta = config.get("geo_beta", 1.0)
     args.geo_gamma = config.get("geo_gamma", 1.0)
