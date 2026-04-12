@@ -416,7 +416,7 @@ def loss_geo_contrastive_cosine(
     surface_depth_weight=1.0,
     surface_axis_weight=0.0,
     surface_pos_damp=0.0,
-    surface_neg_boost=0.25,
+    surface_neg_boost=0.0,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)

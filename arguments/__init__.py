@@ -131,7 +131,7 @@ class OptimizationParams(ParamGroup):
         self.geo_surface_depth_weight = 1.0
         self.geo_surface_axis_weight = 0.0
         self.geo_surface_pos_damp = 0.0
-        self.geo_surface_neg_boost = 0.25
+        self.geo_surface_neg_boost = 0.0
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0

@@ -53,5 +53,5 @@
     "geo_surface_depth_weight": 1.0,
     "geo_surface_axis_weight": 0.0,
     "geo_surface_pos_damp": 0.0,
-    "geo_surface_neg_boost": 0.25
+    "geo_surface_neg_boost": 0.0
 }

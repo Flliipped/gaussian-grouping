@@ -180,11 +180,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             visibility_masks.append(support_render_pkg["visibility_filter"].detach())
                 support_visibility = torch.stack(visibility_masks, dim=0)
 
+            surface_reweight_active = opt.geo_surface_pos_damp > 0.0 or opt.geo_surface_neg_boost > 0.0
+            surface_scaling = gaussians.get_scaling.detach() if surface_reweight_active else None
+            surface_rotation = gaussians._rotation.detach() if surface_reweight_active else None
+
             loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, avg_surface_confidence, avg_surface_axis_align, avg_surface_axis_cosine, avg_surface_boundary_score, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
-                scaling=gaussians.get_scaling.detach(),
-                rotation=gaussians._rotation.detach(),
+                scaling=surface_scaling,
+                rotation=surface_rotation,
                 point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
                 k=opt.geo_knn_k,
                 lambda_val=1.0,
