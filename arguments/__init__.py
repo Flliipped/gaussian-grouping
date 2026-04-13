@@ -102,6 +102,7 @@ class OptimizationParams(ParamGroup):
         self.geo_warmup_iters = 4000
         self.geo_lambda_pos = 1.0
         self.geo_lambda_neg = 1.0
+        self.geo_smooth_lambda = 0.1
         self.geo_max_points = 200000
         self.geo_sample_size = 800
         self.geo_plane_tau = 0.01
@@ -112,6 +113,7 @@ class OptimizationParams(ParamGroup):
         self.geo_neg_margin = 0.8
         self.geo_margin = 0.3
         self.geo_hard_neg_k = 2
+        self.geo_normal_source = "surface_axis"
         self.geo_use_multiview_semantics = False
         self.geo_support_views = 3
         self.geo_sem_pos_ratio = 0.7
@@ -126,6 +128,12 @@ class OptimizationParams(ParamGroup):
         self.geo_beta = 1.0
         self.geo_gamma = 1.0
         self.geo_weight_power = 2.0
+
+        self.distill_enable = False
+        self.distill_weight_lambda = 0.1
+        self.distill_feature_dir = "dino_feature"
+        self.distill_loss_type = "cosine"
+        self.distill_mask_eps = 1e-6
 
         self.sugar_start_iter = 15_000
         self.sugar_interval = 10

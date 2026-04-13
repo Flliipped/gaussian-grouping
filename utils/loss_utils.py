@@ -367,14 +367,16 @@ def loss_sugar_opacity_entropy(opacity, eps=1e-6):
     return entropy.mean()
 
 
-def loss_geo_contrastive_cosine(
+def loss_geo_gated_contrastive(
     xyz,
     features,
+    normals,
     point_ids=None,
     k=8,
     lambda_val=1.0,
     lambda_pos=1.0,
     lambda_neg=1.0,
+    smooth_lambda=0.1,
     max_points=200000,
     sample_size=800,
     plane_tau=0.01,
@@ -391,9 +393,7 @@ def loss_geo_contrastive_cosine(
     sem_num_classes=None,
     sem_ignore_label=-1,
     normal_weight_lambda=5.0,
-    sem_same_boost=1.0,
     sem_neg_boost=1.0,
-    sem_conflict_penalty=0.75,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -402,24 +402,70 @@ def loss_geo_contrastive_cosine(
         selected_indices = torch.randperm(features.size(0), device=features.device)[:max_points]
         xyz = xyz[selected_indices]
         features = features[selected_indices]
+        normals = normals[selected_indices]
         if point_ids is not None:
             point_ids = point_ids[selected_indices]
 
     num_points = features.size(0)
     if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return (
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+        )
 
     sample_count = min(sample_size, num_points)
     effective_k = min(k, num_points - 1)
     if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+        return (
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+        )
 
     raw_feature_norm = torch.norm(features, dim=-1)
-    normalized_features = F.normalize(features, dim=-1, eps=eps)
-
     sample_indices = torch.randperm(num_points, device=features.device)[:sample_count]
     sample_xyz = xyz[sample_indices]
-    sample_features = normalized_features[sample_indices]
+    sample_features = features[sample_indices]
+    sample_normals = F.normalize(normals[sample_indices], dim=-1, eps=eps)
 
     dists = torch.cdist(sample_xyz, xyz)
     _, neighbor_indices_tensor = dists.topk(effective_k + 1, largest=False)
@@ -427,65 +473,52 @@ def loss_geo_contrastive_cosine(
     neighbor_dists = torch.take_along_dim(dists, neighbor_indices_tensor, dim=1)
 
     neighbor_xyz = xyz[neighbor_indices_tensor]
-    neighbor_features = normalized_features[neighbor_indices_tensor]
+    neighbor_features = features[neighbor_indices_tensor]
+    neighbor_normals = F.normalize(normals[neighbor_indices_tensor], dim=-1, eps=eps)
+
+    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
+    feat_dist = torch.norm(neighbor_features - sample_features.unsqueeze(1), dim=-1)
+    aligned_normal_cos = torch.abs(
+        (sample_normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)
+    ).clamp(0.0, 1.0)
+    sample_depth_gap = torch.abs((rel_xyz * sample_normals.unsqueeze(1)).sum(dim=-1))
+    neighbor_depth_gap = torch.abs((rel_xyz * neighbor_normals).sum(dim=-1))
+    depth_gap = 0.5 * (sample_depth_gap + neighbor_depth_gap)
+
+    if normal_weight_lambda > 0:
+        normal_weight = torch.exp(normal_weight_lambda * (aligned_normal_cos - 1.0))
+    else:
+        normal_weight = torch.ones_like(aligned_normal_cos)
+
+    local_radius = neighbor_dists[:, -1:].clamp_min(eps)
+    spatial_ratio = neighbor_dists / local_radius
+    spatial_close = (spatial_ratio <= spatial_pos_scale).to(feat_dist.dtype)
+    normal_close = (aligned_normal_cos >= normal_pos_tau).to(feat_dist.dtype)
+    depth_close = (depth_gap < plane_tau).to(feat_dist.dtype)
+    geom_gate = spatial_close * normal_close * depth_close
+
+    if neg_plane_tau is None or neg_plane_tau <= plane_tau:
+        depth_far = 1.0 - depth_close
+    else:
+        depth_far = (depth_gap > neg_plane_tau).to(feat_dist.dtype)
+    normal_far = (aligned_normal_cos <= normal_neg_tau).to(feat_dist.dtype)
+    boundary_neg_mask = spatial_close * ((depth_far + normal_far) > 0).to(feat_dist.dtype) * (1.0 - geom_gate)
 
     flat_point_ids = torch.cat([sample_indices, neighbor_indices_tensor.reshape(-1)], dim=0)
     unique_point_ids, inverse_ids = torch.unique(flat_point_ids, sorted=False, return_inverse=True)
     unique_xyz = xyz[unique_point_ids]
-
-    unique_dists = torch.cdist(unique_xyz, xyz)
-    _, unique_neighbor_indices = unique_dists.topk(effective_k + 1, largest=False)
-    unique_neighbor_indices = unique_neighbor_indices[:, 1:]
-    unique_neighbor_xyz = xyz[unique_neighbor_indices]
-    unique_local_center = unique_neighbor_xyz.mean(dim=1, keepdim=True)
-    unique_local_xyz = unique_neighbor_xyz - unique_local_center
-    unique_cov = torch.matmul(unique_local_xyz.transpose(1, 2), unique_local_xyz) / (effective_k + eps)
-
-    _, unique_eigvecs = torch.linalg.eigh(unique_cov)
-    unique_normals = unique_eigvecs[:, :, 0]
     sample_local = inverse_ids[:sample_count]
     neighbor_local = inverse_ids[sample_count:].view(sample_count, effective_k)
-    sample_normals = unique_normals[sample_local]
-    neighbor_normals = unique_normals[neighbor_local.reshape(-1)].view(sample_count, effective_k, 3)
-
-    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
-    xyz_dist = neighbor_dists
-    plane_residual = torch.abs((rel_xyz * sample_normals.unsqueeze(1)).sum(dim=-1))
-    cosine_sim = (neighbor_features * sample_features.unsqueeze(1)).sum(dim=-1).clamp(-1.0, 1.0)
-    normal_cosine = torch.abs((sample_normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)).clamp(0.0, 1.0)
-    if normal_weight_lambda > 0:
-        normal_weight = torch.exp(-normal_weight_lambda * (1.0 - normal_cosine))
-    else:
-        normal_weight = torch.ones_like(normal_cosine)
-    local_radius = xyz_dist[:, -1:].clamp_min(eps)
-    spatial_ratio = xyz_dist / local_radius
-    spatial_weight = torch.exp(-spatial_ratio)
-
-    # Geometry gate decides where semantic propagation is allowed.
-    spatial_pos_mask = (spatial_ratio <= spatial_pos_scale).to(cosine_sim.dtype)
-    normal_pos_mask = (normal_cosine >= normal_pos_tau).to(cosine_sim.dtype)
-    depth_pos_mask = (plane_residual < plane_tau).to(cosine_sim.dtype)
-    geom_pos_mask = spatial_pos_mask * normal_pos_mask * depth_pos_mask
-
-    if neg_plane_tau is None or neg_plane_tau <= plane_tau:
-        depth_neg_mask = 1.0 - depth_pos_mask
-    else:
-        depth_neg_mask = (plane_residual > neg_plane_tau).to(cosine_sim.dtype)
-    normal_neg_mask = (normal_cosine <= normal_neg_tau).to(cosine_sim.dtype)
-    geom_neg_mask = ((depth_neg_mask + normal_neg_mask) > 0).to(cosine_sim.dtype) * (1.0 - geom_pos_mask)
-    ignore_mask = torch.clamp(1.0 - geom_pos_mask - geom_neg_mask, min=0.0, max=1.0)
 
     avg_sem_valid_views = zero
     avg_sem_confidence = zero
     semantic_pos_keep_ratio = zero
     semantic_neg_keep_ratio = zero
-    sem_same_mask = torch.zeros_like(geom_pos_mask)
-    sem_diff_mask = torch.zeros_like(geom_pos_mask)
-    sem_pair_conf = torch.zeros_like(geom_pos_mask)
-    semantic_pos_factor = torch.ones_like(geom_pos_mask)
-    semantic_neg_factor = torch.ones_like(geom_pos_mask)
-    pos_mask = geom_pos_mask
-    neg_candidate_mask = geom_neg_mask
+    sem_same_mask = torch.zeros_like(geom_gate)
+    sem_diff_mask = torch.zeros_like(geom_gate)
+    semantic_neg_weight = torch.ones_like(geom_gate)
+    positive_sem_mask = None
+    semantic_cross_neg_mask = torch.zeros_like(geom_gate)
 
     if support_cameras is not None and len(support_cameras) > 0:
         unique_global_point_ids = unique_point_ids if point_ids is None else point_ids[unique_point_ids]
@@ -498,7 +531,12 @@ def loss_geo_contrastive_cosine(
         )
 
         if view_labels.shape[0] > 0:
-            point_sem_label, point_sem_valid, point_sem_confidence, point_valid_view_count = compute_point_label_consensus(
+            (
+                point_sem_label,
+                point_sem_valid,
+                point_sem_confidence,
+                point_valid_view_count,
+            ) = compute_point_label_consensus(
                 view_labels,
                 view_valid,
                 num_classes=sem_num_classes,
@@ -507,7 +545,6 @@ def loss_geo_contrastive_cosine(
             )
 
             neighbor_local_flat = neighbor_local.reshape(-1)
-
             sample_labels = point_sem_label[sample_local]
             sample_valid = point_sem_valid[sample_local]
             sample_confidence = point_sem_confidence[sample_local]
@@ -515,92 +552,98 @@ def loss_geo_contrastive_cosine(
             neighbor_valid = point_sem_valid[neighbor_local_flat].view(sample_count, effective_k)
             neighbor_confidence = point_sem_confidence[neighbor_local_flat].view(sample_count, effective_k)
 
-            sample_pair_valid = sample_valid.unsqueeze(-1)
-            sem_pair_valid = sample_pair_valid & neighbor_valid
-            sem_same_mask = (sem_pair_valid & (sample_labels.unsqueeze(-1) == neighbor_labels)).to(cosine_sim.dtype)
-            sem_diff_mask = (sem_pair_valid & (sample_labels.unsqueeze(-1) != neighbor_labels)).to(cosine_sim.dtype)
-            sem_pair_conf = sample_confidence.unsqueeze(-1) * neighbor_confidence
+            sem_pair_valid = sample_valid.unsqueeze(-1) & neighbor_valid
+            sem_pair_min_conf = torch.minimum(sample_confidence.unsqueeze(-1), neighbor_confidence)
+            sem_pair_strong = sem_pair_valid & (sem_pair_min_conf >= sem_conf_tau)
 
-            sem_valid_point_count = point_sem_valid.to(cosine_sim.dtype).sum()
-            avg_sem_valid_views = (point_sem_valid.to(point_valid_view_count.dtype) * point_valid_view_count).sum() / (sem_valid_point_count + eps)
-            avg_sem_confidence = (point_sem_valid.to(point_sem_confidence.dtype) * point_sem_confidence).sum() / (sem_valid_point_count + eps)
-            geom_pos_count = geom_pos_mask.sum()
-            geom_neg_count = geom_neg_mask.sum()
-            # Semantics should enhance or weaken supervision, not delete most pairs.
-            semantic_pos_factor = 1.0 + sem_same_boost * sem_same_mask * sem_pair_conf
-            semantic_pos_factor = semantic_pos_factor * torch.clamp(
-                1.0 - sem_conflict_penalty * sem_diff_mask * sem_pair_conf,
-                min=0.25,
-                max=2.0,
+            sem_same_mask = (sem_pair_valid & (sample_labels.unsqueeze(-1) == neighbor_labels)).to(feat_dist.dtype)
+            sem_diff_mask = (sem_pair_valid & (sample_labels.unsqueeze(-1) != neighbor_labels)).to(feat_dist.dtype)
+            positive_sem_mask = (sem_pair_strong & (sample_labels.unsqueeze(-1) == neighbor_labels)).to(feat_dist.dtype)
+            semantic_cross_neg_mask = (
+                spatial_close
+                * (sem_pair_strong & (sample_labels.unsqueeze(-1) != neighbor_labels)).to(feat_dist.dtype)
             )
-            semantic_neg_factor = 1.0 + sem_neg_boost * sem_diff_mask * sem_pair_conf
+            semantic_neg_weight = 1.0 + sem_neg_boost * semantic_cross_neg_mask
 
-            # High-confidence semantic disagreements can be promoted to local negatives,
-            # which helps separate co-planar but semantically different instances.
-            semantic_neg_promote_mask = (
-                spatial_pos_mask
-                * sem_diff_mask
-                * (sem_pair_conf >= sem_conf_tau).to(cosine_sim.dtype)
-            )
-            neg_candidate_mask = torch.clamp(geom_neg_mask + semantic_neg_promote_mask, min=0.0, max=1.0)
+            sem_valid_point_count = point_sem_valid.to(feat_dist.dtype).sum()
+            avg_sem_valid_views = (
+                point_sem_valid.to(point_valid_view_count.dtype) * point_valid_view_count
+            ).sum() / (sem_valid_point_count + eps)
+            avg_sem_confidence = (
+                point_sem_valid.to(point_sem_confidence.dtype) * point_sem_confidence
+            ).sum() / (sem_valid_point_count + eps)
 
-            semantic_pos_keep_ratio = (geom_pos_mask * semantic_pos_factor).sum() / (geom_pos_count + eps)
-            neg_reference_count = geom_neg_count + semantic_neg_promote_mask.sum()
-            semantic_neg_keep_ratio = (neg_candidate_mask * semantic_neg_factor).sum() / (neg_reference_count + eps)
-            ignore_mask = torch.clamp(1.0 - torch.clamp(geom_pos_mask + neg_candidate_mask, max=1.0), min=0.0, max=1.0)
+    if positive_sem_mask is None:
+        pos_mask = geom_gate
+        semantic_pos_keep_ratio = torch.where(
+            geom_gate.sum() > 0,
+            torch.ones_like(zero),
+            zero,
+        )
+    else:
+        pos_mask = geom_gate * positive_sem_mask
+        semantic_pos_keep_ratio = pos_mask.sum() / (geom_gate.sum() + eps)
 
-    pos_count = pos_mask.sum()
-    neg_candidate_count = neg_candidate_mask.sum()
-    ignore_count = ignore_mask.sum()
+    neg_candidate_mask = torch.clamp(boundary_neg_mask + semantic_cross_neg_mask, min=0.0, max=1.0)
+    semantic_neg_keep_ratio = semantic_cross_neg_mask.sum() / (neg_candidate_mask.sum() + eps)
+    ignore_mask = torch.clamp(1.0 - torch.clamp(pos_mask + neg_candidate_mask, max=1.0), min=0.0, max=1.0)
 
-    pos_pair_weight = pos_mask * spatial_weight * normal_weight * semantic_pos_factor
-    pos_loss = (pos_pair_weight * (1.0 - cosine_sim)).sum() / (pos_pair_weight.sum() + eps)
+    pos_pair_weight = pos_mask * normal_weight
+    pos_loss = (pos_pair_weight * (feat_dist ** 2)).sum() / (pos_pair_weight.sum() + eps)
+
+    smooth_pair_weight = geom_gate * normal_weight
+    smooth_loss = (smooth_pair_weight * (feat_dist ** 2)).sum() / (smooth_pair_weight.sum() + eps)
 
     effective_hard_neg_k = min(max(int(hard_neg_k), 0), effective_k)
     if effective_hard_neg_k > 0:
-        hard_neg_scores = (
-            cosine_sim
-            + 0.5 * (1.0 - normal_cosine)
-            + sem_neg_boost * sem_diff_mask * sem_pair_conf
-        ).masked_fill(neg_candidate_mask == 0, -1e6)
-        _, hard_neg_idx = hard_neg_scores.topk(effective_hard_neg_k, dim=1, largest=True)
+        masked_neg_dist = feat_dist.masked_fill(neg_candidate_mask == 0, 1e6)
+        _, hard_neg_idx = masked_neg_dist.topk(effective_hard_neg_k, dim=1, largest=False)
         hard_neg_mask = torch.zeros_like(neg_candidate_mask)
         hard_neg_mask.scatter_(1, hard_neg_idx, 1.0)
         hard_neg_mask = hard_neg_mask * neg_candidate_mask
     else:
         hard_neg_mask = neg_candidate_mask
 
-    neg_term = torch.clamp(cosine_sim - neg_margin, min=0.0)
-    active_hard_neg_mask = hard_neg_mask * (cosine_sim > neg_margin).to(cosine_sim.dtype)
-    hard_neg_count = hard_neg_mask.sum()
-    active_hard_neg_count = active_hard_neg_mask.sum()
-
-    neg_pair_weight = active_hard_neg_mask * semantic_neg_factor
+    neg_term = torch.clamp(neg_margin - feat_dist, min=0.0)
+    active_hard_neg_mask = hard_neg_mask * (feat_dist < neg_margin).to(feat_dist.dtype)
+    neg_pair_weight = active_hard_neg_mask * semantic_neg_weight
     neg_loss = (neg_pair_weight * (neg_term ** 2)).sum() / (neg_pair_weight.sum() + eps)
 
-    loss = lambda_pos * pos_loss + lambda_neg * neg_loss
-    gate_ratio = pos_mask.mean()
-    avg_plane_residual = plane_residual.mean()
+    contrastive_loss = lambda_pos * pos_loss + lambda_neg * neg_loss
+    total_loss = contrastive_loss + smooth_lambda * smooth_loss
+
+    pos_count = pos_mask.sum()
+    neg_candidate_count = neg_candidate_mask.sum()
+    ignore_count = ignore_mask.sum()
+    hard_neg_count = hard_neg_mask.sum()
+    active_hard_neg_count = active_hard_neg_mask.sum()
+    total_pair_count = feat_dist.numel()
+
+    gate_ratio = geom_gate.mean()
+    avg_depth_gap = depth_gap.mean()
     avg_feature_norm = raw_feature_norm.mean()
-    avg_normal_cosine = (pos_mask * normal_cosine).sum() / (pos_count + eps)
-    avg_pos_cosine = (pos_mask * cosine_sim).sum() / (pos_count + eps)
-    avg_neg_cosine = (neg_candidate_mask * cosine_sim).sum() / (neg_candidate_count + eps)
-    avg_hard_neg_cosine = (hard_neg_mask * cosine_sim).sum() / (hard_neg_count + eps)
+    avg_normal_cosine = (geom_gate * aligned_normal_cos).sum() / (geom_gate.sum() + eps)
+    avg_pos_dist = (pos_mask * feat_dist).sum() / (pos_count + eps)
+    avg_neg_dist = (neg_candidate_mask * feat_dist).sum() / (neg_candidate_count + eps)
+    avg_hard_neg_dist = (hard_neg_mask * feat_dist).sum() / (hard_neg_count + eps)
     active_neg_ratio = active_hard_neg_count / (hard_neg_count + eps)
-    neg_candidate_ratio = neg_candidate_count / (pos_mask.numel() + eps)
-    ignore_ratio = ignore_count / (pos_mask.numel() + eps)
+    neg_candidate_ratio = neg_candidate_count / (total_pair_count + eps)
+    ignore_ratio = ignore_count / (total_pair_count + eps)
+    boundary_neg_ratio = boundary_neg_mask.sum() / (neg_candidate_count + eps)
 
     return (
-        lambda_val * loss,
+        lambda_val * total_loss,
         gate_ratio,
-        avg_plane_residual,
+        avg_depth_gap,
+        contrastive_loss,
+        smooth_loss,
         pos_loss,
         neg_loss,
         avg_feature_norm,
         avg_normal_cosine,
-        avg_pos_cosine,
-        avg_neg_cosine,
-        avg_hard_neg_cosine,
+        avg_pos_dist,
+        avg_neg_dist,
+        avg_hard_neg_dist,
         active_neg_ratio,
         neg_candidate_ratio,
         ignore_ratio,
@@ -608,5 +651,8 @@ def loss_geo_contrastive_cosine(
         avg_sem_confidence,
         semantic_pos_keep_ratio,
         semantic_neg_keep_ratio,
+        pos_count,
+        neg_candidate_count,
+        boundary_neg_ratio,
     )
     

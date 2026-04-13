@@ -50,6 +50,13 @@ bash script/prepare_pseudo_label.sh mipnerf360/counter 2
 
 ## 2. Training and Masks Rendering
 
+Before training with the default config in `config/gaussian_dataset/train.json`,
+prepare offline DINO feature caches once for the scene:
+
+```
+python script/prepare_dino_features.py -s <location>
+```
+
 For Gaussian Grouping training and segmentation rendering of trained 3D Gaussian Grouping model:
 
 Example1. Bear dataset

@@ -28,6 +28,7 @@
     "geo_warmup_iters": 6000,
     "geo_lambda_pos": 1.0,
     "geo_lambda_neg": 1.0,
+    "geo_smooth_lambda": 0.1,
     "geo_max_points": 200000,
     "geo_sample_size": 800,
     "geo_plane_tau": 0.008,
@@ -37,6 +38,7 @@
     "geo_normal_neg_tau": 0.4,
     "geo_neg_margin": 0.8,
     "geo_hard_neg_k": 1,
+    "geo_normal_source": "surface_axis",
     "geo_use_multiview_semantics": true,
     "geo_support_views": 3,
     "geo_sem_pos_ratio": 0.7,
@@ -46,5 +48,11 @@
     "geo_normal_weight_lambda": 5.0,
     "geo_sem_same_boost": 1.0,
     "geo_sem_neg_boost": 1.0,
-    "geo_sem_conflict_penalty": 0.75
+    "geo_sem_conflict_penalty": 0.75,
+
+    "distill_enable": true,
+    "distill_weight_lambda": 0.1,
+    "distill_feature_dir": "dino_feature",
+    "distill_loss_type": "cosine",
+    "distill_mask_eps": 1e-6
 }

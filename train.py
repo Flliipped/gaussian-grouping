@@ -13,9 +13,15 @@ from utils.loss_utils import (
     l1_loss,
     ssim,
     loss_cls_3d,
-    loss_geo_contrastive_cosine,
+    loss_geo_gated_contrastive,
     loss_sugar_opacity_entropy,
     loss_sugar_surface_alignment,
+)
+from utils.distill_utils import (
+    FeatureCacheLoader,
+    cosine_distill_loss,
+    render_feature_foreground_mask,
+    resolve_feature_cache_dir,
 )
 from gaussian_renderer import render, network_gui
 import sys
@@ -29,21 +35,87 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 import json
 
+def save_auxiliary_heads(model_path, iteration, classifier, distill_head=None):
+    aux_dir = os.path.join(model_path, "point_cloud", f"iteration_{iteration}")
+    os.makedirs(aux_dir, exist_ok=True)
+    torch.save(classifier.state_dict(), os.path.join(aux_dir, "classifier.pth"))
+    if distill_head is not None:
+        torch.save(distill_head.state_dict(), os.path.join(aux_dir, "distill_head.pth"))
+
+
+def restore_auxiliary_heads(model_path, iteration, classifier, distill_head=None):
+    aux_dir = os.path.join(model_path, "point_cloud", f"iteration_{iteration}")
+    classifier_path = os.path.join(aux_dir, "classifier.pth")
+    if os.path.exists(classifier_path):
+        classifier.load_state_dict(torch.load(classifier_path, map_location="cpu"))
+        print(f"Loaded classifier from {classifier_path}")
+
+    if distill_head is not None:
+        distill_head_path = os.path.join(aux_dir, "distill_head.pth")
+        if os.path.exists(distill_head_path):
+            distill_head.load_state_dict(torch.load(distill_head_path, map_location="cpu"))
+            print(f"Loaded distill head from {distill_head_path}")
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
+    checkpoint_classifier_state = None
+    checkpoint_distill_state = None
     prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     num_classes = dataset.num_classes
-    print("Num classes: ",num_classes)
+    print("Num classes: ", num_classes)
     classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
     cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
     classifier.cuda()
+
+    if opt.geo_normal_source != "surface_axis":
+        raise ValueError(
+            f"Unsupported geo_normal_source '{opt.geo_normal_source}'. Only 'surface_axis' is implemented."
+        )
+
+    distill_loader = None
+    distill_head = None
+    distill_optimizer = None
+    distill_teacher_dim = 0
+    if opt.distill_enable:
+        if opt.distill_loss_type != "cosine":
+            raise ValueError(
+                f"Unsupported distill_loss_type '{opt.distill_loss_type}'. Only 'cosine' is implemented."
+            )
+        feature_dir = resolve_feature_cache_dir(dataset.source_path, opt.distill_feature_dir)
+        distill_loader = FeatureCacheLoader(feature_dir)
+        train_cameras = scene.getTrainCameras()
+        if len(train_cameras) == 0:
+            raise ValueError("No training cameras available for DINO feature distillation.")
+        distill_teacher_dim = distill_loader.get_teacher_dim(train_cameras[0].image_name)
+        distill_head = torch.nn.Conv2d(gaussians.num_objects, distill_teacher_dim, kernel_size=1)
+        distill_head.cuda()
+        distill_optimizer = torch.optim.Adam(distill_head.parameters(), lr=5e-4)
+        print(
+            f"DINO distillation enabled. Feature dir: {feature_dir}, teacher_dim: {distill_teacher_dim}"
+        )
+
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        checkpoint_data = torch.load(checkpoint)
+        if isinstance(checkpoint_data, tuple) and len(checkpoint_data) == 4:
+            model_params, checkpoint_classifier_state, checkpoint_distill_state, first_iter = checkpoint_data
+        elif isinstance(checkpoint_data, tuple) and len(checkpoint_data) == 2:
+            model_params, first_iter = checkpoint_data
+        else:
+            raise ValueError(
+                f"Unsupported checkpoint format in {checkpoint}. Expected 2 or 4 tuple entries."
+            )
         gaussians.restore(model_params, opt)
+        if checkpoint_classifier_state is not None:
+            classifier.load_state_dict(checkpoint_classifier_state)
+        else:
+            restore_auxiliary_heads(scene.model_path, first_iter, classifier, distill_head)
+        if distill_head is not None and checkpoint_distill_state is not None:
+            distill_head.load_state_dict(checkpoint_distill_state)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -92,49 +164,60 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii, objects = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_object"]
+        image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
+        objects = render_pkg["render_object"]
 
         # Object Loss
         gt_obj = viewpoint_cam.objects.cuda().long()
         logits = classifier(objects)
         loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
-        loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
+        loss_obj = loss_obj / torch.log(torch.tensor(num_classes, device=image.device))  # normalize to (0,1)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
+        recon_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         loss_obj_3d = None
         if iteration % opt.reg3d_interval == 0:
             # regularize at certain intervals
-            logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
-            prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
+            logits3d = classifier(gaussians._objects_dc.permute(2, 0, 1))
+            prob_obj3d = torch.softmax(logits3d, dim=0).squeeze().permute(1, 0)
             loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
+            loss = recon_loss + loss_obj + loss_obj_3d
         else:
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj          
+            loss = recon_loss + loss_obj
 
         loss_geo_raw = torch.tensor(0.0, device=image.device)
         loss_geo = torch.tensor(0.0, device=image.device)
         geo_coeff = torch.tensor(0.0, device=image.device)
+        loss_con_raw = torch.tensor(0.0, device=image.device)
+        loss_smooth_raw = torch.tensor(0.0, device=image.device)
         loss_sugar_raw = torch.tensor(0.0, device=image.device)
         loss_sugar = torch.tensor(0.0, device=image.device)
         sugar_coeff = torch.tensor(0.0, device=image.device)
         loss_sugar_opacity_entropy_raw = torch.tensor(0.0, device=image.device)
         loss_sugar_opacity_entropy_term = torch.tensor(0.0, device=image.device)
         sugar_opacity_entropy_coeff = torch.tensor(0.0, device=image.device)
+        distill_coeff = torch.tensor(0.0, device=image.device)
+        loss_distill_raw = torch.tensor(0.0, device=image.device)
+        loss_distill = torch.tensor(0.0, device=image.device)
+        distill_active = distill_head is not None
         sugar_axis_align_cosine = torch.tensor(0.0, device=image.device)
         sugar_plane_residual = torch.tensor(0.0, device=image.device)
         sugar_flat_ratio = torch.tensor(0.0, device=image.device)
         gate_ratio = torch.tensor(0.0, device=image.device)
-        avg_plane_residual = torch.tensor(0.0, device=image.device)
+        avg_depth_gap = torch.tensor(0.0, device=image.device)
         pos_loss = torch.tensor(0.0, device=image.device)
         neg_loss = torch.tensor(0.0, device=image.device)
         avg_feature_norm = torch.tensor(0.0, device=image.device)
         avg_normal_cosine = torch.tensor(0.0, device=image.device)
-        avg_pos_cosine = torch.tensor(0.0, device=image.device)
-        avg_neg_cosine = torch.tensor(0.0, device=image.device)
-        avg_hard_neg_cosine = torch.tensor(0.0, device=image.device)
+        avg_pos_dist = torch.tensor(0.0, device=image.device)
+        avg_neg_dist = torch.tensor(0.0, device=image.device)
+        avg_hard_neg_dist = torch.tensor(0.0, device=image.device)
         active_neg_ratio = torch.tensor(0.0, device=image.device)
         neg_candidate_ratio = torch.tensor(0.0, device=image.device)
         ignore_ratio = torch.tensor(0.0, device=image.device)
@@ -142,6 +225,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         avg_sem_confidence = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
         semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
+        pos_pairs = torch.tensor(0.0, device=image.device)
+        neg_pairs = torch.tensor(0.0, device=image.device)
+        boundary_neg_ratio = torch.tensor(0.0, device=image.device)
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
 
@@ -174,6 +260,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_sugar_opacity_entropy_term = sugar_opacity_entropy_coeff * loss_sugar_opacity_entropy_raw
             loss = loss + loss_sugar_opacity_entropy_term
 
+        if distill_active:
+            teacher_feature_map, _ = distill_loader.get_feature_map(
+                viewpoint_cam.image_name,
+                target_hw=objects.shape[-2:],
+                device=image.device,
+                dtype=objects.dtype,
+            )
+            student_feature_map = distill_head(objects)
+            distill_mask = render_feature_foreground_mask(objects, eps=opt.distill_mask_eps)
+            loss_distill_raw = cosine_distill_loss(
+                student_feature_map,
+                teacher_feature_map,
+                mask=distill_mask,
+            )
+            distill_coeff = image.new_tensor(opt.distill_weight_lambda)
+            loss_distill = distill_coeff * loss_distill_raw
+            loss = loss + loss_distill
+
         if geo_active:
             warmup_iters = max(1, opt.geo_warmup_iters)
             geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
@@ -196,14 +300,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             visibility_masks.append(support_render_pkg["visibility_filter"].detach())
                 support_visibility = torch.stack(visibility_masks, dim=0)
 
-            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
+            loss_geo_raw, gate_ratio, avg_depth_gap, loss_con_raw, loss_smooth_raw, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_dist, avg_neg_dist, avg_hard_neg_dist, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, pos_pairs, neg_pairs, boundary_neg_ratio = loss_geo_gated_contrastive(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
+                normals=gaussians.get_surface_axis.detach(),
                 point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
                 k=opt.geo_knn_k,
                 lambda_val=1.0,
                 lambda_pos=opt.geo_lambda_pos,
                 lambda_neg=opt.geo_lambda_neg,
+                smooth_lambda=opt.geo_smooth_lambda,
                 max_points=opt.geo_max_points,
                 sample_size=opt.geo_sample_size,
                 plane_tau=opt.geo_plane_tau,
@@ -220,20 +326,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sem_num_classes=num_classes,
                 sem_ignore_label=opt.geo_sem_ignore_label,
                 normal_weight_lambda=opt.geo_normal_weight_lambda,
-                sem_same_boost=opt.geo_sem_same_boost,
                 sem_neg_boost=opt.geo_sem_neg_boost,
-                sem_conflict_penalty=opt.geo_sem_conflict_penalty,
             )
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
 
-        if iteration % 100 == 0 and (sugar_active or sugar_opacity_entropy_active or geo_active):
+        if iteration % 100 == 0 and (sugar_active or sugar_opacity_entropy_active or geo_active or distill_active):
             loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
             message = (
                 f"[Iter {iteration}] "
                 f"loss_obj={loss_obj.item():.6f}, "
                 f"loss_obj_3d={loss_obj_3d_value:.6f}, "
             )
+            if distill_active:
+                message += (
+                    f"distill_coeff={distill_coeff.item():.6f}, "
+                    f"loss_distill_raw={loss_distill_raw.item():.6f}, "
+                    f"loss_distill={loss_distill.item():.6f}, "
+                )
             if sugar_active:
                 message += (
                     f"sugar_coeff={sugar_coeff.item():.6f}, "
@@ -255,22 +365,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"geo_coeff={geo_coeff.item():.6f}, "
                     + f"loss_geo_raw={loss_geo_raw.item():.6f}, "
                     + f"loss_geo={loss_geo.item():.6f}, "
+                    + f"loss_con={loss_con_raw.item():.6f}, "
+                    + f"loss_smooth={loss_smooth_raw.item():.6f}, "
                     + f"pos_loss={pos_loss.item():.6f}, "
                     + f"neg_loss={neg_loss.item():.6f}, "
                     + f"gate_ratio={gate_ratio.item():.4f}, "
-                    + f"avg_plane_residual={avg_plane_residual.item():.6f}, "
+                    + f"avg_depth_gap={avg_depth_gap.item():.6f}, "
                     + f"avg_feature_norm={avg_feature_norm.item():.6f}, "
                     + f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
-                    + f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
-                    + f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
-                    + f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
+                    + f"avg_pos_dist={avg_pos_dist.item():.6f}, "
+                    + f"avg_neg_dist={avg_neg_dist.item():.6f}, "
+                    + f"avg_hard_neg_dist={avg_hard_neg_dist.item():.6f}, "
                     + f"active_neg_ratio={active_neg_ratio.item():.6f}, "
                     + f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
                     + f"ignore_ratio={ignore_ratio.item():.6f}, "
                     + f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
                     + f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
                     + f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
-                    + f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}"
+                    + f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}, "
+                    + f"pos_pairs={pos_pairs.item():.2f}, "
+                    + f"neg_pairs={neg_pairs.item():.2f}, "
+                    + f"boundary_neg_ratio={boundary_neg_ratio.item():.6f}"
                 )
             else:
                 print(message.rstrip(", "))
@@ -278,6 +393,75 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
         iter_end.record()
+
+        metric_logs = {
+            "train_loss_patches/l1_loss": Ll1.item(),
+            "train_loss_patches/total_loss": loss.item(),
+            "train_loss_patches/loss_recon": recon_loss.item(),
+            "train_loss_patches/loss_obj": loss_obj.item(),
+            "train_loss_patches/sugar_active": float(sugar_active),
+            "train_loss_patches/sugar_coeff": sugar_coeff.item(),
+            "train_loss_patches/sugar_opacity_entropy_active": float(sugar_opacity_entropy_active),
+            "train_loss_patches/sugar_opacity_entropy_coeff": sugar_opacity_entropy_coeff.item(),
+            "train_loss_patches/geo_active": float(geo_active),
+            "train_loss_patches/geo_coeff": geo_coeff.item(),
+            "train_loss_patches/distill_active": float(distill_active),
+            "train_loss_patches/distill_coeff": distill_coeff.item(),
+            "iter_time": iter_start.elapsed_time(iter_end),
+            "iter": iteration,
+        }
+
+        if loss_obj_3d is not None:
+            metric_logs["train_loss_patches/loss_obj_3d"] = loss_obj_3d.item()
+
+        if distill_active:
+            metric_logs.update({
+                "train_loss_patches/loss_distill_raw": loss_distill_raw.item(),
+                "train_loss_patches/loss_distill": loss_distill.item(),
+                "train_loss_patches/distill_teacher_dim": float(distill_teacher_dim),
+            })
+
+        if sugar_active:
+            metric_logs.update({
+                "train_loss_patches/loss_sugar_raw": loss_sugar_raw.item(),
+                "train_loss_patches/loss_sugar": loss_sugar.item(),
+                "train_loss_patches/sugar_axis_align_cosine": sugar_axis_align_cosine.item(),
+                "train_loss_patches/sugar_plane_residual": sugar_plane_residual.item(),
+                "train_loss_patches/sugar_flat_ratio": sugar_flat_ratio.item(),
+            })
+
+        if sugar_opacity_entropy_active:
+            metric_logs.update({
+                "train_loss_patches/loss_sugar_opacity_entropy_raw": loss_sugar_opacity_entropy_raw.item(),
+                "train_loss_patches/loss_sugar_opacity_entropy": loss_sugar_opacity_entropy_term.item(),
+            })
+
+        if geo_active:
+            metric_logs.update({
+                "train_loss_patches/loss_geo_raw": loss_geo_raw.item(),
+                "train_loss_patches/loss_geo": loss_geo.item(),
+                "train_loss_patches/loss_con": loss_con_raw.item(),
+                "train_loss_patches/loss_smooth": loss_smooth_raw.item(),
+                "train_loss_patches/pos_loss": pos_loss.item(),
+                "train_loss_patches/neg_loss": neg_loss.item(),
+                "train_loss_patches/gate_ratio": gate_ratio.item(),
+                "train_loss_patches/avg_depth_gap": avg_depth_gap.item(),
+                "train_loss_patches/avg_feature_norm": avg_feature_norm.item(),
+                "train_loss_patches/avg_normal_cosine": avg_normal_cosine.item(),
+                "train_loss_patches/avg_pos_dist": avg_pos_dist.item(),
+                "train_loss_patches/avg_neg_dist": avg_neg_dist.item(),
+                "train_loss_patches/avg_hard_neg_dist": avg_hard_neg_dist.item(),
+                "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
+                "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
+                "train_loss_patches/ignore_ratio": ignore_ratio.item(),
+                "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
+                "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
+                "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
+                "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
+                "train_loss_patches/pos_pairs": pos_pairs.item(),
+                "train_loss_patches/neg_pairs": neg_pairs.item(),
+                "train_loss_patches/boundary_neg_ratio": boundary_neg_ratio.item(),
+            })
 
 
         with torch.no_grad():
@@ -290,11 +474,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, loss_sugar_opacity_entropy_raw, loss_sugar_opacity_entropy_term, sugar_opacity_entropy_coeff, sugar_opacity_entropy_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(
+                iteration,
+                Ll1,
+                loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                metric_logs,
+                use_wandb,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-                torch.save(classifier.state_dict(), os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),'classifier.pth'))
+                save_auxiliary_heads(scene.model_path, iteration, classifier, distill_head)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -314,11 +509,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 cls_optimizer.step()
-                cls_optimizer.zero_grad()
+                cls_optimizer.zero_grad(set_to_none=True)
+                if distill_optimizer is not None:
+                    distill_optimizer.step()
+                    distill_optimizer.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save(
+                    (
+                        gaussians.capture(),
+                        classifier.state_dict(),
+                        distill_head.state_dict() if distill_head is not None else None,
+                        iteration,
+                    ),
+                    scene.model_path + "/chkpnt" + str(iteration) + ".pth",
+                )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -335,62 +541,14 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, loss_sugar_opacity_entropy_raw, loss_sugar_opacity_entropy_term, sugar_opacity_entropy_coeff, sugar_opacity_entropy_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, metric_logs, use_wandb):
 
     if use_wandb:
-        log_data = {
-            "train_loss_patches/l1_loss": Ll1.item(),
-            "train_loss_patches/total_loss": loss.item(),
-            "train_loss_patches/sugar_active": float(sugar_active),
-            "train_loss_patches/sugar_coeff": sugar_coeff.item(),
-            "train_loss_patches/sugar_opacity_entropy_active": float(sugar_opacity_entropy_active),
-            "train_loss_patches/sugar_opacity_entropy_coeff": sugar_opacity_entropy_coeff.item(),
-            "train_loss_patches/geo_active": float(geo_active),
-            "train_loss_patches/geo_coeff": geo_coeff.item(),
-            "iter_time": elapsed,
-            "iter": iteration
-        }
-
-        if loss_obj_3d is not None:
-            log_data["train_loss_patches/loss_obj_3d"] = loss_obj_3d.item()
-
-        if sugar_active:
-            log_data.update({
-                "train_loss_patches/loss_sugar_raw": loss_sugar_raw.item(),
-                "train_loss_patches/loss_sugar": loss_sugar.item(),
-                "train_loss_patches/sugar_axis_align_cosine": sugar_axis_align_cosine.item(),
-                "train_loss_patches/sugar_plane_residual": sugar_plane_residual.item(),
-                "train_loss_patches/sugar_flat_ratio": sugar_flat_ratio.item(),
-            })
-
-        if sugar_opacity_entropy_active:
-            log_data.update({
-                "train_loss_patches/loss_sugar_opacity_entropy_raw": loss_sugar_opacity_entropy_raw.item(),
-                "train_loss_patches/loss_sugar_opacity_entropy": loss_sugar_opacity_entropy_term.item(),
-            })
-
-        if geo_active:
-            log_data.update({
-                "train_loss_patches/loss_geo_raw": loss_geo_raw.item(),
-                "train_loss_patches/loss_geo": loss_geo.item(),
-                "train_loss_patches/pos_loss": pos_loss.item(),
-                "train_loss_patches/neg_loss": neg_loss.item(),
-                "train_loss_patches/gate_ratio": gate_ratio.item(),
-                "train_loss_patches/avg_plane_residual": avg_plane_residual.item(),
-                "train_loss_patches/avg_feature_norm": avg_feature_norm.item(),
-                "train_loss_patches/avg_normal_cosine": avg_normal_cosine.item(),
-                "train_loss_patches/avg_pos_cosine": avg_pos_cosine.item(),
-                "train_loss_patches/avg_neg_cosine": avg_neg_cosine.item(),
-                "train_loss_patches/avg_hard_neg_cosine": avg_hard_neg_cosine.item(),
-                "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
-                "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
-                "train_loss_patches/ignore_ratio": ignore_ratio.item(),
-                "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
-                "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
-                "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
-                "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
-            })
-
+        log_data = dict(metric_logs)
+        log_data.setdefault("train_loss_patches/l1_loss", Ll1.item())
+        log_data.setdefault("train_loss_patches/total_loss", loss.item())
+        log_data.setdefault("iter_time", elapsed)
+        log_data.setdefault("iter", iteration)
         wandb.log(log_data)
 
     # Report test and samples of training set
@@ -470,6 +628,7 @@ if __name__ == "__main__":
     args.geo_warmup_iters = config.get("geo_warmup_iters", 4000)
     args.geo_lambda_pos = config.get("geo_lambda_pos", 1.0)
     args.geo_lambda_neg = config.get("geo_lambda_neg", 1.0)
+    args.geo_smooth_lambda = config.get("geo_smooth_lambda", 0.1)
     args.geo_max_points = config.get("geo_max_points", 200000)
     args.geo_sample_size = config.get("geo_sample_size", 800)
     args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
@@ -479,6 +638,7 @@ if __name__ == "__main__":
     args.geo_normal_neg_tau = config.get("geo_normal_neg_tau", 0.4)
     args.geo_neg_margin = config.get("geo_neg_margin", 0.8)
     args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
+    args.geo_normal_source = config.get("geo_normal_source", "surface_axis")
     args.geo_use_multiview_semantics = config.get("geo_use_multiview_semantics", False)
     args.geo_support_views = config.get("geo_support_views", 3)
     args.geo_sem_pos_ratio = config.get("geo_sem_pos_ratio", 0.7)
@@ -493,6 +653,11 @@ if __name__ == "__main__":
     args.geo_beta = config.get("geo_beta", 1.0)
     args.geo_gamma = config.get("geo_gamma", 1.0)
     args.geo_weight_power = config.get("geo_weight_power", 2.0)
+    args.distill_enable = config.get("distill_enable", False)
+    args.distill_weight_lambda = config.get("distill_weight_lambda", 0.1)
+    args.distill_feature_dir = config.get("distill_feature_dir", "dino_feature")
+    args.distill_loss_type = config.get("distill_loss_type", "cosine")
+    args.distill_mask_eps = config.get("distill_mask_eps", 1e-6)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
