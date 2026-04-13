@@ -355,6 +355,18 @@ def loss_sugar_surface_alignment(
     )
 
 
+def loss_sugar_opacity_entropy(opacity, eps=1e-6):
+    """SuGaR-style optional opacity entropy regularizer.
+
+    Minimizing the binary entropy gently encourages opacities to move away from
+    uncertain mid-values. It is kept separate from the surface alignment loss so
+    the semantic grouping pipeline can enable it only in controlled ablations.
+    """
+    opacity = opacity.clamp(eps, 1.0 - eps)
+    entropy = -(opacity * torch.log(opacity) + (1.0 - opacity) * torch.log(1.0 - opacity))
+    return entropy.mean()
+
+
 def loss_geo_contrastive_cosine(
     xyz,
     features,

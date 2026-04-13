@@ -105,6 +105,32 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    @property
+    def get_surface_axis(self):
+        """SuGaR-style local surface normal proxy from the smallest Gaussian axis."""
+        scales = self.get_scaling
+        rotation = build_rotation(self._rotation)
+        min_axis_idx = torch.argmin(scales, dim=-1)
+        axis = torch.gather(
+            rotation,
+            2,
+            min_axis_idx.view(-1, 1, 1).expand(-1, 3, 1),
+        ).squeeze(-1)
+        return torch.nn.functional.normalize(axis, dim=-1)
+
+    @property
+    def get_surface_thickness(self):
+        """Smallest scale used by SuGaR-style flattened surface Gaussians."""
+        return self.get_scaling.min(dim=-1, keepdim=True).values
+
+    @property
+    def get_surface_flat_ratio(self):
+        """Ratio between the smallest axis and the average tangent axes."""
+        scales = self.get_scaling
+        sorted_scales, _ = torch.sort(scales, dim=-1)
+        tangent_scale = 0.5 * (sorted_scales[:, 1:2] + sorted_scales[:, 2:3])
+        return sorted_scales[:, 0:1] / tangent_scale.clamp_min(1e-8)
     
     @property
     def get_features(self):

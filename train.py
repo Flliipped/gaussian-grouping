@@ -9,7 +9,14 @@
 import os
 import torch
 from random import randint, sample
-from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_cosine, loss_sugar_surface_alignment
+from utils.loss_utils import (
+    l1_loss,
+    ssim,
+    loss_cls_3d,
+    loss_geo_contrastive_cosine,
+    loss_sugar_opacity_entropy,
+    loss_sugar_surface_alignment,
+)
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -113,6 +120,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_sugar_raw = torch.tensor(0.0, device=image.device)
         loss_sugar = torch.tensor(0.0, device=image.device)
         sugar_coeff = torch.tensor(0.0, device=image.device)
+        loss_sugar_opacity_entropy_raw = torch.tensor(0.0, device=image.device)
+        loss_sugar_opacity_entropy_term = torch.tensor(0.0, device=image.device)
+        sugar_opacity_entropy_coeff = torch.tensor(0.0, device=image.device)
         sugar_axis_align_cosine = torch.tensor(0.0, device=image.device)
         sugar_plane_residual = torch.tensor(0.0, device=image.device)
         sugar_flat_ratio = torch.tensor(0.0, device=image.device)
@@ -153,6 +163,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
             loss_sugar = sugar_coeff * loss_sugar_raw
             loss = loss + loss_sugar
+
+        sugar_opacity_entropy_active = (
+            opt.sugar_lambda_opacity_entropy > 0
+            and opt.sugar_opacity_entropy_start_iter <= iteration < opt.sugar_opacity_entropy_end_iter
+        )
+        if sugar_opacity_entropy_active:
+            sugar_opacity_entropy_coeff = image.new_tensor(opt.sugar_lambda_opacity_entropy)
+            loss_sugar_opacity_entropy_raw = loss_sugar_opacity_entropy(gaussians.get_opacity)
+            loss_sugar_opacity_entropy_term = sugar_opacity_entropy_coeff * loss_sugar_opacity_entropy_raw
+            loss = loss + loss_sugar_opacity_entropy_term
 
         if geo_active:
             warmup_iters = max(1, opt.geo_warmup_iters)
@@ -207,7 +227,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
 
-        if iteration % 100 == 0 and (sugar_active or geo_active):
+        if iteration % 100 == 0 and (sugar_active or sugar_opacity_entropy_active or geo_active):
             loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
             message = (
                 f"[Iter {iteration}] "
@@ -222,6 +242,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"sugar_axis_align_cosine={sugar_axis_align_cosine.item():.6f}, "
                     f"sugar_plane_residual={sugar_plane_residual.item():.6f}, "
                     f"sugar_flat_ratio={sugar_flat_ratio.item():.6f}, "
+                )
+            if sugar_opacity_entropy_active:
+                message += (
+                    f"sugar_opacity_entropy_coeff={sugar_opacity_entropy_coeff.item():.6f}, "
+                    f"loss_sugar_opacity_entropy_raw={loss_sugar_opacity_entropy_raw.item():.6f}, "
+                    f"loss_sugar_opacity_entropy={loss_sugar_opacity_entropy_term.item():.6f}, "
                 )
             if geo_active:
                 print(
@@ -264,7 +290,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, loss_sugar_opacity_entropy_raw, loss_sugar_opacity_entropy_term, sugar_opacity_entropy_coeff, sugar_opacity_entropy_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -309,7 +335,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, loss_sugar_opacity_entropy_raw, loss_sugar_opacity_entropy_term, sugar_opacity_entropy_coeff, sugar_opacity_entropy_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -317,6 +343,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
             "train_loss_patches/total_loss": loss.item(),
             "train_loss_patches/sugar_active": float(sugar_active),
             "train_loss_patches/sugar_coeff": sugar_coeff.item(),
+            "train_loss_patches/sugar_opacity_entropy_active": float(sugar_opacity_entropy_active),
+            "train_loss_patches/sugar_opacity_entropy_coeff": sugar_opacity_entropy_coeff.item(),
             "train_loss_patches/geo_active": float(geo_active),
             "train_loss_patches/geo_coeff": geo_coeff.item(),
             "iter_time": elapsed,
@@ -333,6 +361,12 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/sugar_axis_align_cosine": sugar_axis_align_cosine.item(),
                 "train_loss_patches/sugar_plane_residual": sugar_plane_residual.item(),
                 "train_loss_patches/sugar_flat_ratio": sugar_flat_ratio.item(),
+            })
+
+        if sugar_opacity_entropy_active:
+            log_data.update({
+                "train_loss_patches/loss_sugar_opacity_entropy_raw": loss_sugar_opacity_entropy_raw.item(),
+                "train_loss_patches/loss_sugar_opacity_entropy": loss_sugar_opacity_entropy_term.item(),
             })
 
         if geo_active:
@@ -469,6 +503,9 @@ if __name__ == "__main__":
     args.sugar_knn_k = config.get("sugar_knn_k", 8)
     args.sugar_max_points = config.get("sugar_max_points", 200000)
     args.sugar_sample_size = config.get("sugar_sample_size", 800)
+    args.sugar_lambda_opacity_entropy = config.get("sugar_lambda_opacity_entropy", 0.0)
+    args.sugar_opacity_entropy_start_iter = config.get("sugar_opacity_entropy_start_iter", args.sugar_start_iter)
+    args.sugar_opacity_entropy_end_iter = config.get("sugar_opacity_entropy_end_iter", args.geo_start_iter)
     print("Optimizing " + args.model_path)
 
     if args.use_wandb:

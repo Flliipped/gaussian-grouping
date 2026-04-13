@@ -17,6 +17,9 @@
     "sugar_knn_k": 8,
     "sugar_max_points": 200000,
     "sugar_sample_size": 800,
+    "sugar_lambda_opacity_entropy": 0.0,
+    "sugar_opacity_entropy_start_iter": 10000,
+    "sugar_opacity_entropy_end_iter": 12000,
 
     "geo_start_iter" : 12000,
     "geo_interval": 10,

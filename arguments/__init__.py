@@ -137,6 +137,9 @@ class OptimizationParams(ParamGroup):
         self.sugar_knn_k = 8
         self.sugar_max_points = 200000
         self.sugar_sample_size = 800
+        self.sugar_lambda_opacity_entropy = 0.0
+        self.sugar_opacity_entropy_start_iter = 15_000
+        self.sugar_opacity_entropy_end_iter = 17_000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
