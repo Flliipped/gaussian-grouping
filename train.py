@@ -82,22 +82,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     distill_optimizer = None
     distill_teacher_dim = 0
     if opt.distill_enable:
-        if opt.distill_loss_type != "cosine":
-            raise ValueError(
-                f"Unsupported distill_loss_type '{opt.distill_loss_type}'. Only 'cosine' is implemented."
+        try:
+            if opt.distill_loss_type != "cosine":
+                raise ValueError(
+                    f"Unsupported distill_loss_type '{opt.distill_loss_type}'. Only 'cosine' is implemented."
+                )
+            feature_dir = resolve_feature_cache_dir(dataset.source_path, opt.distill_feature_dir)
+            distill_loader = FeatureCacheLoader(feature_dir)
+            train_cameras = scene.getTrainCameras()
+            if len(train_cameras) == 0:
+                raise ValueError("No training cameras available for DINO feature distillation.")
+            distill_teacher_dim = distill_loader.get_teacher_dim(train_cameras[0].image_name)
+            distill_head = torch.nn.Conv2d(gaussians.num_objects, distill_teacher_dim, kernel_size=1)
+            distill_head.cuda()
+            distill_optimizer = torch.optim.Adam(distill_head.parameters(), lr=5e-4)
+            print(
+                f"DINO distillation enabled. Feature dir: {feature_dir}, teacher_dim: {distill_teacher_dim}"
             )
-        feature_dir = resolve_feature_cache_dir(dataset.source_path, opt.distill_feature_dir)
-        distill_loader = FeatureCacheLoader(feature_dir)
-        train_cameras = scene.getTrainCameras()
-        if len(train_cameras) == 0:
-            raise ValueError("No training cameras available for DINO feature distillation.")
-        distill_teacher_dim = distill_loader.get_teacher_dim(train_cameras[0].image_name)
-        distill_head = torch.nn.Conv2d(gaussians.num_objects, distill_teacher_dim, kernel_size=1)
-        distill_head.cuda()
-        distill_optimizer = torch.optim.Adam(distill_head.parameters(), lr=5e-4)
-        print(
-            f"DINO distillation enabled. Feature dir: {feature_dir}, teacher_dim: {distill_teacher_dim}"
-        )
+        except Exception as exc:
+            print(f"[Warning] Disable DINO distillation: {exc}")
+            opt.distill_enable = False
+            distill_loader = None
+            distill_head = None
+            distill_optimizer = None
+            distill_teacher_dim = 0
 
     if checkpoint:
         checkpoint_data = torch.load(checkpoint)
@@ -205,7 +213,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         distill_coeff = torch.tensor(0.0, device=image.device)
         loss_distill_raw = torch.tensor(0.0, device=image.device)
         loss_distill = torch.tensor(0.0, device=image.device)
-        distill_active = distill_head is not None
+        distill_active = distill_head is not None and distill_loader is not None
         sugar_axis_align_cosine = torch.tensor(0.0, device=image.device)
         sugar_plane_residual = torch.tensor(0.0, device=image.device)
         sugar_flat_ratio = torch.tensor(0.0, device=image.device)
@@ -261,22 +269,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = loss + loss_sugar_opacity_entropy_term
 
         if distill_active:
-            teacher_feature_map, _ = distill_loader.get_feature_map(
-                viewpoint_cam.image_name,
-                target_hw=objects.shape[-2:],
-                device=image.device,
-                dtype=objects.dtype,
-            )
-            student_feature_map = distill_head(objects)
-            distill_mask = render_feature_foreground_mask(objects, eps=opt.distill_mask_eps)
-            loss_distill_raw = cosine_distill_loss(
-                student_feature_map,
-                teacher_feature_map,
-                mask=distill_mask,
-            )
-            distill_coeff = image.new_tensor(opt.distill_weight_lambda)
-            loss_distill = distill_coeff * loss_distill_raw
-            loss = loss + loss_distill
+            try:
+                teacher_feature_map, _ = distill_loader.get_feature_map(
+                    viewpoint_cam.image_name,
+                    target_hw=objects.shape[-2:],
+                    device=image.device,
+                    dtype=objects.dtype,
+                )
+                student_feature_map = distill_head(objects)
+                distill_mask = render_feature_foreground_mask(objects, eps=opt.distill_mask_eps)
+                loss_distill_raw = cosine_distill_loss(
+                    student_feature_map,
+                    teacher_feature_map,
+                    mask=distill_mask,
+                )
+                distill_coeff = image.new_tensor(opt.distill_weight_lambda)
+                loss_distill = distill_coeff * loss_distill_raw
+                loss = loss + loss_distill
+            except Exception as exc:
+                print(f"[Warning] Disable DINO distillation during training: {exc}")
+                distill_loader = None
+                distill_head = None
+                distill_optimizer = None
+                distill_teacher_dim = 0
+                distill_active = False
 
         if geo_active:
             warmup_iters = max(1, opt.geo_warmup_iters)

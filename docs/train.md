@@ -50,8 +50,9 @@ bash script/prepare_pseudo_label.sh mipnerf360/counter 2
 
 ## 2. Training and Masks Rendering
 
-Before training with the default config in `config/gaussian_dataset/train.json`,
-prepare offline DINO feature caches once for the scene:
+If you want to enable optional DINO distillation, prepare offline DINO feature
+caches once for the scene and set `"distill_enable": true` in
+`config/gaussian_dataset/train.json`:
 
 ```
 python script/prepare_dino_features.py -s <location>

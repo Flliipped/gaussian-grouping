@@ -50,7 +50,7 @@
     "geo_sem_neg_boost": 1.0,
     "geo_sem_conflict_penalty": 0.75,
 
-    "distill_enable": true,
+    "distill_enable": false,
     "distill_weight_lambda": 0.1,
     "distill_feature_dir": "dino_feature",
     "distill_loss_type": "cosine",
