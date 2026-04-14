@@ -11,6 +11,7 @@ from utils.loss_utils import (
     loss_geo_gated_contrastive,
     loss_sugar_surface_alignment,
 )
+from utils.multiview_utils import compute_pair_label_persistence
 
 
 class GeoSemanticGroupingTests(unittest.TestCase):
@@ -155,6 +156,65 @@ class GeoSemanticGroupingTests(unittest.TestCase):
         self.assertGreater(pos_pairs, 0.0)
         self.assertGreater(neg_pairs, 0.0)
         self.assertLess(semantic_pos_keep_ratio, 1.0)
+
+    def test_pair_label_persistence_tracks_same_diff_and_unstable_pairs(self):
+        view_labels = torch.tensor(
+            [
+                [1, 1, 2, 1],
+                [1, 1, 2, 2],
+                [1, 1, 2, 1],
+                [1, 1, 2, 2],
+            ],
+            dtype=torch.long,
+        )
+        view_valid = torch.ones_like(view_labels, dtype=torch.bool)
+        anchor_indices = torch.tensor([0], dtype=torch.long)
+        neighbor_indices = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+        same_conf, diff_conf, stability, valid_views = compute_pair_label_persistence(
+            view_labels,
+            view_valid,
+            anchor_indices,
+            neighbor_indices,
+            min_views=2,
+            conf_tau=0.6,
+        )
+
+        self.assertEqual(valid_views[0, 0].item(), 4.0)
+        self.assertGreater(same_conf[0, 0].item(), 0.9)
+        self.assertGreater(diff_conf[0, 1].item(), 0.9)
+        self.assertLess(stability[0, 2].item(), 0.1)
+
+    def test_confidence_gate_can_ignore_unreliable_geometry(self):
+        torch.manual_seed(0)
+        xyz = torch.tensor([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]], dtype=torch.float32)
+        features = torch.tensor([[0.0] * 16, [0.1] * 16], dtype=torch.float32)
+        normals = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+        surface_thickness = torch.tensor([[0.4], [0.4]], dtype=torch.float32)
+        surface_flat_ratio = torch.tensor([[2.0], [2.0]], dtype=torch.float32)
+
+        outputs = loss_geo_gated_contrastive(
+            xyz=xyz,
+            features=features,
+            normals=normals,
+            k=1,
+            sample_size=2,
+            spatial_pos_scale=1.1,
+            plane_tau=0.05,
+            normal_pos_tau=0.9,
+            neg_margin=1.0,
+            hard_neg_k=1,
+            surface_thickness=surface_thickness,
+            surface_flat_ratio=surface_flat_ratio,
+            confidence_enable=True,
+            ignore_band=0.1,
+            gate_sharpen_ratio=1.0,
+        )
+
+        pos_pairs = outputs[19].item()
+        edge_confidence_mean = outputs[23].item()
+        self.assertEqual(pos_pairs, 0.0)
+        self.assertLess(edge_confidence_mean, 0.05)
 
     def test_feature_cache_loader_resizes_and_validates(self):
         loader = FeatureCacheLoader(Path("."))

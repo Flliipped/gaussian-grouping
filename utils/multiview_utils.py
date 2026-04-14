@@ -160,3 +160,72 @@ def compute_point_label_consensus(view_labels, view_valid, num_classes=None, min
     )
 
     return consensus_label, consensus_valid, consensus_confidence, valid_view_count
+
+
+def compute_pair_label_persistence(
+    view_labels,
+    view_valid,
+    anchor_indices,
+    neighbor_indices,
+    min_views=2,
+    conf_tau=0.7,
+):
+    """
+    Estimate whether a pair of Gaussians stays on the same instance boundary
+    relation across views.
+
+    Returns:
+        same_confidence: [S, K] float
+        diff_confidence: [S, K] float
+        stability: [S, K] float
+        valid_view_count: [S, K] float
+    """
+    device = view_labels.device
+    sample_count = anchor_indices.shape[0]
+    effective_k = neighbor_indices.shape[1] if neighbor_indices.dim() == 2 else 0
+
+    zeros = torch.zeros((sample_count, effective_k), device=device, dtype=torch.float32)
+    if view_labels.numel() == 0 or sample_count == 0 or effective_k == 0:
+        return zeros, zeros, zeros, zeros
+
+    anchor_indices = anchor_indices.long()
+    neighbor_indices = neighbor_indices.long()
+    num_views = view_labels.shape[0]
+
+    anchor_labels = view_labels[:, anchor_indices]
+    anchor_valid = view_valid[:, anchor_indices]
+
+    neighbor_flat = neighbor_indices.reshape(-1)
+    gather_index = neighbor_flat.unsqueeze(0).expand(num_views, -1)
+    neighbor_labels = torch.gather(view_labels, 1, gather_index).view(num_views, sample_count, effective_k)
+    neighbor_valid = torch.gather(view_valid, 1, gather_index).view(num_views, sample_count, effective_k)
+
+    pair_valid = anchor_valid.unsqueeze(-1) & neighbor_valid
+    same_votes = pair_valid & (anchor_labels.unsqueeze(-1) == neighbor_labels)
+    diff_votes = pair_valid & (anchor_labels.unsqueeze(-1) != neighbor_labels)
+
+    valid_view_count = pair_valid.to(torch.float32).sum(dim=0)
+    min_views = max(int(min_views), 1)
+    supported = valid_view_count >= min_views
+
+    same_ratio = same_votes.to(torch.float32).sum(dim=0) / valid_view_count.clamp_min(1.0)
+    diff_ratio = diff_votes.to(torch.float32).sum(dim=0) / valid_view_count.clamp_min(1.0)
+
+    same_confidence = torch.where(
+        supported,
+        same_ratio * torch.sigmoid((same_ratio - conf_tau) / 0.1),
+        zeros,
+    )
+    diff_confidence = torch.where(
+        supported,
+        diff_ratio * torch.sigmoid((diff_ratio - conf_tau) / 0.1),
+        zeros,
+    )
+    stability_margin = torch.abs(same_ratio - diff_ratio)
+    stability = torch.where(
+        supported,
+        torch.maximum(same_confidence, diff_confidence) * stability_margin,
+        zeros,
+    )
+
+    return same_confidence, diff_confidence, stability, valid_view_count

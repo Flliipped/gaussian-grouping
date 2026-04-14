@@ -236,6 +236,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         pos_pairs = torch.tensor(0.0, device=image.device)
         neg_pairs = torch.tensor(0.0, device=image.device)
         boundary_neg_ratio = torch.tensor(0.0, device=image.device)
+        soft_gate_mean = torch.tensor(0.0, device=image.device)
+        edge_confidence_mean = torch.tensor(0.0, device=image.device)
+        persistence_same = torch.tensor(0.0, device=image.device)
+        persistence_diff = torch.tensor(0.0, device=image.device)
+        boundary_stability = torch.tensor(0.0, device=image.device)
+        proto_coeff = torch.tensor(0.0, device=image.device)
+        loss_proto_raw = torch.tensor(0.0, device=image.device)
+        loss_proto = torch.tensor(0.0, device=image.device)
+        proto_valid_points = torch.tensor(0.0, device=image.device)
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
 
@@ -298,6 +307,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             warmup_iters = max(1, opt.geo_warmup_iters)
             geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
             geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
+            if opt.geo_gate_sharpen_end <= opt.geo_gate_sharpen_start:
+                gate_sharpen_ratio = 1.0 if iteration >= opt.geo_gate_sharpen_start else 0.0
+            else:
+                gate_sharpen_ratio = min(
+                    max(
+                        (iteration - opt.geo_gate_sharpen_start)
+                        / max(opt.geo_gate_sharpen_end - opt.geo_gate_sharpen_start, 1),
+                        0.0,
+                    ),
+                    1.0,
+                )
+            persistence_active = opt.geo_boundary_persistence_enable and iteration >= opt.geo_gate_sharpen_start
+            proto_active = opt.proto_enable and iteration >= opt.geo_gate_sharpen_start
 
             support_cameras = None
             support_visibility = None
@@ -316,7 +338,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             visibility_masks.append(support_render_pkg["visibility_filter"].detach())
                 support_visibility = torch.stack(visibility_masks, dim=0)
 
-            loss_geo_raw, gate_ratio, avg_depth_gap, loss_con_raw, loss_smooth_raw, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_dist, avg_neg_dist, avg_hard_neg_dist, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, pos_pairs, neg_pairs, boundary_neg_ratio = loss_geo_gated_contrastive(
+            (
+                loss_geo_raw,
+                gate_ratio,
+                avg_depth_gap,
+                loss_con_raw,
+                loss_smooth_raw,
+                pos_loss,
+                neg_loss,
+                avg_feature_norm,
+                avg_normal_cosine,
+                avg_pos_dist,
+                avg_neg_dist,
+                avg_hard_neg_dist,
+                active_neg_ratio,
+                neg_candidate_ratio,
+                ignore_ratio,
+                avg_sem_valid_views,
+                avg_sem_confidence,
+                semantic_pos_keep_ratio,
+                semantic_neg_keep_ratio,
+                pos_pairs,
+                neg_pairs,
+                boundary_neg_ratio,
+                soft_gate_mean,
+                edge_confidence_mean,
+                persistence_same,
+                persistence_diff,
+                loss_proto_raw,
+                proto_valid_points,
+                boundary_stability,
+            ) = loss_geo_gated_contrastive(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
                 normals=gaussians.get_surface_axis.detach(),
@@ -343,9 +395,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sem_ignore_label=opt.geo_sem_ignore_label,
                 normal_weight_lambda=opt.geo_normal_weight_lambda,
                 sem_neg_boost=opt.geo_sem_neg_boost,
+                surface_thickness=gaussians.get_surface_thickness.detach(),
+                surface_flat_ratio=gaussians.get_surface_flat_ratio.detach(),
+                confidence_enable=opt.geo_confidence_enable,
+                confidence_mode=opt.geo_confidence_mode,
+                ignore_band=opt.geo_ignore_band,
+                gate_sharpen_ratio=gate_sharpen_ratio,
+                multiscale_knn=opt.geo_multiscale_knn,
+                boundary_persistence_enable=persistence_active,
+                proto_enable=proto_active,
             )
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
+            if proto_active:
+                proto_coeff = image.new_tensor(
+                    opt.geo_weight_lambda * geo_progress * opt.proto_weight_lambda * gate_sharpen_ratio
+                )
+                loss_proto = proto_coeff * loss_proto_raw
+                loss = loss + loss_proto
 
         if iteration % 100 == 0 and (sugar_active or sugar_opacity_entropy_active or geo_active or distill_active):
             loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
@@ -395,13 +462,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"active_neg_ratio={active_neg_ratio.item():.6f}, "
                     + f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
                     + f"ignore_ratio={ignore_ratio.item():.6f}, "
+                    + f"soft_gate_mean={soft_gate_mean.item():.6f}, "
+                    + f"edge_confidence_mean={edge_confidence_mean.item():.6f}, "
+                    + f"persistence_same={persistence_same.item():.6f}, "
+                    + f"persistence_diff={persistence_diff.item():.6f}, "
+                    + f"boundary_stability={boundary_stability.item():.6f}, "
                     + f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
                     + f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
                     + f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
                     + f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}, "
                     + f"pos_pairs={pos_pairs.item():.2f}, "
                     + f"neg_pairs={neg_pairs.item():.2f}, "
-                    + f"boundary_neg_ratio={boundary_neg_ratio.item():.6f}"
+                    + f"boundary_neg_ratio={boundary_neg_ratio.item():.6f}, "
+                    + f"loss_proto_raw={loss_proto_raw.item():.6f}, "
+                    + f"loss_proto={loss_proto.item():.6f}, "
+                    + f"proto_valid_points={proto_valid_points.item():.2f}"
                 )
             else:
                 print(message.rstrip(", "))
@@ -470,6 +545,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
                 "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
                 "train_loss_patches/ignore_ratio": ignore_ratio.item(),
+                "train_loss_patches/soft_gate_mean": soft_gate_mean.item(),
+                "train_loss_patches/edge_confidence_mean": edge_confidence_mean.item(),
+                "train_loss_patches/persistence_same": persistence_same.item(),
+                "train_loss_patches/persistence_diff": persistence_diff.item(),
+                "train_loss_patches/boundary_stability": boundary_stability.item(),
                 "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
                 "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
                 "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
@@ -477,6 +557,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "train_loss_patches/pos_pairs": pos_pairs.item(),
                 "train_loss_patches/neg_pairs": neg_pairs.item(),
                 "train_loss_patches/boundary_neg_ratio": boundary_neg_ratio.item(),
+                "train_loss_patches/loss_proto_raw": loss_proto_raw.item(),
+                "train_loss_patches/loss_proto": loss_proto.item(),
+                "train_loss_patches/proto_coeff": proto_coeff.item(),
+                "train_loss_patches/proto_valid_points": proto_valid_points.item(),
             })
 
 
@@ -665,6 +749,18 @@ if __name__ == "__main__":
     args.geo_sem_same_boost = config.get("geo_sem_same_boost", 1.0)
     args.geo_sem_neg_boost = config.get("geo_sem_neg_boost", 1.0)
     args.geo_sem_conflict_penalty = config.get("geo_sem_conflict_penalty", 0.75)
+    args.geo_confidence_enable = config.get("geo_confidence_enable", True)
+    args.geo_confidence_mode = config.get("geo_confidence_mode", "sugar")
+    args.geo_ignore_band = config.get("geo_ignore_band", 0.1)
+    args.geo_gate_sharpen_start = config.get("geo_gate_sharpen_start", args.geo_start_iter)
+    args.geo_gate_sharpen_end = config.get(
+        "geo_gate_sharpen_end",
+        args.geo_start_iter + args.geo_warmup_iters,
+    )
+    args.geo_multiscale_knn = config.get("geo_multiscale_knn", [args.geo_knn_k])
+    args.geo_boundary_persistence_enable = config.get("geo_boundary_persistence_enable", False)
+    args.proto_enable = config.get("proto_enable", False)
+    args.proto_weight_lambda = config.get("proto_weight_lambda", 0.05)
     args.geo_alpha = config.get("geo_alpha", 2.0)
     args.geo_beta = config.get("geo_beta", 1.0)
     args.geo_gamma = config.get("geo_gamma", 1.0)
