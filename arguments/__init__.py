@@ -124,6 +124,15 @@ class OptimizationParams(ParamGroup):
         self.geo_sem_same_boost = 1.0
         self.geo_sem_neg_boost = 1.0
         self.geo_sem_conflict_penalty = 0.75
+        self.geo_confidence_enable = False
+        self.geo_confidence_mode = "sugar"
+        self.geo_ignore_band = 0.1
+        self.geo_gate_sharpen_start = 17_000
+        self.geo_gate_sharpen_end = 21_000
+        self.geo_multiscale_knn = 8
+        self.geo_boundary_persistence_enable = False
+        self.proto_enable = False
+        self.proto_weight_lambda = 0.05
         self.geo_alpha = 2.0
         self.geo_beta = 1.0
         self.geo_gamma = 1.0

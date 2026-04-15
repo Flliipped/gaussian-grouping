@@ -61,6 +61,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     checkpoint_classifier_state = None
     checkpoint_distill_state = None
+
+    opt.geo_confidence_enable = getattr(opt, "geo_confidence_enable", False)
+    opt.geo_confidence_mode = getattr(opt, "geo_confidence_mode", "sugar")
+    opt.geo_ignore_band = getattr(opt, "geo_ignore_band", 0.1)
+    opt.geo_gate_sharpen_start = getattr(opt, "geo_gate_sharpen_start", opt.geo_start_iter)
+    opt.geo_gate_sharpen_end = getattr(
+        opt,
+        "geo_gate_sharpen_end",
+        opt.geo_start_iter + getattr(opt, "geo_warmup_iters", 4000),
+    )
+    opt.geo_multiscale_knn = getattr(opt, "geo_multiscale_knn", [getattr(opt, "geo_knn_k", 8)])
+    opt.geo_boundary_persistence_enable = getattr(opt, "geo_boundary_persistence_enable", False)
+    opt.proto_enable = getattr(opt, "proto_enable", False)
+    opt.proto_weight_lambda = getattr(opt, "proto_weight_lambda", 0.05)
+
     prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
