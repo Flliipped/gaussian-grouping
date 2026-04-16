@@ -18,7 +18,7 @@
     "sugar_max_points": 200000,
     "sugar_sample_size": 800,
 
-    "geo_start_iter" : 12000,
+    "geo_start_iter": 12000,
     "geo_interval": 10,
     "geo_knn_k": 8,
     "geo_weight_lambda": 1.0,
@@ -44,7 +44,7 @@
     "geo_sem_neg_boost": 1.0,
     "geo_sem_conflict_penalty": 0.75,
 
-    "proto_enabled": false,
+    "proto_enabled": true,
     "proto_start_iter": 18000,
     "proto_interval": 10,
     "proto_warmup_iters": 3000,

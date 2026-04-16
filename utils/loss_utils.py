@@ -10,25 +10,11 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
-from scipy.spatial import cKDTree
 from utils.general_utils import build_rotation
 from utils.multiview_utils import collect_multiview_labels, compute_point_label_consensus
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
-
-def masked_l1_loss(network_output, gt, mask):
-    mask = mask.float()[None,:,:].repeat(gt.shape[0],1,1)
-    loss = torch.abs((network_output - gt)) * mask
-    loss = loss.sum() / mask.sum()
-    return loss
-
-def weighted_l1_loss(network_output, gt, weight):
-    loss = torch.abs((network_output - gt)) * weight
-    return loss.mean()
-
-def l2_loss(network_output, gt):
-    return ((network_output - gt) ** 2).mean()
 
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -115,161 +101,6 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     normalized_loss = loss / num_classes
 
     return lambda_val * normalized_loss
-
-def loss_geo_contrastive(xyz, features, k=5, lambda_val=2.0, lambda_pos=1.0, lambda_neg=3000, max_points=200000, plane_tau = 0.01, normal_tau=0.9, sample_size=800, margin=1.0, hard_neg_k=2 ,eps=1e-8):
-    if features.size(0) > max_points:
-        indices = torch.randperm(features.size(0))[:max_points]
-        xyz = xyz[indices]
-        features = features[indices]
-
-    indices = torch.randperm(features.size(0))[:sample_size]
-    sample_xyz = xyz[indices]
-    sample_features = features[indices]
-
-    dists = torch.cdist(sample_xyz, xyz)
-    _, neighbor_indices_tensor = dists.topk(k + 1, largest=False)
-    neighbor_indices_tensor = neighbor_indices_tensor[:, 1:]
-
-    neighbor_xyz = xyz[neighbor_indices_tensor]
-    neighbor_features = features[neighbor_indices_tensor]
-
-    local_center = neighbor_xyz.mean(dim=1, keepdim=True)
-    local_xyz = neighbor_xyz - local_center
-
-    cov = torch.matmul(local_xyz.transpose(1, 2), local_xyz) / (k + eps)
-
-    eigvals, eigvecs = torch.linalg.eigh(cov)
-    normals = eigvecs[:, :, 0]
-
-    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
-    plane_residual = torch.abs((rel_xyz * normals.unsqueeze(1)).sum(dim=-1))
-
-    gate = (plane_residual < plane_tau).float()
-
-    feat_dist = torch.norm(neighbor_features - sample_features.unsqueeze(1), dim=-1)
-
-    pos_loss = (gate * (feat_dist ** 2)).sum() / (gate.sum() + eps)
-
-    # -------------------------
-    # Hard negative mining
-    # -------------------------
-    neg_mask = (1.0 - gate)                                    # [M, k]
-
-    # For hard negatives:
-    # among negative neighbors, smaller feat_dist => harder
-    masked_neg_dist = feat_dist.clone()
-
-    # set positive positions to large value so they won't be selected
-    masked_neg_dist[neg_mask == 0] = 1e6
-
-    # select top hard_neg_k smallest negative distances per anchor
-    hard_neg_vals, hard_neg_idx = masked_neg_dist.topk(hard_neg_k, largest=False)
-
-    # build hard negative mask
-    hard_neg_mask = torch.zeros_like(neg_mask)                 # [M, k]
-    hard_neg_mask.scatter_(1, hard_neg_idx, 1.0)
-
-    # but only keep truly negative positions
-    hard_neg_mask = hard_neg_mask * neg_mask
-
-    # negative margin loss
-    neg_term = torch.clamp(margin - feat_dist, min=0.0)
-    neg_loss = (hard_neg_mask * (neg_term ** 2)).sum() / (hard_neg_mask.sum() + eps)
-
-    loss = lambda_pos * pos_loss + lambda_neg * neg_loss
-    
-    gate_ratio = gate.mean()
-    avg_plane_residual = plane_residual.mean()
-
-    return lambda_val * loss, gate_ratio, avg_plane_residual, pos_loss, neg_loss
-
-
-def loss_geo_contrastive_boundary(
-    xyz,
-    features,
-    k=8,
-    lambda_val=1.0,
-    max_points=200000,
-    sample_size=800,
-    plane_tau=0.01,
-    margin=1.0,
-    alpha=2.0,
-    beta=1.0,
-    gamma=1.0,
-    weight_power=2.0,
-    eps=1e-8,
-):
-    zero = features.new_tensor(0.0)
-
-    if features.size(0) > max_points:
-        indices = torch.randperm(features.size(0), device=features.device)[:max_points]
-        xyz = xyz[indices]
-        features = features[indices]
-
-    num_points = features.size(0)
-    if num_points < 2:
-        return zero, zero, zero, zero, zero, zero, zero, zero
-
-    sample_count = min(sample_size, num_points)
-    effective_k = min(k, num_points - 1)
-    if sample_count <= 0 or effective_k <= 0:
-        return zero, zero, zero, zero, zero, zero, zero, zero
-
-    indices = torch.randperm(num_points, device=features.device)[:sample_count]
-    sample_xyz = xyz[indices]
-    sample_features = features[indices]
-
-    dists = torch.cdist(sample_xyz, xyz)
-    _, neighbor_indices_tensor = dists.topk(effective_k + 1, largest=False)
-    neighbor_indices_tensor = neighbor_indices_tensor[:, 1:]
-
-    neighbor_xyz = xyz[neighbor_indices_tensor]
-    neighbor_features = features[neighbor_indices_tensor]
-
-    local_center = neighbor_xyz.mean(dim=1, keepdim=True)
-    local_xyz = neighbor_xyz - local_center
-    cov = torch.matmul(local_xyz.transpose(1, 2), local_xyz) / (effective_k + eps)
-
-    _, eigvecs = torch.linalg.eigh(cov)
-    normals = eigvecs[:, :, 0]
-
-    rel_xyz = neighbor_xyz - sample_xyz.unsqueeze(1)
-    plane_residual = torch.abs((rel_xyz * normals.unsqueeze(1)).sum(dim=-1))
-    xyz_dist = torch.norm(rel_xyz, dim=-1)
-    feat_dist = torch.norm(neighbor_features - sample_features.unsqueeze(1), dim=-1)
-
-    pos_mask = (plane_residual < plane_tau).to(feat_dist.dtype)
-    pos_loss = (pos_mask * (feat_dist ** 2)).sum() / (pos_mask.sum() + eps)
-
-    log_boundary_weight = alpha * plane_residual - beta * feat_dist - gamma * xyz_dist
-    log_boundary_weight = log_boundary_weight - log_boundary_weight.max().detach()
-    boundary_weight = torch.exp(log_boundary_weight)
-    boundary_weight = boundary_weight / (boundary_weight.max() + eps)
-    boundary_weight = boundary_weight ** weight_power
-
-    neg_mask = 1.0 - pos_mask
-    neg_weight = boundary_weight * neg_mask
-
-    neg_term = torch.clamp(margin - feat_dist, min=0.0)
-    neg_loss = (neg_weight * (neg_term ** 2)).sum() / (neg_weight.sum() + eps)
-
-    loss = pos_loss + neg_loss
-    gate_ratio = pos_mask.mean()
-    avg_plane_residual = plane_residual.mean()
-    avg_boundary_weight = boundary_weight.mean()
-    max_boundary_weight = boundary_weight.max()
-    std_boundary_weight = boundary_weight.std(unbiased=False)
-
-    return (
-        lambda_val * loss,
-        gate_ratio,
-        avg_plane_residual,
-        pos_loss,
-        neg_loss,
-        avg_boundary_weight,
-        max_boundary_weight,
-        std_boundary_weight,
-    )
 
 
 def loss_sugar_surface_alignment(
@@ -597,4 +428,177 @@ def loss_geo_contrastive_cosine(
         semantic_pos_keep_ratio,
         semantic_neg_keep_ratio,
     )
-    
+
+
+def loss_object_prototype(
+    xyz,
+    features,
+    prototype_state,
+    point_ids=None,
+    support_cameras=None,
+    support_visibility=None,
+    sem_num_classes=None,
+    sem_ignore_label=-1,
+    sem_min_views=2,
+    sem_conf_tau=0.7,
+    bank_conf_tau=0.8,
+    bank_momentum=0.9,
+    temperature=0.2,
+    lambda_assign=1.0,
+    lambda_pull=1.0,
+    lambda_push=0.5,
+    lambda_soft=0.25,
+    push_margin=0.1,
+    max_points=200000,
+    sample_size=1200,
+    min_proto_points=4,
+    eps=1e-8,
+):
+    zero = features.new_tensor(0.0)
+
+    if prototype_state is None or support_cameras is None or len(support_cameras) == 0:
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+
+    if features.size(0) > max_points:
+        selected_indices = torch.randperm(features.size(0), device=features.device)[:max_points]
+        xyz = xyz[selected_indices]
+        features = features[selected_indices]
+        if point_ids is not None:
+            point_ids = point_ids[selected_indices]
+
+    num_points = features.size(0)
+    if num_points == 0:
+        return zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero
+
+    sample_count = min(sample_size, num_points)
+    sample_indices = torch.randperm(num_points, device=features.device)[:sample_count]
+    sample_xyz = xyz[sample_indices]
+    sample_features = F.normalize(features[sample_indices], dim=-1, eps=eps)
+    sample_point_ids = sample_indices if point_ids is None else point_ids[sample_indices]
+
+    view_labels, view_valid = collect_multiview_labels(
+        support_cameras,
+        sample_xyz,
+        point_ids=sample_point_ids,
+        visibility_masks=support_visibility,
+        ignore_label=sem_ignore_label,
+    )
+    point_sem_label, point_sem_valid, point_sem_confidence, point_valid_view_count = compute_point_label_consensus(
+        view_labels,
+        view_valid,
+        num_classes=sem_num_classes,
+        min_views=sem_min_views,
+        conf_tau=sem_conf_tau,
+    )
+
+    prototype_bank = prototype_state["bank"]
+    prototype_valid = prototype_state["valid"]
+    prototype_counts = prototype_state["counts"]
+    num_prototypes = prototype_bank.shape[0]
+
+    update_mask = point_sem_valid & (point_sem_confidence >= bank_conf_tau)
+    updated_proto_count = zero
+    with torch.no_grad():
+        if update_mask.any():
+            update_labels = torch.unique(point_sem_label[update_mask])
+            updated = 0
+            for label in update_labels.tolist():
+                label_mask = update_mask & (point_sem_label == label)
+                if int(label_mask.sum().item()) < max(int(min_proto_points), 1):
+                    continue
+                proto_feat = sample_features[label_mask].mean(dim=0)
+                proto_feat = F.normalize(proto_feat.unsqueeze(0), dim=-1, eps=eps).squeeze(0)
+                if prototype_valid[label]:
+                    proto_feat = bank_momentum * prototype_bank[label] + (1.0 - bank_momentum) * proto_feat
+                    proto_feat = F.normalize(proto_feat.unsqueeze(0), dim=-1, eps=eps).squeeze(0)
+                prototype_bank[label].copy_(proto_feat)
+                prototype_valid[label] = True
+                prototype_counts[label] += label_mask.sum().to(prototype_counts.dtype)
+                updated += 1
+            updated_proto_count = zero.new_tensor(float(updated))
+
+    active_proto_ids = prototype_valid.nonzero(as_tuple=False).squeeze(-1)
+    active_proto_count = zero.new_tensor(float(active_proto_ids.numel()))
+    if active_proto_ids.numel() == 0:
+        return zero, zero, zero, zero, zero, active_proto_count, updated_proto_count, zero, zero, zero, zero, zero, zero
+
+    active_prototypes = F.normalize(prototype_bank[active_proto_ids], dim=-1, eps=eps)
+    similarity = torch.matmul(sample_features, active_prototypes.transpose(0, 1)).clamp(-1.0, 1.0)
+    logits = similarity / max(float(temperature), eps)
+
+    label_to_local = torch.full((num_prototypes,), -1, device=features.device, dtype=torch.long)
+    label_to_local[active_proto_ids] = torch.arange(active_proto_ids.numel(), device=features.device)
+    safe_labels = point_sem_label.clamp(min=0, max=num_prototypes - 1)
+    local_targets = label_to_local[safe_labels]
+    supervised_mask = point_sem_valid & (point_sem_confidence >= sem_conf_tau) & (local_targets >= 0)
+
+    assign_loss = zero
+    pull_loss = zero
+    push_loss = zero
+    avg_pos_similarity = zero
+    avg_neg_similarity = zero
+
+    if supervised_mask.any():
+        supervised_weights = point_sem_confidence[supervised_mask]
+        supervised_logits = logits[supervised_mask]
+        supervised_targets = local_targets[supervised_mask]
+
+        ce_loss = F.cross_entropy(supervised_logits, supervised_targets, reduction="none")
+        assign_loss = (ce_loss * supervised_weights).sum() / (supervised_weights.sum() + eps)
+
+        pos_similarity = similarity[supervised_mask, supervised_targets]
+        pull_loss = ((1.0 - pos_similarity) * supervised_weights).sum() / (supervised_weights.sum() + eps)
+        avg_pos_similarity = pos_similarity.mean()
+
+        if active_proto_ids.numel() > 1:
+            neg_similarity = similarity[supervised_mask].clone()
+            neg_similarity.scatter_(1, supervised_targets.unsqueeze(1), -1.0)
+            hardest_negative_similarity = neg_similarity.max(dim=1).values
+            push_term = torch.clamp(hardest_negative_similarity - pos_similarity + push_margin, min=0.0)
+            push_loss = ((push_term ** 2) * supervised_weights).sum() / (supervised_weights.sum() + eps)
+            avg_neg_similarity = hardest_negative_similarity.mean()
+
+    soft_loss = zero
+    soft_mask = (point_valid_view_count > 0) & (~supervised_mask)
+    if soft_mask.any():
+        soft_probs = torch.softmax(logits[soft_mask], dim=-1)
+        proto_mix = torch.matmul(soft_probs, active_prototypes)
+        proto_mix = F.normalize(proto_mix, dim=-1, eps=eps)
+        soft_weights = 1.0 - point_sem_confidence[soft_mask]
+        soft_similarity = (sample_features[soft_mask] * proto_mix).sum(dim=-1).clamp(-1.0, 1.0)
+        soft_loss = ((1.0 - soft_similarity) * soft_weights).sum() / (soft_weights.sum() + eps)
+
+    probs = torch.softmax(logits, dim=-1)
+    entropy = -(probs * torch.log(probs.clamp_min(eps))).sum(dim=-1)
+    if active_proto_ids.numel() > 1:
+        entropy = entropy / torch.log(zero.new_tensor(float(active_proto_ids.numel())))
+    else:
+        entropy = torch.zeros_like(entropy)
+
+    prototype_loss = (
+        lambda_assign * assign_loss
+        + lambda_pull * pull_loss
+        + lambda_push * push_loss
+        + lambda_soft * soft_loss
+    )
+
+    supervised_ratio = supervised_mask.to(zero.dtype).mean()
+    soft_ratio = soft_mask.to(zero.dtype).mean()
+    avg_confidence = point_sem_confidence[point_valid_view_count > 0].mean() if (point_valid_view_count > 0).any() else zero
+    avg_entropy = entropy.mean()
+
+    return (
+        prototype_loss,
+        assign_loss,
+        pull_loss,
+        push_loss,
+        soft_loss,
+        active_proto_count,
+        updated_proto_count,
+        supervised_ratio,
+        soft_ratio,
+        avg_confidence,
+        avg_entropy,
+        avg_pos_similarity,
+        avg_neg_similarity,
+    )

@@ -9,7 +9,14 @@
 import os
 import torch
 from random import randint, sample
-from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_cosine, loss_sugar_surface_alignment
+from utils.loss_utils import (
+    l1_loss,
+    ssim,
+    loss_cls_3d,
+    loss_geo_contrastive_cosine,
+    loss_object_prototype,
+    loss_sugar_surface_alignment,
+)
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -19,8 +26,30 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-import wandb
 import json
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+
+def build_multiview_semantic_support(scene, gaussians, pipe, background, viewpoint_cam, visibility_filter, num_support_views):
+    candidate_cameras = [cam for cam in scene.getTrainCameras() if cam.uid != viewpoint_cam.uid]
+    num_support = min(max(int(num_support_views), 0), len(candidate_cameras))
+    support_cameras = [viewpoint_cam]
+    if num_support > 0:
+        support_cameras.extend(sample(candidate_cameras, num_support))
+
+    visibility_masks = [visibility_filter.detach()]
+    if len(support_cameras) > 1:
+        with torch.no_grad():
+            for support_cam in support_cameras[1:]:
+                support_render_pkg = render(support_cam, gaussians, pipe, background)
+                visibility_masks.append(support_render_pkg["visibility_filter"].detach())
+
+    return support_cameras, torch.stack(visibility_masks, dim=0)
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
@@ -34,6 +63,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
     classifier.cuda()
+    prototype_state = {
+        "bank": torch.zeros((num_classes, gaussians.num_objects), device="cuda"),
+        "valid": torch.zeros((num_classes,), device="cuda", dtype=torch.bool),
+        "counts": torch.zeros((num_classes,), device="cuda"),
+    }
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -132,8 +166,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         avg_sem_confidence = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
         semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
+        loss_proto_raw = torch.tensor(0.0, device=image.device)
+        loss_proto = torch.tensor(0.0, device=image.device)
+        proto_coeff = torch.tensor(0.0, device=image.device)
+        proto_assign_loss = torch.tensor(0.0, device=image.device)
+        proto_pull_loss = torch.tensor(0.0, device=image.device)
+        proto_push_loss = torch.tensor(0.0, device=image.device)
+        proto_soft_loss = torch.tensor(0.0, device=image.device)
+        active_proto_count = torch.tensor(0.0, device=image.device)
+        updated_proto_count = torch.tensor(0.0, device=image.device)
+        proto_supervised_ratio = torch.tensor(0.0, device=image.device)
+        proto_soft_ratio = torch.tensor(0.0, device=image.device)
+        proto_avg_confidence = torch.tensor(0.0, device=image.device)
+        proto_avg_entropy = torch.tensor(0.0, device=image.device)
+        proto_avg_pos_similarity = torch.tensor(0.0, device=image.device)
+        proto_avg_neg_similarity = torch.tensor(0.0, device=image.device)
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
+        proto_active = opt.proto_enabled and iteration >= opt.proto_start_iter and iteration % opt.proto_interval == 0
 
         if sugar_active:
             sugar_warmup_iters = max(1, opt.sugar_warmup_iters)
@@ -154,28 +204,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_sugar = sugar_coeff * loss_sugar_raw
             loss = loss + loss_sugar
 
+        support_cameras = None
+        support_visibility = None
+        needs_semantic_support = (geo_active and opt.geo_use_multiview_semantics) or proto_active
+        if needs_semantic_support:
+            support_view_budget = 0
+            if geo_active and opt.geo_use_multiview_semantics:
+                support_view_budget = max(support_view_budget, int(opt.geo_support_views))
+            if proto_active:
+                support_view_budget = max(support_view_budget, int(opt.proto_support_views))
+            support_cameras, support_visibility = build_multiview_semantic_support(
+                scene,
+                gaussians,
+                pipe,
+                background,
+                viewpoint_cam,
+                visibility_filter,
+                support_view_budget,
+            )
+
         if geo_active:
             warmup_iters = max(1, opt.geo_warmup_iters)
             geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
             geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
-
-            support_cameras = None
-            support_visibility = None
-            if opt.geo_use_multiview_semantics:
-                candidate_cameras = [cam for cam in scene.getTrainCameras() if cam.uid != viewpoint_cam.uid]
-                num_support = min(max(int(opt.geo_support_views), 0), len(candidate_cameras))
-                support_cameras = [viewpoint_cam]
-                if num_support > 0:
-                    support_cameras.extend(sample(candidate_cameras, num_support))
-
-                visibility_masks = [visibility_filter.detach()]
-                if len(support_cameras) > 1:
-                    with torch.no_grad():
-                        for support_cam in support_cameras[1:]:
-                            support_render_pkg = render(support_cam, gaussians, pipe, background)
-                            visibility_masks.append(support_render_pkg["visibility_filter"].detach())
-                support_visibility = torch.stack(visibility_masks, dim=0)
-
             loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
@@ -193,8 +244,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 normal_neg_tau=opt.geo_normal_neg_tau,
                 neg_margin=opt.geo_neg_margin,
                 hard_neg_k=opt.geo_hard_neg_k,
-                support_cameras=support_cameras,
-                support_visibility=support_visibility,
+                support_cameras=support_cameras if opt.geo_use_multiview_semantics else None,
+                support_visibility=support_visibility if opt.geo_use_multiview_semantics else None,
                 sem_min_views=opt.geo_sem_min_views,
                 sem_conf_tau=opt.geo_sem_conf_tau,
                 sem_num_classes=num_classes,
@@ -207,7 +258,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
 
-        if iteration % 100 == 0 and (sugar_active or geo_active):
+        if proto_active:
+            proto_warmup_iters = max(1, opt.proto_warmup_iters)
+            proto_progress = min(max((iteration - opt.proto_start_iter) / proto_warmup_iters, 0.0), 1.0)
+            proto_coeff = image.new_tensor(opt.proto_weight_lambda * proto_progress)
+            loss_proto_raw, proto_assign_loss, proto_pull_loss, proto_push_loss, proto_soft_loss, active_proto_count, updated_proto_count, proto_supervised_ratio, proto_soft_ratio, proto_avg_confidence, proto_avg_entropy, proto_avg_pos_similarity, proto_avg_neg_similarity = loss_object_prototype(
+                xyz=gaussians._xyz.squeeze().detach(),
+                features=gaussians._objects_dc.squeeze(1),
+                prototype_state=prototype_state,
+                point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
+                support_cameras=support_cameras,
+                support_visibility=support_visibility,
+                sem_num_classes=num_classes,
+                sem_ignore_label=opt.proto_ignore_label,
+                sem_min_views=opt.proto_min_views,
+                sem_conf_tau=opt.proto_conf_tau,
+                bank_conf_tau=opt.proto_bank_conf_tau,
+                bank_momentum=opt.proto_bank_momentum,
+                temperature=opt.proto_temperature,
+                lambda_assign=opt.proto_lambda_assign,
+                lambda_pull=opt.proto_lambda_pull,
+                lambda_push=opt.proto_lambda_push,
+                lambda_soft=opt.proto_lambda_soft,
+                push_margin=opt.proto_push_margin,
+                max_points=opt.proto_max_points,
+                sample_size=opt.proto_sample_size,
+                min_proto_points=opt.proto_min_points,
+            )
+            loss_proto = proto_coeff * loss_proto_raw
+            loss = loss + loss_proto
+
+        if iteration % 100 == 0 and (sugar_active or geo_active or proto_active):
             loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
             message = (
                 f"[Iter {iteration}] "
@@ -223,31 +304,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"sugar_plane_residual={sugar_plane_residual.item():.6f}, "
                     f"sugar_flat_ratio={sugar_flat_ratio.item():.6f}, "
                 )
-            if geo_active:
-                print(
-                    message
-                    + f"geo_coeff={geo_coeff.item():.6f}, "
-                    + f"loss_geo_raw={loss_geo_raw.item():.6f}, "
-                    + f"loss_geo={loss_geo.item():.6f}, "
-                    + f"pos_loss={pos_loss.item():.6f}, "
-                    + f"neg_loss={neg_loss.item():.6f}, "
-                    + f"gate_ratio={gate_ratio.item():.4f}, "
-                    + f"avg_plane_residual={avg_plane_residual.item():.6f}, "
-                    + f"avg_feature_norm={avg_feature_norm.item():.6f}, "
-                    + f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
-                    + f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
-                    + f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
-                    + f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
-                    + f"active_neg_ratio={active_neg_ratio.item():.6f}, "
-                    + f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
-                    + f"ignore_ratio={ignore_ratio.item():.6f}, "
-                    + f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
-                    + f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
-                    + f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
-                    + f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}"
+            if proto_active:
+                message += (
+                    f"proto_coeff={proto_coeff.item():.6f}, "
+                    f"loss_proto_raw={loss_proto_raw.item():.6f}, "
+                    f"loss_proto={loss_proto.item():.6f}, "
+                    f"proto_assign_loss={proto_assign_loss.item():.6f}, "
+                    f"proto_pull_loss={proto_pull_loss.item():.6f}, "
+                    f"proto_push_loss={proto_push_loss.item():.6f}, "
+                    f"proto_soft_loss={proto_soft_loss.item():.6f}, "
+                    f"active_proto_count={active_proto_count.item():.2f}, "
+                    f"updated_proto_count={updated_proto_count.item():.2f}, "
+                    f"proto_supervised_ratio={proto_supervised_ratio.item():.6f}, "
+                    f"proto_soft_ratio={proto_soft_ratio.item():.6f}, "
+                    f"proto_avg_confidence={proto_avg_confidence.item():.6f}, "
+                    f"proto_avg_entropy={proto_avg_entropy.item():.6f}, "
+                    f"proto_avg_pos_similarity={proto_avg_pos_similarity.item():.6f}, "
+                    f"proto_avg_neg_similarity={proto_avg_neg_similarity.item():.6f}, "
                 )
-            else:
-                print(message.rstrip(", "))
+            if geo_active:
+                message += (
+                    f"geo_coeff={geo_coeff.item():.6f}, "
+                    f"loss_geo_raw={loss_geo_raw.item():.6f}, "
+                    f"loss_geo={loss_geo.item():.6f}, "
+                    f"pos_loss={pos_loss.item():.6f}, "
+                    f"neg_loss={neg_loss.item():.6f}, "
+                    f"gate_ratio={gate_ratio.item():.4f}, "
+                    f"avg_plane_residual={avg_plane_residual.item():.6f}, "
+                    f"avg_feature_norm={avg_feature_norm.item():.6f}, "
+                    f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
+                    f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
+                    f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
+                    f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
+                    f"active_neg_ratio={active_neg_ratio.item():.6f}, "
+                    f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
+                    f"ignore_ratio={ignore_ratio.item():.6f}, "
+                    f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
+                    f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
+                    f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
+                    f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}, "
+                )
+            print(message.rstrip(", "))
 
 
         loss.backward()
@@ -264,11 +361,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_assign_loss, proto_pull_loss, proto_push_loss, proto_soft_loss, active_proto_count, updated_proto_count, proto_supervised_ratio, proto_soft_ratio, proto_avg_confidence, proto_avg_entropy, proto_avg_pos_similarity, proto_avg_neg_similarity, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 torch.save(classifier.state_dict(), os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),'classifier.pth'))
+                if opt.proto_enabled:
+                    torch.save(
+                        {
+                            "bank": prototype_state["bank"].detach().cpu(),
+                            "valid": prototype_state["valid"].detach().cpu(),
+                            "counts": prototype_state["counts"].detach().cpu(),
+                        },
+                        os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration), "prototype_bank.pth"),
+                    )
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -309,7 +415,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_assign_loss, proto_pull_loss, proto_push_loss, proto_soft_loss, active_proto_count, updated_proto_count, proto_supervised_ratio, proto_soft_ratio, proto_avg_confidence, proto_avg_entropy, proto_avg_pos_similarity, proto_avg_neg_similarity, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -319,6 +425,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
             "train_loss_patches/sugar_coeff": sugar_coeff.item(),
             "train_loss_patches/geo_active": float(geo_active),
             "train_loss_patches/geo_coeff": geo_coeff.item(),
+            "train_loss_patches/proto_active": float(proto_active),
+            "train_loss_patches/proto_coeff": proto_coeff.item(),
             "iter_time": elapsed,
             "iter": iteration
         }
@@ -355,6 +463,24 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
                 "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
                 "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
+            })
+
+        if proto_active:
+            log_data.update({
+                "train_loss_patches/loss_proto_raw": loss_proto_raw.item(),
+                "train_loss_patches/loss_proto": loss_proto.item(),
+                "train_loss_patches/proto_assign_loss": proto_assign_loss.item(),
+                "train_loss_patches/proto_pull_loss": proto_pull_loss.item(),
+                "train_loss_patches/proto_push_loss": proto_push_loss.item(),
+                "train_loss_patches/proto_soft_loss": proto_soft_loss.item(),
+                "train_loss_patches/active_proto_count": active_proto_count.item(),
+                "train_loss_patches/updated_proto_count": updated_proto_count.item(),
+                "train_loss_patches/proto_supervised_ratio": proto_supervised_ratio.item(),
+                "train_loss_patches/proto_soft_ratio": proto_soft_ratio.item(),
+                "train_loss_patches/proto_avg_confidence": proto_avg_confidence.item(),
+                "train_loss_patches/proto_avg_entropy": proto_avg_entropy.item(),
+                "train_loss_patches/proto_avg_pos_similarity": proto_avg_pos_similarity.item(),
+                "train_loss_patches/proto_avg_neg_similarity": proto_avg_neg_similarity.item(),
             })
 
         wandb.log(log_data)
@@ -447,18 +573,33 @@ if __name__ == "__main__":
     args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
     args.geo_use_multiview_semantics = config.get("geo_use_multiview_semantics", False)
     args.geo_support_views = config.get("geo_support_views", 3)
-    args.geo_sem_pos_ratio = config.get("geo_sem_pos_ratio", 0.7)
     args.geo_sem_min_views = config.get("geo_sem_min_views", 2)
-    args.geo_sem_conf_tau = config.get("geo_sem_conf_tau", args.geo_sem_pos_ratio)
+    args.geo_sem_conf_tau = config.get("geo_sem_conf_tau", config.get("geo_sem_pos_ratio", 0.7))
     args.geo_sem_ignore_label = config.get("geo_sem_ignore_label", -1)
     args.geo_normal_weight_lambda = config.get("geo_normal_weight_lambda", 5.0)
     args.geo_sem_same_boost = config.get("geo_sem_same_boost", 1.0)
     args.geo_sem_neg_boost = config.get("geo_sem_neg_boost", 1.0)
     args.geo_sem_conflict_penalty = config.get("geo_sem_conflict_penalty", 0.75)
-    args.geo_alpha = config.get("geo_alpha", 2.0)
-    args.geo_beta = config.get("geo_beta", 1.0)
-    args.geo_gamma = config.get("geo_gamma", 1.0)
-    args.geo_weight_power = config.get("geo_weight_power", 2.0)
+    args.proto_enabled = config.get("proto_enabled", False)
+    args.proto_start_iter = config.get("proto_start_iter", max(args.geo_start_iter, args.densify_until_iter + 4000))
+    args.proto_interval = config.get("proto_interval", 10)
+    args.proto_warmup_iters = config.get("proto_warmup_iters", 3000)
+    args.proto_weight_lambda = config.get("proto_weight_lambda", 0.0)
+    args.proto_support_views = config.get("proto_support_views", args.geo_support_views)
+    args.proto_max_points = config.get("proto_max_points", 200000)
+    args.proto_sample_size = config.get("proto_sample_size", 1200)
+    args.proto_min_views = config.get("proto_min_views", 2)
+    args.proto_conf_tau = config.get("proto_conf_tau", 0.7)
+    args.proto_bank_conf_tau = config.get("proto_bank_conf_tau", 0.8)
+    args.proto_bank_momentum = config.get("proto_bank_momentum", 0.9)
+    args.proto_temperature = config.get("proto_temperature", 0.2)
+    args.proto_lambda_assign = config.get("proto_lambda_assign", 1.0)
+    args.proto_lambda_pull = config.get("proto_lambda_pull", 1.0)
+    args.proto_lambda_push = config.get("proto_lambda_push", 0.5)
+    args.proto_lambda_soft = config.get("proto_lambda_soft", 0.25)
+    args.proto_push_margin = config.get("proto_push_margin", 0.1)
+    args.proto_min_points = config.get("proto_min_points", 4)
+    args.proto_ignore_label = config.get("proto_ignore_label", -1)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
@@ -472,6 +613,8 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
 
     if args.use_wandb:
+        if wandb is None:
+            raise ImportError("`--use_wandb` was set, but `wandb` is not installed.")
         wandb.init(project="gaussian-splatting")
         wandb.config.args = args
         wandb.run.name = args.model_path
