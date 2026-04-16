@@ -6,12 +6,11 @@ usage() {
     echo "Usage:"
     echo "  $0 <dataset_name> <scale> [output_name]"
     echo "  $0 <dataset_name> <scale> -m <output_name>"
-    echo "  $0 <dataset_name> <scale> [output_name] [--no-eval]"
-    echo "  $0 <dataset_name> <scale> -m <output_name> [--no-eval]"
+    echo "  $0 <dataset_name> <scale> [output_name] [--no-eval] [--wandb] [--config <config_file>]"
+    echo "  $0 <dataset_name> <scale> -m <output_name> [--no-eval] [--wandb] [--config <config_file>]"
     exit 1
 }
 
-# 至少需要 2 个参数
 if [ "$#" -lt 2 ]; then
     usage
 fi
@@ -27,14 +26,11 @@ if [ ! -d "$dataset_folder" ]; then
     exit 2
 fi
 
-# 默认输出目录
 model_path="output/${dataset_name}"
-
-# 默认开启 eval
 use_eval=true
 use_wandb=false
+config_file="config/gaussian_dataset/train.json"
 
-# 解析剩余参数
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -m)
@@ -52,16 +48,22 @@ while [ "$#" -gt 0 ]; do
             use_eval=true
             shift
             ;;
-         --wandb)
+        --wandb)
             use_wandb=true
             shift
+            ;;
+        --config)
+            if [ -z "$2" ]; then
+                usage
+            fi
+            config_file="$2"
+            shift 2
             ;;
         -*)
             echo "Unknown option: $1"
             usage
             ;;
         *)
-            # 位置参数作为 output_name
             model_path="output/$1"
             shift
             ;;
@@ -72,14 +74,20 @@ echo "Dataset folder: ${dataset_folder}"
 echo "Scale: ${scale}"
 echo "Model output: ${model_path}"
 echo "Eval enabled: ${use_eval}"
+echo "Wandb enabled: ${use_wandb}"
+echo "Config file: ${config_file}"
 
-# 训练命令
+if [ ! -f "$config_file" ]; then
+    echo "Error: Config file '$config_file' does not exist."
+    exit 3
+fi
+
 train_cmd=(
     python train.py
     -s "${dataset_folder}"
     -r "${scale}"
     -m "${model_path}"
-    --config_file config/gaussian_dataset/train.json
+    --config_file "${config_file}"
     --train_split
 )
 
@@ -89,13 +97,12 @@ fi
 if [ "${use_wandb}" = true ]; then
     train_cmd+=(--use_wandb)
 fi
+
 echo "Running training command:"
 printf ' %q' "${train_cmd[@]}"
 echo
-echo "Wandb enabled: ${use_wandb}"
 "${train_cmd[@]}"
 
-# 渲染命令
 render_cmd=(
     python render.py
     -m "${model_path}"
@@ -105,5 +112,4 @@ render_cmd=(
 echo "Running render command:"
 printf ' %q' "${render_cmd[@]}"
 echo
-
 "${render_cmd[@]}"

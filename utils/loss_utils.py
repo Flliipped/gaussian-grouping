@@ -452,6 +452,9 @@ def loss_object_prototype(
     max_points=200000,
     sample_size=1200,
     min_proto_points=4,
+    active_count_tau=32,
+    max_active_prototypes=16,
+    soft_conf_floor=0.3,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -513,11 +516,15 @@ def loss_object_prototype(
                     proto_feat = F.normalize(proto_feat.unsqueeze(0), dim=-1, eps=eps).squeeze(0)
                 prototype_bank[label].copy_(proto_feat)
                 prototype_valid[label] = True
-                prototype_counts[label] += label_mask.sum().to(prototype_counts.dtype)
+                prototype_counts[label] += point_sem_confidence[label_mask].sum().to(prototype_counts.dtype)
                 updated += 1
             updated_proto_count = zero.new_tensor(float(updated))
 
-    active_proto_ids = prototype_valid.nonzero(as_tuple=False).squeeze(-1)
+    active_proto_ids = (prototype_valid & (prototype_counts >= float(active_count_tau))).nonzero(as_tuple=False).squeeze(-1)
+    if max_active_prototypes > 0 and active_proto_ids.numel() > max_active_prototypes:
+        active_proto_counts = prototype_counts[active_proto_ids]
+        _, topk_idx = active_proto_counts.topk(max_active_prototypes, largest=True)
+        active_proto_ids = active_proto_ids[topk_idx]
     active_proto_count = zero.new_tensor(float(active_proto_ids.numel()))
     if active_proto_ids.numel() == 0:
         return zero, zero, zero, zero, zero, active_proto_count, updated_proto_count, zero, zero, zero, zero, zero, zero
@@ -545,6 +552,8 @@ def loss_object_prototype(
 
         ce_loss = F.cross_entropy(supervised_logits, supervised_targets, reduction="none")
         assign_loss = (ce_loss * supervised_weights).sum() / (supervised_weights.sum() + eps)
+        if active_proto_ids.numel() > 1:
+            assign_loss = assign_loss / torch.log(zero.new_tensor(float(active_proto_ids.numel())))
 
         pos_similarity = similarity[supervised_mask, supervised_targets]
         pull_loss = ((1.0 - pos_similarity) * supervised_weights).sum() / (supervised_weights.sum() + eps)
@@ -559,12 +568,12 @@ def loss_object_prototype(
             avg_neg_similarity = hardest_negative_similarity.mean()
 
     soft_loss = zero
-    soft_mask = (point_valid_view_count > 0) & (~supervised_mask)
+    soft_mask = point_sem_valid & (~supervised_mask) & (point_sem_confidence >= soft_conf_floor)
     if soft_mask.any():
         soft_probs = torch.softmax(logits[soft_mask], dim=-1)
         proto_mix = torch.matmul(soft_probs, active_prototypes)
         proto_mix = F.normalize(proto_mix, dim=-1, eps=eps)
-        soft_weights = 1.0 - point_sem_confidence[soft_mask]
+        soft_weights = point_sem_confidence[soft_mask]
         soft_similarity = (sample_features[soft_mask] * proto_mix).sum(dim=-1).clamp(-1.0, 1.0)
         soft_loss = ((1.0 - soft_similarity) * soft_weights).sum() / (soft_weights.sum() + eps)
 

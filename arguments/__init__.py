@@ -139,6 +139,9 @@ class OptimizationParams(ParamGroup):
         self.proto_lambda_soft = 0.25
         self.proto_push_margin = 0.1
         self.proto_min_points = 4
+        self.proto_active_count_tau = 32
+        self.proto_max_active = 16
+        self.proto_soft_conf_floor = 0.3
         self.proto_ignore_label = -1
 
         self.sugar_start_iter = 15_000

@@ -284,6 +284,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 max_points=opt.proto_max_points,
                 sample_size=opt.proto_sample_size,
                 min_proto_points=opt.proto_min_points,
+                active_count_tau=opt.proto_active_count_tau,
+                max_active_prototypes=opt.proto_max_active,
+                soft_conf_floor=opt.proto_soft_conf_floor,
             )
             loss_proto = proto_coeff * loss_proto_raw
             loss = loss + loss_proto
@@ -599,6 +602,9 @@ if __name__ == "__main__":
     args.proto_lambda_soft = config.get("proto_lambda_soft", 0.25)
     args.proto_push_margin = config.get("proto_push_margin", 0.1)
     args.proto_min_points = config.get("proto_min_points", 4)
+    args.proto_active_count_tau = config.get("proto_active_count_tau", 32)
+    args.proto_max_active = config.get("proto_max_active", 16)
+    args.proto_soft_conf_floor = config.get("proto_soft_conf_floor", 0.3)
     args.proto_ignore_label = config.get("proto_ignore_label", -1)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
