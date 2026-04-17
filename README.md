@@ -62,6 +62,30 @@ You can refer to the [install document](./docs/install.md) to build the Python e
 # Training and Masks Rendering
 Then refer to the [train document](./docs/train.md) to train your own scene.
 
+### BCOG Training Entry
+The current research branch uses `Boundary-Conditioned Object-Aware Grouping (BCOG)` as the main training recipe.
+
+Training entry:
+```bash
+bash script/train_bcog.sh <dataset_name> <scale> [output_name]
+```
+
+Example:
+```bash
+bash script/train_bcog.sh lerf/figurines 1 figurines_bcog
+```
+
+This script calls:
+```bash
+python train.py -s data/<dataset_name> -r <scale> -m output/<output_name> --config_file config/gaussian_dataset/train_bcog.json --train_split --eval
+```
+
+Useful presets:
+
+- `config/gaussian_dataset/train.json`: graph-only baseline
+- `config/gaussian_dataset/train_proto.json`: graph + prototype bank
+- `config/gaussian_dataset/train_bcog.json`: full BCOG
+
 # Open-Vocabulary Segmentation
 For evaluation on the **LERF-Mask dataset** proposed in our paper, you can refer to the [dataset document](./docs/dataset.md).
 

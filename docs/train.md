@@ -50,20 +50,69 @@ bash script/prepare_pseudo_label.sh mipnerf360/counter 2
 
 ## 2. Training and Masks Rendering
 
-For Gaussian Grouping training and segmentation rendering of trained 3D Gaussian Grouping model:
+### 2.1 Main BCOG entry
 
-Example1. Bear dataset
-```
-bash script/train.sh bear 1
+The current research branch is organized around:
+
+`Boundary-Conditioned Object-Aware Grouping (BCOG)`
+
+Recommended training entry:
+
+```bash
+bash script/train_bcog.sh <dataset_name> <scale> [output_name]
 ```
 
-Example2. figurines dataset
-```
-bash script/train_lerf.sh lerf/figurines 1
+Examples:
+
+```bash
+bash script/train_bcog.sh bear 1 bear_bcog
+bash script/train_bcog.sh lerf/figurines 1 figurines_bcog
+bash script/train_bcog.sh mipnerf360/counter 2 counter_bcog
 ```
 
-Example3. counter dataset
+This script will:
+
+1. Train with `train.py`
+2. Use `config/gaussian_dataset/train_bcog.json` by default
+3. Render masks after training
+
+### 2.2 Direct Python entry
+
+If you prefer to run training manually, the Python entry is:
+
+```bash
+python train.py \
+    -s data/<dataset_name> \
+    -r <scale> \
+    -m output/<output_name> \
+    --config_file config/gaussian_dataset/train_bcog.json \
+    --train_split \
+    --eval
 ```
-bash script/train.sh mipnerf360/counter 2
+
+Example:
+
+```bash
+python train.py -s data/lerf/figurines -r 1 -m output/figurines_bcog --config_file config/gaussian_dataset/train_bcog.json --train_split --eval
 ```
+
+### 2.3 Configs
+
+The branch now keeps a small config hierarchy with `extends` support:
+
+- `config/gaussian_dataset/train_base.json`: shared reconstruction + sugar + reliability-graph defaults
+- `config/gaussian_dataset/train.json`: graph-only baseline, used for Stage B style ablations
+- `config/gaussian_dataset/train_proto.json`: graph + prototype bank, used for Stage C ablations
+- `config/gaussian_dataset/train_bcog.json`: full BCOG recipe with late-stage prototype-disagreement-guided split
+
+You can override the config in the shell script:
+
+```bash
+bash script/train_bcog.sh lerf/figurines 1 figurines_graph_only --config config/gaussian_dataset/train.json
+```
+
+### 2.4 Legacy scripts
+
+The original repository scripts such as `script/train.sh` and `script/train_lerf.sh` are kept for backward compatibility with the base Gaussian Grouping workflow.
+For this branch, prefer `script/train_bcog.sh`.
 

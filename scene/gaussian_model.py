@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.nn.functional as F
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -562,6 +563,122 @@ class GaussianModel:
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
+
+    def split_ambiguous_gaussians(
+        self,
+        selected_idx,
+        prototype_pair_ids,
+        prototype_bank,
+        pair_probs=None,
+        normal_dirs=None,
+        offset_scale=0.5,
+        scale_shrink=0.6,
+        opacity_ratio=0.5,
+        feature_blend=0.7,
+        eps=1e-8,
+    ):
+        if selected_idx is None or prototype_pair_ids is None or prototype_bank is None:
+            return 0
+        if selected_idx.numel() == 0 or prototype_pair_ids.numel() == 0:
+            return 0
+
+        n_init_points = self.get_xyz.shape[0]
+        selected_idx = selected_idx.long().view(-1)
+        prototype_pair_ids = prototype_pair_ids.long().view(-1, prototype_pair_ids.shape[-1])
+
+        valid_mask = (
+            (selected_idx >= 0)
+            & (selected_idx < n_init_points)
+            & (prototype_pair_ids[:, 0] >= 0)
+            & (prototype_pair_ids[:, 1] >= 0)
+            & (prototype_pair_ids[:, 0] < prototype_bank.shape[0])
+            & (prototype_pair_ids[:, 1] < prototype_bank.shape[0])
+            & (prototype_pair_ids[:, 0] != prototype_pair_ids[:, 1])
+        )
+        if not valid_mask.any():
+            return 0
+
+        selected_idx = selected_idx[valid_mask]
+        prototype_pair_ids = prototype_pair_ids[valid_mask]
+        if pair_probs is not None:
+            pair_probs = pair_probs[valid_mask]
+        if normal_dirs is not None:
+            normal_dirs = normal_dirs[valid_mask]
+
+        parent_xyz = self._xyz[selected_idx]
+        parent_scaling = self.get_scaling[selected_idx]
+        parent_rotation = self._rotation[selected_idx]
+        parent_features_dc = self._features_dc[selected_idx]
+        parent_features_rest = self._features_rest[selected_idx]
+        parent_objects = self._objects_dc[selected_idx]
+        parent_opacity = self.get_opacity[selected_idx]
+
+        if normal_dirs is None or normal_dirs.numel() == 0:
+            normal_dirs = torch.zeros_like(parent_xyz)
+            normal_dirs[:, 2] = 1.0
+        normal_dirs = F.normalize(normal_dirs, dim=-1, eps=eps)
+
+        fallback_x = torch.zeros_like(normal_dirs)
+        fallback_x[:, 0] = 1.0
+        fallback_y = torch.zeros_like(normal_dirs)
+        fallback_y[:, 1] = 1.0
+        tangent_dirs = torch.cross(normal_dirs, fallback_x, dim=-1)
+        tangent_norm = tangent_dirs.norm(dim=-1, keepdim=True)
+        degenerate = tangent_norm.squeeze(-1) <= 1e-6
+        if degenerate.any():
+            tangent_dirs[degenerate] = torch.cross(normal_dirs[degenerate], fallback_y[degenerate], dim=-1)
+        tangent_dirs = F.normalize(tangent_dirs, dim=-1, eps=eps)
+
+        offset_magnitude = parent_scaling.max(dim=-1, keepdim=True).values * float(offset_scale)
+        child_xyz_a = parent_xyz + tangent_dirs * offset_magnitude
+        child_xyz_b = parent_xyz - tangent_dirs * offset_magnitude
+        new_xyz = torch.cat((child_xyz_a, child_xyz_b), dim=0)
+
+        child_scaling = (parent_scaling * float(scale_shrink)).clamp_min(1e-6)
+        new_scaling = self.scaling_inverse_activation(child_scaling)
+        new_scaling = torch.cat((new_scaling, new_scaling), dim=0)
+        new_rotation = torch.cat((parent_rotation, parent_rotation), dim=0)
+        new_features_dc = torch.cat((parent_features_dc, parent_features_dc), dim=0)
+        new_features_rest = torch.cat((parent_features_rest, parent_features_rest), dim=0)
+
+        child_opacity = (parent_opacity * float(opacity_ratio)).clamp(min=1e-4, max=1.0 - 1e-4)
+        child_opacity = self.inverse_opacity_activation(child_opacity)
+        new_opacity = torch.cat((child_opacity, child_opacity), dim=0)
+
+        parent_object_flat = parent_objects.squeeze(1)
+        parent_object_norm = parent_object_flat.norm(dim=-1, keepdim=True).clamp_min(eps)
+        parent_object_dir = F.normalize(parent_object_flat, dim=-1, eps=eps)
+        proto_a = F.normalize(prototype_bank[prototype_pair_ids[:, 0]], dim=-1, eps=eps)
+        proto_b = F.normalize(prototype_bank[prototype_pair_ids[:, 1]], dim=-1, eps=eps)
+
+        if pair_probs is not None and pair_probs.shape[-1] >= 2:
+            pair_probs = pair_probs[:, :2]
+            pair_probs = pair_probs / pair_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+            blend_a = float(feature_blend) * (0.5 + 0.5 * pair_probs[:, 0:1])
+            blend_b = float(feature_blend) * (0.5 + 0.5 * pair_probs[:, 1:2])
+        else:
+            blend_a = parent_object_norm.new_full((parent_object_norm.shape[0], 1), float(feature_blend))
+            blend_b = blend_a
+
+        child_object_a = F.normalize((1.0 - blend_a) * parent_object_dir + blend_a * proto_a, dim=-1, eps=eps) * parent_object_norm
+        child_object_b = F.normalize((1.0 - blend_b) * parent_object_dir + blend_b * proto_b, dim=-1, eps=eps) * parent_object_norm
+        new_objects_dc = torch.cat((child_object_a, child_object_b), dim=0).unsqueeze(1)
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_objects_dc,
+        )
+
+        prune_mask = torch.zeros((n_init_points,), device="cuda", dtype=torch.bool)
+        prune_mask[selected_idx] = True
+        prune_filter = torch.cat((prune_mask, torch.zeros((new_xyz.shape[0],), device="cuda", dtype=torch.bool)))
+        self.prune_points(prune_filter)
+        return int(selected_idx.numel())
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition

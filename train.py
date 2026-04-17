@@ -13,10 +13,10 @@ from utils.loss_utils import (
     l1_loss,
     ssim,
     loss_cls_3d,
-    loss_geo_contrastive_cosine,
-    loss_object_prototype,
     loss_sugar_surface_alignment,
 )
+from utils.bcog_losses import compute_graph_reliability, loss_graph_contrastive, loss_object_prototype
+from utils.prototype_bank import create_scene_prototype_bank
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -51,6 +51,117 @@ def build_multiview_semantic_support(scene, gaussians, pipe, background, viewpoi
     return support_cameras, torch.stack(visibility_masks, dim=0)
 
 
+def metric_or_default(metrics, key, reference_tensor):
+    if metrics is None:
+        return reference_tensor.new_tensor(0.0)
+    value = metrics.get(key, None)
+    if value is None:
+        return reference_tensor.new_tensor(0.0)
+    if torch.is_tensor(value):
+        return value
+    return reference_tensor.new_tensor(float(value))
+
+
+def load_config_file(config_path, visited=None):
+    resolved_path = os.path.abspath(config_path)
+    if visited is None:
+        visited = set()
+    if resolved_path in visited:
+        raise ValueError(f"Cyclic config inheritance detected at '{resolved_path}'.")
+
+    with open(resolved_path, "r") as file:
+        config = json.load(file)
+
+    parent_ref = config.pop("extends", None)
+    if parent_ref is None:
+        return config
+
+    parent_path = parent_ref if os.path.isabs(parent_ref) else os.path.join(os.path.dirname(resolved_path), parent_ref)
+    parent_config = load_config_file(parent_path, visited | {resolved_path})
+    parent_config.update(config)
+    return parent_config
+
+
+def run_prototype_disagreement_split(gaussians, prototype_state, proto_metrics, opt, reference_tensor):
+    zero = reference_tensor.new_tensor(0.0)
+    split_metrics = {
+        "split_count": zero,
+        "split_candidate_count": zero,
+        "avg_split_ambiguity": zero,
+    }
+    if proto_metrics is None or prototype_state is None or int(opt.split_max_points) <= 0:
+        return split_metrics
+
+    required_keys = [
+        "split_point_ids",
+        "split_normals",
+        "split_top2_ids",
+        "split_top2_probs",
+        "split_entropy",
+        "split_margin",
+        "split_ambiguity",
+        "split_boundary_score",
+        "split_boundary_mask",
+    ]
+    if any(proto_metrics.get(key, None) is None for key in required_keys):
+        return split_metrics
+
+    point_ids = proto_metrics["split_point_ids"].long()
+    normal_dirs = proto_metrics["split_normals"]
+    top2_ids = proto_metrics["split_top2_ids"].long()
+    top2_probs = proto_metrics["split_top2_probs"]
+    entropy = proto_metrics["split_entropy"]
+    margin = proto_metrics["split_margin"]
+    ambiguity = proto_metrics["split_ambiguity"]
+    boundary_score = proto_metrics["split_boundary_score"]
+    boundary_mask = proto_metrics["split_boundary_mask"].bool()
+
+    if point_ids.numel() == 0 or top2_ids.numel() == 0:
+        return split_metrics
+
+    valid_pair_mask = (
+        (top2_ids[:, 0] >= 0)
+        & (top2_ids[:, 1] >= 0)
+        & (top2_ids[:, 0] != top2_ids[:, 1])
+    )
+    candidate_mask = valid_pair_mask & boundary_mask
+    candidate_mask &= boundary_score >= float(opt.split_boundary_tau)
+    candidate_mask &= entropy >= float(opt.split_entropy_tau)
+    candidate_mask &= margin <= float(opt.split_margin_tau)
+    candidate_mask &= ambiguity >= float(opt.split_ambiguity_tau)
+
+    candidate_count = int(candidate_mask.sum().item())
+    split_metrics["split_candidate_count"] = zero.new_tensor(float(candidate_count))
+    if candidate_count == 0:
+        return split_metrics
+
+    candidate_indices = candidate_mask.nonzero(as_tuple=False).squeeze(-1)
+    candidate_score = (
+        ambiguity[candidate_indices]
+        + boundary_score[candidate_indices]
+        + (1.0 - margin[candidate_indices])
+    )
+    topk = min(candidate_count, int(opt.split_max_points))
+    topk_order = torch.topk(candidate_score, k=topk, largest=True).indices
+    selected_local = candidate_indices[topk_order]
+
+    split_count = gaussians.split_ambiguous_gaussians(
+        selected_idx=point_ids[selected_local],
+        prototype_pair_ids=top2_ids[selected_local],
+        prototype_bank=prototype_state["bank"].detach(),
+        pair_probs=top2_probs[selected_local],
+        normal_dirs=normal_dirs[selected_local],
+        offset_scale=opt.split_offset_scale,
+        scale_shrink=opt.split_scale_shrink,
+        opacity_ratio=opt.split_opacity_ratio,
+        feature_blend=opt.split_feature_blend,
+    )
+    split_metrics["split_count"] = zero.new_tensor(float(split_count))
+    if split_count > 0:
+        split_metrics["avg_split_ambiguity"] = ambiguity[selected_local].mean()
+    return split_metrics
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
     prepare_output_and_logger(dataset)
@@ -63,11 +174,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
     classifier.cuda()
-    prototype_state = {
-        "bank": torch.zeros((num_classes, gaussians.num_objects), device="cuda"),
-        "valid": torch.zeros((num_classes,), device="cuda", dtype=torch.bool),
-        "counts": torch.zeros((num_classes,), device="cuda"),
-    }
+    prototype_state = create_scene_prototype_bank(opt.proto_num_slots, gaussians.num_objects, device="cuda")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -144,46 +251,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_geo_raw = torch.tensor(0.0, device=image.device)
         loss_geo = torch.tensor(0.0, device=image.device)
         geo_coeff = torch.tensor(0.0, device=image.device)
+        loss_proto_raw = torch.tensor(0.0, device=image.device)
+        loss_proto = torch.tensor(0.0, device=image.device)
+        proto_coeff = torch.tensor(0.0, device=image.device)
         loss_sugar_raw = torch.tensor(0.0, device=image.device)
         loss_sugar = torch.tensor(0.0, device=image.device)
         sugar_coeff = torch.tensor(0.0, device=image.device)
         sugar_axis_align_cosine = torch.tensor(0.0, device=image.device)
         sugar_plane_residual = torch.tensor(0.0, device=image.device)
         sugar_flat_ratio = torch.tensor(0.0, device=image.device)
-        gate_ratio = torch.tensor(0.0, device=image.device)
-        avg_plane_residual = torch.tensor(0.0, device=image.device)
-        pos_loss = torch.tensor(0.0, device=image.device)
-        neg_loss = torch.tensor(0.0, device=image.device)
-        avg_feature_norm = torch.tensor(0.0, device=image.device)
-        avg_normal_cosine = torch.tensor(0.0, device=image.device)
-        avg_pos_cosine = torch.tensor(0.0, device=image.device)
-        avg_neg_cosine = torch.tensor(0.0, device=image.device)
-        avg_hard_neg_cosine = torch.tensor(0.0, device=image.device)
-        active_neg_ratio = torch.tensor(0.0, device=image.device)
-        neg_candidate_ratio = torch.tensor(0.0, device=image.device)
-        ignore_ratio = torch.tensor(0.0, device=image.device)
-        avg_sem_valid_views = torch.tensor(0.0, device=image.device)
-        avg_sem_confidence = torch.tensor(0.0, device=image.device)
-        semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
-        semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
-        loss_proto_raw = torch.tensor(0.0, device=image.device)
-        loss_proto = torch.tensor(0.0, device=image.device)
-        proto_coeff = torch.tensor(0.0, device=image.device)
-        proto_assign_loss = torch.tensor(0.0, device=image.device)
-        proto_pull_loss = torch.tensor(0.0, device=image.device)
-        proto_push_loss = torch.tensor(0.0, device=image.device)
-        proto_soft_loss = torch.tensor(0.0, device=image.device)
-        active_proto_count = torch.tensor(0.0, device=image.device)
-        updated_proto_count = torch.tensor(0.0, device=image.device)
-        proto_supervised_ratio = torch.tensor(0.0, device=image.device)
-        proto_soft_ratio = torch.tensor(0.0, device=image.device)
-        proto_avg_confidence = torch.tensor(0.0, device=image.device)
-        proto_avg_entropy = torch.tensor(0.0, device=image.device)
-        proto_avg_pos_similarity = torch.tensor(0.0, device=image.device)
-        proto_avg_neg_similarity = torch.tensor(0.0, device=image.device)
+        graph_metrics = {}
+        proto_metrics = {}
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
-        proto_active = opt.proto_enabled and iteration >= opt.proto_start_iter and iteration % opt.proto_interval == 0
+        split_due = (
+            opt.split_enabled
+            and opt.proto_enabled
+            and iteration > opt.densify_until_iter
+            and iteration >= opt.split_start_iter
+            and iteration % opt.split_interval == 0
+        )
+        proto_active = (
+            opt.proto_enabled
+            and iteration >= opt.proto_start_iter
+            and (iteration % opt.proto_interval == 0 or split_due)
+        )
+        graph_state = None
 
         if sugar_active:
             sugar_warmup_iters = max(1, opt.sugar_warmup_iters)
@@ -223,70 +316,86 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 support_view_budget,
             )
 
-        if geo_active:
-            warmup_iters = max(1, opt.geo_warmup_iters)
-            geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
-            geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
-            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
+        if geo_active or proto_active:
+            graph_sem_min_views = max(
+                int(opt.geo_sem_min_views) if geo_active else 0,
+                int(opt.proto_min_views) if proto_active else 0,
+            )
+            graph_sem_conf_tau = max(
+                float(opt.geo_sem_conf_tau) if geo_active else 0.0,
+                float(opt.proto_conf_tau) if proto_active else 0.0,
+            )
+            graph_ignore_label = opt.proto_ignore_label if proto_active else opt.geo_sem_ignore_label
+            graph_state = compute_graph_reliability(
                 features=gaussians._objects_dc.squeeze(1),
                 xyz=gaussians._xyz.squeeze().detach(),
                 point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
+                scaling=gaussians.get_scaling.detach(),
                 k=opt.geo_knn_k,
-                lambda_val=1.0,
-                lambda_pos=opt.geo_lambda_pos,
-                lambda_neg=opt.geo_lambda_neg,
-                max_points=opt.geo_max_points,
-                sample_size=opt.geo_sample_size,
+                max_points=max(int(opt.geo_max_points), int(opt.proto_max_points) if proto_active else 0),
+                sample_size=max(int(opt.geo_sample_size), int(opt.proto_sample_size) if proto_active else 0),
                 plane_tau=opt.geo_plane_tau,
                 neg_plane_tau=opt.geo_neg_plane_tau,
                 spatial_pos_scale=opt.geo_spatial_pos_scale,
-                normal_pos_tau=opt.geo_normal_pos_tau,
                 normal_neg_tau=opt.geo_normal_neg_tau,
+                reliability_pos_tau=opt.geo_reliability_pos_tau,
+                reliability_neg_tau=opt.geo_reliability_neg_tau,
+                reliability_alpha_dist=opt.geo_reliability_alpha_dist,
+                reliability_alpha_normal=opt.geo_reliability_alpha_normal,
+                reliability_alpha_plane=opt.geo_reliability_alpha_plane,
+                reliability_alpha_mv=opt.geo_reliability_alpha_mv,
+                support_cameras=support_cameras,
+                support_visibility=support_visibility,
+                sem_min_views=graph_sem_min_views,
+                sem_conf_tau=graph_sem_conf_tau,
+                sem_num_classes=num_classes,
+                sem_ignore_label=graph_ignore_label,
+                sem_conflict_penalty=opt.geo_sem_conflict_penalty,
+                boundary_tau=opt.proto_boundary_tau,
+            )
+
+        if geo_active and graph_state is not None:
+            warmup_iters = max(1, opt.geo_warmup_iters)
+            geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
+            geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
+            loss_geo_raw, graph_metrics = loss_graph_contrastive(
+                graph_state=graph_state,
+                lambda_val=1.0,
+                lambda_pos=opt.geo_lambda_pos,
+                lambda_neg=opt.geo_lambda_neg,
                 neg_margin=opt.geo_neg_margin,
                 hard_neg_k=opt.geo_hard_neg_k,
-                support_cameras=support_cameras if opt.geo_use_multiview_semantics else None,
-                support_visibility=support_visibility if opt.geo_use_multiview_semantics else None,
-                sem_min_views=opt.geo_sem_min_views,
-                sem_conf_tau=opt.geo_sem_conf_tau,
-                sem_num_classes=num_classes,
-                sem_ignore_label=opt.geo_sem_ignore_label,
-                normal_weight_lambda=opt.geo_normal_weight_lambda,
-                sem_same_boost=opt.geo_sem_same_boost,
-                sem_neg_boost=opt.geo_sem_neg_boost,
-                sem_conflict_penalty=opt.geo_sem_conflict_penalty,
             )
             loss_geo = geo_coeff * loss_geo_raw
             loss = loss + loss_geo
 
-        if proto_active:
+        if proto_active and graph_state is not None:
             proto_warmup_iters = max(1, opt.proto_warmup_iters)
             proto_progress = min(max((iteration - opt.proto_start_iter) / proto_warmup_iters, 0.0), 1.0)
             proto_coeff = image.new_tensor(opt.proto_weight_lambda * proto_progress)
-            loss_proto_raw, proto_assign_loss, proto_pull_loss, proto_push_loss, proto_soft_loss, active_proto_count, updated_proto_count, proto_supervised_ratio, proto_soft_ratio, proto_avg_confidence, proto_avg_entropy, proto_avg_pos_similarity, proto_avg_neg_similarity = loss_object_prototype(
-                xyz=gaussians._xyz.squeeze().detach(),
-                features=gaussians._objects_dc.squeeze(1),
+            loss_proto_raw, proto_metrics = loss_object_prototype(
+                graph_state=graph_state,
                 prototype_state=prototype_state,
-                point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
-                support_cameras=support_cameras,
-                support_visibility=support_visibility,
-                sem_num_classes=num_classes,
-                sem_ignore_label=opt.proto_ignore_label,
-                sem_min_views=opt.proto_min_views,
-                sem_conf_tau=opt.proto_conf_tau,
+                temperature=opt.proto_temperature,
                 bank_conf_tau=opt.proto_bank_conf_tau,
                 bank_momentum=opt.proto_bank_momentum,
-                temperature=opt.proto_temperature,
-                lambda_assign=opt.proto_lambda_assign,
                 lambda_pull=opt.proto_lambda_pull,
-                lambda_push=opt.proto_lambda_push,
+                lambda_sep=opt.proto_lambda_sep,
+                lambda_cons=opt.proto_lambda_cons,
                 lambda_soft=opt.proto_lambda_soft,
-                push_margin=opt.proto_push_margin,
-                max_points=opt.proto_max_points,
-                sample_size=opt.proto_sample_size,
                 min_proto_points=opt.proto_min_points,
                 active_count_tau=opt.proto_active_count_tau,
                 max_active_prototypes=opt.proto_max_active,
-                soft_conf_floor=opt.proto_soft_conf_floor,
+                update_reliability_tau=opt.proto_update_reliability_tau,
+                update_entropy_tau=opt.proto_update_entropy_tau,
+                bootstrap_slots=opt.proto_bootstrap_slots,
+                bootstrap_novelty_tau=opt.proto_bootstrap_novelty_tau,
+                sep_margin=opt.proto_sep_margin,
+                ambiguity_beta_entropy=opt.ambiguity_beta_entropy,
+                ambiguity_beta_mv=opt.ambiguity_beta_mv,
+                ambiguity_beta_rel=opt.ambiguity_beta_rel,
+                ambiguity_beta_plane=opt.ambiguity_beta_plane,
+                ambiguity_beta_scale=opt.ambiguity_beta_scale,
             )
             loss_proto = proto_coeff * loss_proto_raw
             loss = loss + loss_proto
@@ -300,52 +409,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
             if sugar_active:
                 message += (
-                    f"sugar_coeff={sugar_coeff.item():.6f}, "
-                    f"loss_sugar_raw={loss_sugar_raw.item():.6f}, "
                     f"loss_sugar={loss_sugar.item():.6f}, "
-                    f"sugar_axis_align_cosine={sugar_axis_align_cosine.item():.6f}, "
                     f"sugar_plane_residual={sugar_plane_residual.item():.6f}, "
-                    f"sugar_flat_ratio={sugar_flat_ratio.item():.6f}, "
-                )
-            if proto_active:
-                message += (
-                    f"proto_coeff={proto_coeff.item():.6f}, "
-                    f"loss_proto_raw={loss_proto_raw.item():.6f}, "
-                    f"loss_proto={loss_proto.item():.6f}, "
-                    f"proto_assign_loss={proto_assign_loss.item():.6f}, "
-                    f"proto_pull_loss={proto_pull_loss.item():.6f}, "
-                    f"proto_push_loss={proto_push_loss.item():.6f}, "
-                    f"proto_soft_loss={proto_soft_loss.item():.6f}, "
-                    f"active_proto_count={active_proto_count.item():.2f}, "
-                    f"updated_proto_count={updated_proto_count.item():.2f}, "
-                    f"proto_supervised_ratio={proto_supervised_ratio.item():.6f}, "
-                    f"proto_soft_ratio={proto_soft_ratio.item():.6f}, "
-                    f"proto_avg_confidence={proto_avg_confidence.item():.6f}, "
-                    f"proto_avg_entropy={proto_avg_entropy.item():.6f}, "
-                    f"proto_avg_pos_similarity={proto_avg_pos_similarity.item():.6f}, "
-                    f"proto_avg_neg_similarity={proto_avg_neg_similarity.item():.6f}, "
                 )
             if geo_active:
                 message += (
-                    f"geo_coeff={geo_coeff.item():.6f}, "
-                    f"loss_geo_raw={loss_geo_raw.item():.6f}, "
                     f"loss_geo={loss_geo.item():.6f}, "
-                    f"pos_loss={pos_loss.item():.6f}, "
-                    f"neg_loss={neg_loss.item():.6f}, "
-                    f"gate_ratio={gate_ratio.item():.4f}, "
-                    f"avg_plane_residual={avg_plane_residual.item():.6f}, "
-                    f"avg_feature_norm={avg_feature_norm.item():.6f}, "
-                    f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
-                    f"avg_pos_cosine={avg_pos_cosine.item():.6f}, "
-                    f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
-                    f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
-                    f"active_neg_ratio={active_neg_ratio.item():.6f}, "
-                    f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
-                    f"ignore_ratio={ignore_ratio.item():.6f}, "
-                    f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
-                    f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
-                    f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
-                    f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}, "
+                    f"pos_loss={metric_or_default(graph_metrics, 'pos_loss', image).item():.6f}, "
+                    f"neg_loss={metric_or_default(graph_metrics, 'neg_loss', image).item():.6f}, "
+                    f"avg_reliability={metric_or_default(graph_metrics, 'avg_reliability', image).item():.6f}, "
+                    f"boundary_ratio={metric_or_default(graph_metrics, 'boundary_ratio', image).item():.6f}, "
+                )
+            if proto_active:
+                message += (
+                    f"loss_proto={loss_proto.item():.6f}, "
+                    f"proto_pull_loss={metric_or_default(proto_metrics, 'pull_loss', image).item():.6f}, "
+                    f"proto_cons_loss={metric_or_default(proto_metrics, 'cons_loss', image).item():.6f}, "
+                    f"active_proto_count={metric_or_default(proto_metrics, 'active_proto_count', image).item():.2f}, "
+                    f"proto_avg_margin={metric_or_default(proto_metrics, 'avg_margin', image).item():.6f}, "
+                    f"proto_avg_ambiguity={metric_or_default(proto_metrics, 'avg_ambiguity', image).item():.6f}, "
                 )
             print(message.rstrip(", "))
 
@@ -364,7 +446,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_assign_loss, proto_pull_loss, proto_push_loss, proto_soft_loss, active_proto_count, updated_proto_count, proto_supervised_ratio, proto_soft_ratio, proto_avg_confidence, proto_avg_entropy, proto_avg_pos_similarity, proto_avg_neg_similarity, use_wandb)
+            training_report(
+                iteration,
+                Ll1,
+                loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                loss_obj_3d,
+                loss_sugar,
+                sugar_active,
+                sugar_plane_residual,
+                loss_geo,
+                geo_active,
+                graph_metrics,
+                loss_proto,
+                proto_active,
+                proto_metrics,
+                use_wandb,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -374,10 +476,49 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         {
                             "bank": prototype_state["bank"].detach().cpu(),
                             "valid": prototype_state["valid"].detach().cpu(),
-                            "counts": prototype_state["counts"].detach().cpu(),
+                            "mass": prototype_state["mass"].detach().cpu(),
+                            "age": prototype_state["age"].detach().cpu(),
                         },
                         os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration), "prototype_bank.pth"),
                     )
+
+            if split_due:
+                split_metrics = run_prototype_disagreement_split(
+                    gaussians=gaussians,
+                    prototype_state=prototype_state,
+                    proto_metrics=proto_metrics,
+                    opt=opt,
+                    reference_tensor=image,
+                )
+                split_count = int(metric_or_default(split_metrics, "split_count", image).item())
+                if split_count > 0:
+                    print(
+                        f"[Iter {iteration}] "
+                        f"stage_d_split={split_count}, "
+                        f"candidate_count={metric_or_default(split_metrics, 'split_candidate_count', image).item():.0f}, "
+                        f"avg_split_ambiguity={metric_or_default(split_metrics, 'avg_split_ambiguity', image).item():.6f}"
+                    )
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "train_loss_patches/split_count": metric_or_default(split_metrics, "split_count", image).item(),
+                            "train_loss_patches/split_candidate_count": metric_or_default(split_metrics, "split_candidate_count", image).item(),
+                            "train_loss_patches/avg_split_ambiguity": metric_or_default(split_metrics, "avg_split_ambiguity", image).item(),
+                            "iter": iteration,
+                        }
+                    )
+            elif (
+                use_wandb
+                and opt.split_enabled
+                and iteration >= opt.split_start_iter
+                and iteration % opt.split_interval == 0
+            ):
+                wandb.log(
+                    {
+                        "train_loss_patches/split_count": 0.0,
+                        "iter": iteration,
+                    }
+                )
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -418,18 +559,12 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_assign_loss, proto_pull_loss, proto_push_loss, proto_soft_loss, active_proto_count, updated_proto_count, proto_supervised_ratio, proto_soft_ratio, proto_avg_confidence, proto_avg_entropy, proto_avg_pos_similarity, proto_avg_neg_similarity, use_wandb):
+def training_report(iteration, Ll1, loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar, sugar_active, sugar_plane_residual, loss_geo, geo_active, graph_metrics, loss_proto, proto_active, proto_metrics, use_wandb):
 
     if use_wandb:
         log_data = {
             "train_loss_patches/l1_loss": Ll1.item(),
             "train_loss_patches/total_loss": loss.item(),
-            "train_loss_patches/sugar_active": float(sugar_active),
-            "train_loss_patches/sugar_coeff": sugar_coeff.item(),
-            "train_loss_patches/geo_active": float(geo_active),
-            "train_loss_patches/geo_coeff": geo_coeff.item(),
-            "train_loss_patches/proto_active": float(proto_active),
-            "train_loss_patches/proto_coeff": proto_coeff.item(),
             "iter_time": elapsed,
             "iter": iteration
         }
@@ -439,51 +574,27 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
 
         if sugar_active:
             log_data.update({
-                "train_loss_patches/loss_sugar_raw": loss_sugar_raw.item(),
                 "train_loss_patches/loss_sugar": loss_sugar.item(),
-                "train_loss_patches/sugar_axis_align_cosine": sugar_axis_align_cosine.item(),
                 "train_loss_patches/sugar_plane_residual": sugar_plane_residual.item(),
-                "train_loss_patches/sugar_flat_ratio": sugar_flat_ratio.item(),
             })
 
         if geo_active:
             log_data.update({
-                "train_loss_patches/loss_geo_raw": loss_geo_raw.item(),
                 "train_loss_patches/loss_geo": loss_geo.item(),
-                "train_loss_patches/pos_loss": pos_loss.item(),
-                "train_loss_patches/neg_loss": neg_loss.item(),
-                "train_loss_patches/gate_ratio": gate_ratio.item(),
-                "train_loss_patches/avg_plane_residual": avg_plane_residual.item(),
-                "train_loss_patches/avg_feature_norm": avg_feature_norm.item(),
-                "train_loss_patches/avg_normal_cosine": avg_normal_cosine.item(),
-                "train_loss_patches/avg_pos_cosine": avg_pos_cosine.item(),
-                "train_loss_patches/avg_neg_cosine": avg_neg_cosine.item(),
-                "train_loss_patches/avg_hard_neg_cosine": avg_hard_neg_cosine.item(),
-                "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
-                "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
-                "train_loss_patches/ignore_ratio": ignore_ratio.item(),
-                "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
-                "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
-                "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
-                "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
+                "train_loss_patches/pos_loss": metric_or_default(graph_metrics, "pos_loss", Ll1).item(),
+                "train_loss_patches/neg_loss": metric_or_default(graph_metrics, "neg_loss", Ll1).item(),
+                "train_loss_patches/avg_reliability": metric_or_default(graph_metrics, "avg_reliability", Ll1).item(),
+                "train_loss_patches/boundary_ratio": metric_or_default(graph_metrics, "boundary_ratio", Ll1).item(),
             })
 
         if proto_active:
             log_data.update({
-                "train_loss_patches/loss_proto_raw": loss_proto_raw.item(),
                 "train_loss_patches/loss_proto": loss_proto.item(),
-                "train_loss_patches/proto_assign_loss": proto_assign_loss.item(),
-                "train_loss_patches/proto_pull_loss": proto_pull_loss.item(),
-                "train_loss_patches/proto_push_loss": proto_push_loss.item(),
-                "train_loss_patches/proto_soft_loss": proto_soft_loss.item(),
-                "train_loss_patches/active_proto_count": active_proto_count.item(),
-                "train_loss_patches/updated_proto_count": updated_proto_count.item(),
-                "train_loss_patches/proto_supervised_ratio": proto_supervised_ratio.item(),
-                "train_loss_patches/proto_soft_ratio": proto_soft_ratio.item(),
-                "train_loss_patches/proto_avg_confidence": proto_avg_confidence.item(),
-                "train_loss_patches/proto_avg_entropy": proto_avg_entropy.item(),
-                "train_loss_patches/proto_avg_pos_similarity": proto_avg_pos_similarity.item(),
-                "train_loss_patches/proto_avg_neg_similarity": proto_avg_neg_similarity.item(),
+                "train_loss_patches/proto_pull_loss": metric_or_default(proto_metrics, "pull_loss", Ll1).item(),
+                "train_loss_patches/proto_cons_loss": metric_or_default(proto_metrics, "cons_loss", Ll1).item(),
+                "train_loss_patches/active_proto_count": metric_or_default(proto_metrics, "active_proto_count", Ll1).item(),
+                "train_loss_patches/proto_avg_margin": metric_or_default(proto_metrics, "avg_margin", Ll1).item(),
+                "train_loss_patches/proto_avg_ambiguity": metric_or_default(proto_metrics, "avg_ambiguity", Ll1).item(),
             })
 
         wandb.log(log_data)
@@ -541,13 +652,15 @@ if __name__ == "__main__":
 
     # Read and parse the configuration file
     try:
-        with open(args.config_file, 'r') as file:
-            config = json.load(file)
+        config = load_config_file(args.config_file)
     except FileNotFoundError:
         print(f"Error: Configuration file '{args.config_file}' not found.")
         exit(1)
     except json.JSONDecodeError as e:
         print(f"Error: Failed to parse the JSON configuration file: {e}")
+        exit(1)
+    except ValueError as e:
+        print(f"Error: {e}")
         exit(1)
 
     args.densify_until_iter = config.get("densify_until_iter", 15000)
@@ -570,7 +683,6 @@ if __name__ == "__main__":
     args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
     args.geo_neg_plane_tau = config.get("geo_neg_plane_tau", 0.02)
     args.geo_spatial_pos_scale = config.get("geo_spatial_pos_scale", 0.75)
-    args.geo_normal_pos_tau = config.get("geo_normal_pos_tau", 0.75)
     args.geo_normal_neg_tau = config.get("geo_normal_neg_tau", 0.4)
     args.geo_neg_margin = config.get("geo_neg_margin", 0.8)
     args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
@@ -579,11 +691,15 @@ if __name__ == "__main__":
     args.geo_sem_min_views = config.get("geo_sem_min_views", 2)
     args.geo_sem_conf_tau = config.get("geo_sem_conf_tau", config.get("geo_sem_pos_ratio", 0.7))
     args.geo_sem_ignore_label = config.get("geo_sem_ignore_label", -1)
-    args.geo_normal_weight_lambda = config.get("geo_normal_weight_lambda", 5.0)
-    args.geo_sem_same_boost = config.get("geo_sem_same_boost", 1.0)
-    args.geo_sem_neg_boost = config.get("geo_sem_neg_boost", 1.0)
     args.geo_sem_conflict_penalty = config.get("geo_sem_conflict_penalty", 0.75)
+    args.geo_reliability_pos_tau = config.get("geo_reliability_pos_tau", 0.65)
+    args.geo_reliability_neg_tau = config.get("geo_reliability_neg_tau", 0.35)
+    args.geo_reliability_alpha_dist = config.get("geo_reliability_alpha_dist", 1.25)
+    args.geo_reliability_alpha_normal = config.get("geo_reliability_alpha_normal", 2.0)
+    args.geo_reliability_alpha_plane = config.get("geo_reliability_alpha_plane", 1.5)
+    args.geo_reliability_alpha_mv = config.get("geo_reliability_alpha_mv", 1.0)
     args.proto_enabled = config.get("proto_enabled", False)
+    args.proto_num_slots = config.get("proto_num_slots", 16)
     args.proto_start_iter = config.get("proto_start_iter", max(args.geo_start_iter, args.densify_until_iter + 4000))
     args.proto_interval = config.get("proto_interval", 10)
     args.proto_warmup_iters = config.get("proto_warmup_iters", 3000)
@@ -596,16 +712,37 @@ if __name__ == "__main__":
     args.proto_bank_conf_tau = config.get("proto_bank_conf_tau", 0.8)
     args.proto_bank_momentum = config.get("proto_bank_momentum", 0.9)
     args.proto_temperature = config.get("proto_temperature", 0.2)
-    args.proto_lambda_assign = config.get("proto_lambda_assign", 1.0)
     args.proto_lambda_pull = config.get("proto_lambda_pull", 1.0)
-    args.proto_lambda_push = config.get("proto_lambda_push", 0.5)
+    args.proto_lambda_sep = config.get("proto_lambda_sep", 0.25)
+    args.proto_lambda_cons = config.get("proto_lambda_cons", 0.5)
     args.proto_lambda_soft = config.get("proto_lambda_soft", 0.25)
-    args.proto_push_margin = config.get("proto_push_margin", 0.1)
+    args.proto_sep_margin = config.get("proto_sep_margin", 0.1)
     args.proto_min_points = config.get("proto_min_points", 4)
     args.proto_active_count_tau = config.get("proto_active_count_tau", 32)
     args.proto_max_active = config.get("proto_max_active", 16)
-    args.proto_soft_conf_floor = config.get("proto_soft_conf_floor", 0.3)
+    args.proto_update_reliability_tau = config.get("proto_update_reliability_tau", 0.55)
+    args.proto_update_entropy_tau = config.get("proto_update_entropy_tau", 0.45)
+    args.proto_bootstrap_slots = config.get("proto_bootstrap_slots", 4)
+    args.proto_bootstrap_novelty_tau = config.get("proto_bootstrap_novelty_tau", 0.9)
+    args.proto_boundary_tau = config.get("proto_boundary_tau", 0.45)
     args.proto_ignore_label = config.get("proto_ignore_label", -1)
+    args.ambiguity_beta_entropy = config.get("ambiguity_beta_entropy", 1.0)
+    args.ambiguity_beta_mv = config.get("ambiguity_beta_mv", 1.0)
+    args.ambiguity_beta_rel = config.get("ambiguity_beta_rel", 1.0)
+    args.ambiguity_beta_plane = config.get("ambiguity_beta_plane", 0.5)
+    args.ambiguity_beta_scale = config.get("ambiguity_beta_scale", 0.25)
+    args.split_enabled = config.get("split_enabled", config.get("use_ambiguous_split", False))
+    args.split_start_iter = config.get("split_start_iter", max(args.proto_start_iter + args.proto_warmup_iters, args.densify_until_iter + 12_000))
+    args.split_interval = config.get("split_interval", 500)
+    args.split_max_points = config.get("split_max_points", config.get("split_topk", 64))
+    args.split_ambiguity_tau = config.get("split_ambiguity_tau", 1.1)
+    args.split_entropy_tau = config.get("split_entropy_tau", 0.55)
+    args.split_margin_tau = config.get("split_margin_tau", 0.2)
+    args.split_boundary_tau = config.get("split_boundary_tau", 0.5)
+    args.split_scale_shrink = config.get("split_scale_shrink", 0.6)
+    args.split_offset_scale = config.get("split_offset_scale", 0.5)
+    args.split_opacity_ratio = config.get("split_opacity_ratio", 0.5)
+    args.split_feature_blend = config.get("split_feature_blend", 0.7)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
