@@ -13,12 +13,19 @@ def create_scene_prototype_bank(num_slots, feature_dim, device, eps=1e-8):
     }
 
 
+def get_valid_prototype_ids(prototype_state, max_active=0):
+    valid_ids = prototype_state["valid"].nonzero(as_tuple=False).squeeze(-1)
+    if max_active > 0 and valid_ids.numel() > max_active:
+        valid_mass = prototype_state["mass"][valid_ids]
+        _, topk_idx = valid_mass.topk(max_active, largest=True)
+        valid_ids = valid_ids[topk_idx]
+    return valid_ids
+
+
 def get_active_prototype_ids(prototype_state, min_mass=0.0, max_active=0):
     valid = prototype_state["valid"]
     mass = prototype_state["mass"]
     active_ids = (valid & (mass >= float(min_mass))).nonzero(as_tuple=False).squeeze(-1)
-    if active_ids.numel() == 0:
-        active_ids = valid.nonzero(as_tuple=False).squeeze(-1)
     if max_active > 0 and active_ids.numel() > max_active:
         active_mass = mass[active_ids]
         _, topk_idx = active_mass.topk(max_active, largest=True)
@@ -171,7 +178,7 @@ def update_scene_prototypes(
                 proto_feat = F.normalize(proto_feat.unsqueeze(0), dim=-1, eps=eps).squeeze(0)
             prototype_state["bank"][global_slot].copy_(proto_feat)
             prototype_state["valid"][global_slot] = True
-            prototype_state["mass"][global_slot] += total_weight.to(prototype_state["mass"].dtype)
+            prototype_state["mass"][global_slot] += slot_mask.sum().to(prototype_state["mass"].dtype)
             prototype_state["age"][global_slot] = 0.0
             updated += 1
 

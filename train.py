@@ -426,6 +426,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"proto_pull_loss={metric_or_default(proto_metrics, 'pull_loss', image).item():.6f}, "
                     f"proto_cons_loss={metric_or_default(proto_metrics, 'cons_loss', image).item():.6f}, "
                     f"active_proto_count={metric_or_default(proto_metrics, 'active_proto_count', image).item():.2f}, "
+                    f"updated_proto_count={metric_or_default(proto_metrics, 'updated_proto_count', image).item():.2f}, "
                     f"proto_avg_margin={metric_or_default(proto_metrics, 'avg_margin', image).item():.6f}, "
                     f"proto_avg_ambiguity={metric_or_default(proto_metrics, 'avg_ambiguity', image).item():.6f}, "
                 )
@@ -593,6 +594,7 @@ def training_report(iteration, Ll1, loss, elapsed, testing_iterations, scene : S
                 "train_loss_patches/proto_pull_loss": metric_or_default(proto_metrics, "pull_loss", Ll1).item(),
                 "train_loss_patches/proto_cons_loss": metric_or_default(proto_metrics, "cons_loss", Ll1).item(),
                 "train_loss_patches/active_proto_count": metric_or_default(proto_metrics, "active_proto_count", Ll1).item(),
+                "train_loss_patches/updated_proto_count": metric_or_default(proto_metrics, "updated_proto_count", Ll1).item(),
                 "train_loss_patches/proto_avg_margin": metric_or_default(proto_metrics, "avg_margin", Ll1).item(),
                 "train_loss_patches/proto_avg_ambiguity": metric_or_default(proto_metrics, "avg_ambiguity", Ll1).item(),
             })

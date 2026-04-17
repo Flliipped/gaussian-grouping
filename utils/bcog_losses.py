@@ -6,6 +6,7 @@ from utils.prototype_bank import (
     bootstrap_scene_prototypes,
     compute_slot_assignments,
     get_active_prototype_ids,
+    get_valid_prototype_ids,
     update_scene_prototypes,
 )
 
@@ -366,10 +367,10 @@ def loss_object_prototype(
         eps=eps,
     )
 
-    active_ids = get_active_prototype_ids(prototype_state, min_mass=active_count_tau, max_active=max_active_prototypes)
+    update_ids = get_valid_prototype_ids(prototype_state, max_active=max_active_prototypes)
     split_top2_ids = torch.full((sample_features.shape[0], 2), -1, device=sample_features.device, dtype=torch.long)
     split_top2_probs = sample_features.new_zeros((sample_features.shape[0], 2))
-    if active_ids.numel() == 0:
+    if update_ids.numel() == 0:
         metrics = {
             "loss": zero,
             "pull_loss": zero,
@@ -409,14 +410,14 @@ def loss_object_prototype(
     _, probs, entropy, margin = compute_slot_assignments(
         sample_features,
         prototype_state=prototype_state,
-        active_ids=active_ids,
+        active_ids=update_ids,
         temperature=temperature,
         eps=eps,
     )
     if probs.shape[1] > 0:
         topk = torch.topk(probs, k=min(2, probs.shape[1]), dim=-1)
         split_top2_probs[:, :topk.values.shape[1]] = topk.values.detach()
-        split_top2_ids[:, :topk.indices.shape[1]] = active_ids[topk.indices].detach()
+        split_top2_ids[:, :topk.indices.shape[1]] = update_ids[topk.indices].detach()
     update_confidence = (1.0 - entropy.detach()) * point_reliability.detach() * sample_mv_confidence.detach()
     update_mask = (
         sample_sem_valid
@@ -431,13 +432,49 @@ def loss_object_prototype(
         probs=probs,
         update_confidence=update_confidence,
         update_mask=update_mask,
-        active_ids=active_ids,
+        active_ids=update_ids,
         momentum=bank_momentum,
         min_weight=max(float(min_proto_points), 1.0),
         eps=eps,
     )
 
     active_ids = get_active_prototype_ids(prototype_state, min_mass=active_count_tau, max_active=max_active_prototypes)
+    if active_ids.numel() == 0:
+        metrics = {
+            "loss": zero,
+            "pull_loss": zero,
+            "sep_loss": zero,
+            "cons_loss": zero,
+            "soft_loss": zero,
+            "active_proto_count": zero,
+            "updated_proto_count": zero.new_tensor(float(updated_proto_count)),
+            "update_ratio": update_mask.to(zero.dtype).mean(),
+            "soft_ratio": zero,
+            "avg_update_confidence": update_confidence[update_mask].mean() if update_mask.any() else zero,
+            "avg_entropy": entropy.mean(),
+            "avg_pos_similarity": zero,
+            "avg_neg_similarity": zero,
+            "avg_margin": margin.mean(),
+            "avg_ambiguity": zero,
+            "bootstrap_count": zero.new_tensor(float(bootstrap_count)),
+            "boundary_ratio": point_boundary_mask.to(zero.dtype).mean(),
+            "avg_mv_confidence": sample_mv_confidence.mean(),
+            "avg_reliability": point_reliability.mean(),
+            "split_point_ids": sample_point_ids.detach(),
+            "split_normals": sample_normals.detach(),
+            "split_top2_ids": split_top2_ids,
+            "split_top2_probs": split_top2_probs,
+            "split_entropy": entropy.detach(),
+            "split_margin": margin.detach(),
+            "split_ambiguity": torch.zeros_like(entropy),
+            "split_boundary_score": graph_state["point_boundary_score"].detach(),
+            "split_boundary_mask": point_boundary_mask.detach(),
+            "split_reliability": point_reliability.detach(),
+            "split_mv_confidence": sample_mv_confidence.detach(),
+            "split_plane_ratio": graph_state["point_plane_ratio"].detach(),
+            "split_scale_score": graph_state["sample_scale_score"].detach(),
+        }
+        return zero, metrics
     _, probs, entropy, margin = compute_slot_assignments(
         sample_features,
         prototype_state=prototype_state,
