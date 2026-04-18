@@ -405,16 +405,18 @@ def compute_graph_reliability(
     alpha_normal=2.0,
     alpha_residual=2.0,
     alpha_mv=1.0,
-    pos_reliability_thresh=0.65,
-    neg_reliability_thresh=0.35,
+    pos_reliability_thresh=0.60,
+    neg_reliability_thresh=0.30,
     eps=1e-8,
 ):
     zero = xyz.new_tensor(0.0)
     pair_dtype = xyz.dtype
+    feature_indices = torch.arange(xyz.size(0), device=xyz.device)
 
     if xyz.size(0) > max_points:
         selected_indices = torch.randperm(xyz.size(0), device=xyz.device)[:max_points]
         xyz = xyz[selected_indices]
+        feature_indices = feature_indices[selected_indices]
         if point_ids is not None:
             point_ids = point_ids[selected_indices]
 
@@ -566,6 +568,7 @@ def compute_graph_reliability(
         "valid": True,
         "zero": zero,
         "xyz": xyz,
+        "feature_indices": feature_indices,
         "sample_indices": sample_indices,
         "neighbor_indices": neighbor_indices_tensor,
         "reliability": reliability,
@@ -605,8 +608,10 @@ def loss_graph_contrastive(
     if graph_data is None or not graph_data.get("valid", False):
         return _graph_zero_outputs(zero)
 
-    raw_feature_norm = torch.norm(features, dim=-1)
-    normalized_features = F.normalize(features, dim=-1, eps=eps)
+    feature_indices = graph_data["feature_indices"]
+    selected_features = features[feature_indices]
+    raw_feature_norm = torch.norm(selected_features, dim=-1)
+    normalized_features = F.normalize(selected_features, dim=-1, eps=eps)
 
     sample_features = normalized_features[graph_data["sample_indices"]]
     neighbor_features = normalized_features[graph_data["neighbor_indices"]]

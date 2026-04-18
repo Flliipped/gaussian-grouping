@@ -111,6 +111,15 @@ class OptimizationParams(ParamGroup):
         self.graph_normal_neg_tau = 0.4
         self.graph_neg_margin = 0.8
         self.graph_hard_neg_k = 2
+        # Recommended defaults for the explicit graph-regularizer:
+        # keep the graph term as a regularizer (not the dominant objective),
+        # activate hard negatives earlier, and slightly rebalance reliable
+        # positive / negative partitions.
+        self.graph_weight_lambda = 0.15
+        self.graph_pos_reliability_thresh = 0.60
+        self.graph_neg_reliability_thresh = 0.30
+        self.graph_neg_margin = 0.30
+        self.graph_lambda_neg = 2.0
         self.graph_use_multiview_semantics = False
         self.graph_support_views = 3
         self.graph_sem_pos_ratio = 0.7
