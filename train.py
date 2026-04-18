@@ -9,7 +9,14 @@
 import os
 import torch
 from random import randint, sample
-from utils.loss_utils import l1_loss, ssim, loss_cls_3d, loss_geo_contrastive_cosine, loss_sugar_surface_alignment
+from utils.loss_utils import (
+    compute_graph_reliability,
+    l1_loss,
+    loss_cls_3d,
+    loss_graph_contrastive,
+    loss_sugar_surface_alignment,
+    ssim,
+)
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -107,16 +114,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj          
 
-        loss_geo_raw = torch.tensor(0.0, device=image.device)
-        loss_geo = torch.tensor(0.0, device=image.device)
-        geo_coeff = torch.tensor(0.0, device=image.device)
+        loss_graph_raw = torch.tensor(0.0, device=image.device)
+        loss_graph = torch.tensor(0.0, device=image.device)
+        graph_coeff = torch.tensor(0.0, device=image.device)
         loss_sugar_raw = torch.tensor(0.0, device=image.device)
         loss_sugar = torch.tensor(0.0, device=image.device)
         sugar_coeff = torch.tensor(0.0, device=image.device)
         sugar_axis_align_cosine = torch.tensor(0.0, device=image.device)
         sugar_plane_residual = torch.tensor(0.0, device=image.device)
         sugar_flat_ratio = torch.tensor(0.0, device=image.device)
-        gate_ratio = torch.tensor(0.0, device=image.device)
+        graph_pos_ratio = torch.tensor(0.0, device=image.device)
+        graph_neg_ratio = torch.tensor(0.0, device=image.device)
+        graph_ignore_ratio = torch.tensor(0.0, device=image.device)
+        avg_reliability = torch.tensor(0.0, device=image.device)
+        avg_pos_reliability = torch.tensor(0.0, device=image.device)
+        avg_neg_reliability = torch.tensor(0.0, device=image.device)
+        avg_mv_consistency = torch.tensor(0.0, device=image.device)
         avg_plane_residual = torch.tensor(0.0, device=image.device)
         pos_loss = torch.tensor(0.0, device=image.device)
         neg_loss = torch.tensor(0.0, device=image.device)
@@ -126,14 +139,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         avg_neg_cosine = torch.tensor(0.0, device=image.device)
         avg_hard_neg_cosine = torch.tensor(0.0, device=image.device)
         active_neg_ratio = torch.tensor(0.0, device=image.device)
-        neg_candidate_ratio = torch.tensor(0.0, device=image.device)
-        ignore_ratio = torch.tensor(0.0, device=image.device)
         avg_sem_valid_views = torch.tensor(0.0, device=image.device)
         avg_sem_confidence = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
         semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
-        geo_active = iteration >= opt.geo_start_iter and iteration % opt.geo_interval == 0
+        graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
 
         if sugar_active:
             sugar_warmup_iters = max(1, opt.sugar_warmup_iters)
@@ -154,16 +165,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_sugar = sugar_coeff * loss_sugar_raw
             loss = loss + loss_sugar
 
-        if geo_active:
-            warmup_iters = max(1, opt.geo_warmup_iters)
-            geo_progress = min(max((iteration - opt.geo_start_iter) / warmup_iters, 0.0), 1.0)
-            geo_coeff = image.new_tensor(opt.geo_weight_lambda * geo_progress)
+        if graph_active:
+            warmup_iters = max(1, opt.graph_warmup_iters)
+            graph_progress = min(max((iteration - opt.graph_start_iter) / warmup_iters, 0.0), 1.0)
+            graph_coeff = image.new_tensor(opt.graph_weight_lambda * graph_progress)
 
             support_cameras = None
             support_visibility = None
-            if opt.geo_use_multiview_semantics:
+            if opt.graph_use_multiview_semantics:
                 candidate_cameras = [cam for cam in scene.getTrainCameras() if cam.uid != viewpoint_cam.uid]
-                num_support = min(max(int(opt.geo_support_views), 0), len(candidate_cameras))
+                num_support = min(max(int(opt.graph_support_views), 0), len(candidate_cameras))
                 support_cameras = [viewpoint_cam]
                 if num_support > 0:
                     support_cameras.extend(sample(candidate_cameras, num_support))
@@ -176,38 +187,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             visibility_masks.append(support_render_pkg["visibility_filter"].detach())
                 support_visibility = torch.stack(visibility_masks, dim=0)
 
-            loss_geo_raw, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_geo_contrastive_cosine(
-                features=gaussians._objects_dc.squeeze(1),
+            graph_data = compute_graph_reliability(
                 xyz=gaussians._xyz.squeeze().detach(),
                 point_ids=torch.arange(gaussians._xyz.shape[0], device=gaussians._xyz.device),
-                k=opt.geo_knn_k,
-                lambda_val=1.0,
-                lambda_pos=opt.geo_lambda_pos,
-                lambda_neg=opt.geo_lambda_neg,
-                max_points=opt.geo_max_points,
-                sample_size=opt.geo_sample_size,
-                plane_tau=opt.geo_plane_tau,
-                neg_plane_tau=opt.geo_neg_plane_tau,
-                spatial_pos_scale=opt.geo_spatial_pos_scale,
-                normal_pos_tau=opt.geo_normal_pos_tau,
-                normal_neg_tau=opt.geo_normal_neg_tau,
-                neg_margin=opt.geo_neg_margin,
-                hard_neg_k=opt.geo_hard_neg_k,
+                k=opt.graph_knn_k,
+                max_points=opt.graph_max_points,
+                sample_size=opt.graph_sample_size,
+                plane_tau=opt.graph_plane_tau,
+                neg_plane_tau=opt.graph_neg_plane_tau,
+                spatial_pos_scale=opt.graph_spatial_pos_scale,
+                normal_pos_tau=opt.graph_normal_pos_tau,
+                normal_neg_tau=opt.graph_normal_neg_tau,
                 support_cameras=support_cameras,
                 support_visibility=support_visibility,
-                sem_min_views=opt.geo_sem_min_views,
-                sem_conf_tau=opt.geo_sem_conf_tau,
+                sem_min_views=opt.graph_sem_min_views,
+                sem_conf_tau=opt.graph_sem_conf_tau,
                 sem_num_classes=num_classes,
-                sem_ignore_label=opt.geo_sem_ignore_label,
-                normal_weight_lambda=opt.geo_normal_weight_lambda,
-                sem_same_boost=opt.geo_sem_same_boost,
-                sem_neg_boost=opt.geo_sem_neg_boost,
-                sem_conflict_penalty=opt.geo_sem_conflict_penalty,
+                sem_ignore_label=opt.graph_sem_ignore_label,
+                sem_same_boost=opt.graph_sem_same_boost,
+                sem_neg_boost=opt.graph_sem_neg_boost,
+                sem_conflict_penalty=opt.graph_sem_conflict_penalty,
+                alpha_dist=opt.graph_alpha_dist,
+                alpha_normal=opt.graph_alpha_normal,
+                alpha_residual=opt.graph_alpha_residual,
+                alpha_mv=opt.graph_alpha_mv,
+                pos_reliability_thresh=opt.graph_pos_reliability_thresh,
+                neg_reliability_thresh=opt.graph_neg_reliability_thresh,
             )
-            loss_geo = geo_coeff * loss_geo_raw
-            loss = loss + loss_geo
+            loss_graph_raw, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_graph_contrastive(
+                features=gaussians._objects_dc.squeeze(1),
+                graph_data=graph_data,
+                lambda_val=1.0,
+                lambda_pos=opt.graph_lambda_pos,
+                lambda_neg=opt.graph_lambda_neg,
+                neg_margin=opt.graph_neg_margin,
+                hard_neg_k=opt.graph_hard_neg_k,
+                normal_weight_lambda=opt.graph_normal_weight_lambda,
+            )
+            loss_graph = graph_coeff * loss_graph_raw
+            loss = loss + loss_graph
 
-        if iteration % 100 == 0 and (sugar_active or geo_active):
+        if iteration % 100 == 0 and (sugar_active or graph_active):
             loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
             message = (
                 f"[Iter {iteration}] "
@@ -223,15 +243,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     f"sugar_plane_residual={sugar_plane_residual.item():.6f}, "
                     f"sugar_flat_ratio={sugar_flat_ratio.item():.6f}, "
                 )
-            if geo_active:
+            if graph_active:
                 print(
                     message
-                    + f"geo_coeff={geo_coeff.item():.6f}, "
-                    + f"loss_geo_raw={loss_geo_raw.item():.6f}, "
-                    + f"loss_geo={loss_geo.item():.6f}, "
+                    + f"graph_coeff={graph_coeff.item():.6f}, "
+                    + f"loss_graph_raw={loss_graph_raw.item():.6f}, "
+                    + f"loss_graph={loss_graph.item():.6f}, "
                     + f"pos_loss={pos_loss.item():.6f}, "
                     + f"neg_loss={neg_loss.item():.6f}, "
-                    + f"gate_ratio={gate_ratio.item():.4f}, "
+                    + f"graph_pos_ratio={graph_pos_ratio.item():.4f}, "
+                    + f"graph_neg_ratio={graph_neg_ratio.item():.4f}, "
+                    + f"graph_ignore_ratio={graph_ignore_ratio.item():.4f}, "
+                    + f"avg_reliability={avg_reliability.item():.6f}, "
+                    + f"avg_pos_reliability={avg_pos_reliability.item():.6f}, "
+                    + f"avg_neg_reliability={avg_neg_reliability.item():.6f}, "
+                    + f"avg_mv_consistency={avg_mv_consistency.item():.6f}, "
                     + f"avg_plane_residual={avg_plane_residual.item():.6f}, "
                     + f"avg_feature_norm={avg_feature_norm.item():.6f}, "
                     + f"avg_normal_cosine={avg_normal_cosine.item():.6f}, "
@@ -239,8 +265,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"avg_neg_cosine={avg_neg_cosine.item():.6f}, "
                     + f"avg_hard_neg_cosine={avg_hard_neg_cosine.item():.6f}, "
                     + f"active_neg_ratio={active_neg_ratio.item():.6f}, "
-                    + f"neg_candidate_ratio={neg_candidate_ratio.item():.6f}, "
-                    + f"ignore_ratio={ignore_ratio.item():.6f}, "
                     + f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
                     + f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
                     + f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
@@ -264,7 +288,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -309,7 +333,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_geo_raw, loss_geo, geo_coeff, geo_active, gate_ratio, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, neg_candidate_ratio, ignore_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -317,8 +341,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
             "train_loss_patches/total_loss": loss.item(),
             "train_loss_patches/sugar_active": float(sugar_active),
             "train_loss_patches/sugar_coeff": sugar_coeff.item(),
-            "train_loss_patches/geo_active": float(geo_active),
-            "train_loss_patches/geo_coeff": geo_coeff.item(),
+            "train_loss_patches/graph_active": float(graph_active),
+            "train_loss_patches/graph_coeff": graph_coeff.item(),
             "iter_time": elapsed,
             "iter": iteration
         }
@@ -335,13 +359,19 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/sugar_flat_ratio": sugar_flat_ratio.item(),
             })
 
-        if geo_active:
+        if graph_active:
             log_data.update({
-                "train_loss_patches/loss_geo_raw": loss_geo_raw.item(),
-                "train_loss_patches/loss_geo": loss_geo.item(),
+                "train_loss_patches/loss_graph_raw": loss_graph_raw.item(),
+                "train_loss_patches/loss_graph": loss_graph.item(),
                 "train_loss_patches/pos_loss": pos_loss.item(),
                 "train_loss_patches/neg_loss": neg_loss.item(),
-                "train_loss_patches/gate_ratio": gate_ratio.item(),
+                "train_loss_patches/graph_pos_ratio": graph_pos_ratio.item(),
+                "train_loss_patches/graph_neg_ratio": graph_neg_ratio.item(),
+                "train_loss_patches/graph_ignore_ratio": graph_ignore_ratio.item(),
+                "train_loss_patches/avg_reliability": avg_reliability.item(),
+                "train_loss_patches/avg_pos_reliability": avg_pos_reliability.item(),
+                "train_loss_patches/avg_neg_reliability": avg_neg_reliability.item(),
+                "train_loss_patches/avg_mv_consistency": avg_mv_consistency.item(),
                 "train_loss_patches/avg_plane_residual": avg_plane_residual.item(),
                 "train_loss_patches/avg_feature_norm": avg_feature_norm.item(),
                 "train_loss_patches/avg_normal_cosine": avg_normal_cosine.item(),
@@ -349,8 +379,6 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/avg_neg_cosine": avg_neg_cosine.item(),
                 "train_loss_patches/avg_hard_neg_cosine": avg_hard_neg_cosine.item(),
                 "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
-                "train_loss_patches/neg_candidate_ratio": neg_candidate_ratio.item(),
-                "train_loss_patches/ignore_ratio": ignore_ratio.item(),
                 "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
                 "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
                 "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
@@ -429,36 +457,38 @@ if __name__ == "__main__":
     args.reg3d_max_points = config.get("reg3d_max_points", 300000)
     args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
 
-    args.geo_start_iter = config.get("geo_start_iter", args.densify_until_iter + 2000)
-    args.geo_interval = config.get("geo_interval", 10)
-    args.geo_knn_k = config.get("geo_knn_k", 8)
-    args.geo_weight_lambda = config.get("geo_weight_lambda", 1.0)
-    args.geo_warmup_iters = config.get("geo_warmup_iters", 4000)
-    args.geo_lambda_pos = config.get("geo_lambda_pos", 1.0)
-    args.geo_lambda_neg = config.get("geo_lambda_neg", 1.0)
-    args.geo_max_points = config.get("geo_max_points", 200000)
-    args.geo_sample_size = config.get("geo_sample_size", 800)
-    args.geo_plane_tau = config.get("geo_plane_tau", 0.01)
-    args.geo_neg_plane_tau = config.get("geo_neg_plane_tau", 0.02)
-    args.geo_spatial_pos_scale = config.get("geo_spatial_pos_scale", 0.75)
-    args.geo_normal_pos_tau = config.get("geo_normal_pos_tau", 0.75)
-    args.geo_normal_neg_tau = config.get("geo_normal_neg_tau", 0.4)
-    args.geo_neg_margin = config.get("geo_neg_margin", 0.8)
-    args.geo_hard_neg_k = config.get("geo_hard_neg_k", 2)
-    args.geo_use_multiview_semantics = config.get("geo_use_multiview_semantics", False)
-    args.geo_support_views = config.get("geo_support_views", 3)
-    args.geo_sem_pos_ratio = config.get("geo_sem_pos_ratio", 0.7)
-    args.geo_sem_min_views = config.get("geo_sem_min_views", 2)
-    args.geo_sem_conf_tau = config.get("geo_sem_conf_tau", args.geo_sem_pos_ratio)
-    args.geo_sem_ignore_label = config.get("geo_sem_ignore_label", -1)
-    args.geo_normal_weight_lambda = config.get("geo_normal_weight_lambda", 5.0)
-    args.geo_sem_same_boost = config.get("geo_sem_same_boost", 1.0)
-    args.geo_sem_neg_boost = config.get("geo_sem_neg_boost", 1.0)
-    args.geo_sem_conflict_penalty = config.get("geo_sem_conflict_penalty", 0.75)
-    args.geo_alpha = config.get("geo_alpha", 2.0)
-    args.geo_beta = config.get("geo_beta", 1.0)
-    args.geo_gamma = config.get("geo_gamma", 1.0)
-    args.geo_weight_power = config.get("geo_weight_power", 2.0)
+    args.graph_start_iter = config.get("graph_start_iter", config.get("geo_start_iter", args.densify_until_iter + 2000))
+    args.graph_interval = config.get("graph_interval", config.get("geo_interval", 10))
+    args.graph_knn_k = config.get("graph_knn_k", config.get("geo_knn_k", 8))
+    args.graph_weight_lambda = config.get("graph_weight_lambda", config.get("geo_weight_lambda", 1.0))
+    args.graph_warmup_iters = config.get("graph_warmup_iters", config.get("geo_warmup_iters", 4000))
+    args.graph_lambda_pos = config.get("graph_lambda_pos", config.get("geo_lambda_pos", 1.0))
+    args.graph_lambda_neg = config.get("graph_lambda_neg", config.get("geo_lambda_neg", 1.0))
+    args.graph_max_points = config.get("graph_max_points", config.get("geo_max_points", 200000))
+    args.graph_sample_size = config.get("graph_sample_size", config.get("geo_sample_size", 800))
+    args.graph_plane_tau = config.get("graph_plane_tau", config.get("geo_plane_tau", 0.01))
+    args.graph_neg_plane_tau = config.get("graph_neg_plane_tau", config.get("geo_neg_plane_tau", 0.02))
+    args.graph_spatial_pos_scale = config.get("graph_spatial_pos_scale", config.get("geo_spatial_pos_scale", 0.75))
+    args.graph_normal_pos_tau = config.get("graph_normal_pos_tau", config.get("geo_normal_pos_tau", 0.75))
+    args.graph_normal_neg_tau = config.get("graph_normal_neg_tau", config.get("geo_normal_neg_tau", 0.4))
+    args.graph_neg_margin = config.get("graph_neg_margin", config.get("geo_neg_margin", 0.8))
+    args.graph_hard_neg_k = config.get("graph_hard_neg_k", config.get("geo_hard_neg_k", 2))
+    args.graph_use_multiview_semantics = config.get("graph_use_multiview_semantics", config.get("geo_use_multiview_semantics", False))
+    args.graph_support_views = config.get("graph_support_views", config.get("geo_support_views", 3))
+    args.graph_sem_pos_ratio = config.get("graph_sem_pos_ratio", config.get("geo_sem_pos_ratio", 0.7))
+    args.graph_sem_min_views = config.get("graph_sem_min_views", config.get("geo_sem_min_views", 2))
+    args.graph_sem_conf_tau = config.get("graph_sem_conf_tau", config.get("geo_sem_conf_tau", args.graph_sem_pos_ratio))
+    args.graph_sem_ignore_label = config.get("graph_sem_ignore_label", config.get("geo_sem_ignore_label", -1))
+    args.graph_normal_weight_lambda = config.get("graph_normal_weight_lambda", config.get("geo_normal_weight_lambda", 5.0))
+    args.graph_sem_same_boost = config.get("graph_sem_same_boost", config.get("geo_sem_same_boost", 1.0))
+    args.graph_sem_neg_boost = config.get("graph_sem_neg_boost", config.get("geo_sem_neg_boost", 1.0))
+    args.graph_sem_conflict_penalty = config.get("graph_sem_conflict_penalty", config.get("geo_sem_conflict_penalty", 0.75))
+    args.graph_alpha_dist = config.get("graph_alpha_dist", 2.0)
+    args.graph_alpha_normal = config.get("graph_alpha_normal", 2.0)
+    args.graph_alpha_residual = config.get("graph_alpha_residual", 2.0)
+    args.graph_alpha_mv = config.get("graph_alpha_mv", 1.0)
+    args.graph_pos_reliability_thresh = config.get("graph_pos_reliability_thresh", 0.65)
+    args.graph_neg_reliability_thresh = config.get("graph_neg_reliability_thresh", 0.35)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
