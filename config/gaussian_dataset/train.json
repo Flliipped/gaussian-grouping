@@ -27,13 +27,13 @@
     "graph_lambda_neg": 1.0,
     "graph_max_points": 200000,
     "graph_sample_size": 800,
-    "graph_plane_tau": 0.01,
-    "graph_neg_plane_tau": 0.02,
+    "graph_plane_tau": 0.35,
+    "graph_neg_plane_tau": 0.60,
     "graph_spatial_pos_scale": 0.75,
     "graph_normal_pos_tau": 0.75,
     "graph_normal_neg_tau": 0.4,
     "graph_neg_margin": 0.8,
-    "graph_hard_neg_k": 1,
+    "graph_hard_neg_k": 2,
     "graph_use_multiview_semantics": true,
     "graph_support_views": 3,
     "graph_sem_pos_ratio": 0.7,
@@ -48,6 +48,6 @@
     "graph_alpha_normal": 2.0,
     "graph_alpha_residual": 2.0,
     "graph_alpha_mv": 1.0,
-    "graph_pos_reliability_thresh": 0.65,
-    "graph_neg_reliability_thresh": 0.35
+    "graph_pos_reliability_thresh": 0.60,
+    "graph_neg_reliability_thresh": 0.30
 }

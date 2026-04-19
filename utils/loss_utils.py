@@ -466,14 +466,16 @@ def compute_graph_reliability(
     normal_cosine = torch.abs((sample_normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)).clamp(0.0, 1.0)
 
     spatial_pos_mask = (spatial_ratio <= spatial_pos_scale).to(pair_dtype)
-    depth_pos_mask = (plane_residual < plane_tau).to(pair_dtype)
+    # Use normalized residuals for graph partitioning so the same threshold
+    # behaves more consistently across scenes with different local scales.
+    depth_pos_mask = (plane_residual_ratio < plane_tau).to(pair_dtype)
     normal_pos_mask = (normal_cosine >= normal_pos_tau).to(pair_dtype)
     geometry_positive_support = spatial_pos_mask * depth_pos_mask * normal_pos_mask
 
     if neg_plane_tau is None or neg_plane_tau <= plane_tau:
         depth_neg_mask = 1.0 - depth_pos_mask
     else:
-        depth_neg_mask = (plane_residual > neg_plane_tau).to(pair_dtype)
+        depth_neg_mask = (plane_residual_ratio > neg_plane_tau).to(pair_dtype)
     normal_neg_mask = (normal_cosine <= normal_neg_tau).to(pair_dtype)
     geometry_break_mask = ((depth_neg_mask + normal_neg_mask) > 0).to(pair_dtype)
 
