@@ -29,6 +29,7 @@ fi
 
 # 默认输出目录
 model_path="output/${dataset_name}"
+config_file="config/gaussian_dataset/train.json"
 
 # 默认开启 eval
 use_eval=true
@@ -52,6 +53,13 @@ while [ "$#" -gt 0 ]; do
             use_eval=true
             shift
             ;;
+        --config_file)
+            if [ -z "$2" ]; then
+                usage
+            fi
+            config_file="$2"
+            shift 2
+            ;;
          --wandb)
             use_wandb=true
             shift
@@ -71,6 +79,7 @@ done
 echo "Dataset folder: ${dataset_folder}"
 echo "Scale: ${scale}"
 echo "Model output: ${model_path}"
+echo "Config file: ${config_file}"
 echo "Eval enabled: ${use_eval}"
 
 # 训练命令
@@ -79,7 +88,7 @@ train_cmd=(
     -s "${dataset_folder}"
     -r "${scale}"
     -m "${model_path}"
-    --config_file config/gaussian_dataset/train.json
+    --config_file "${config_file}"
     --train_split
 )
 
