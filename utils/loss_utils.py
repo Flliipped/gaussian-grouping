@@ -482,6 +482,9 @@ def compute_graph_reliability(
 
     avg_sem_valid_views = zero
     avg_sem_confidence = zero
+    sem_valid_point_ratio = zero
+    sem_pair_valid_ratio = zero
+    sem_high_conf_same_ratio = zero
     semantic_pos_keep_ratio = zero
     semantic_neg_keep_ratio = zero
     sem_same_mask = torch.zeros_like(spatial_ratio)
@@ -528,8 +531,11 @@ def compute_graph_reliability(
             sem_valid_point_count = point_sem_valid.to(pair_dtype).sum()
             avg_sem_valid_views = (point_sem_valid.to(point_valid_view_count.dtype) * point_valid_view_count).sum() / (sem_valid_point_count + eps)
             avg_sem_confidence = (point_sem_valid.to(point_sem_confidence.dtype) * point_sem_confidence).sum() / (sem_valid_point_count + eps)
+            sem_valid_point_ratio = sem_valid_point_count / (point_sem_valid.numel() + eps)
+            sem_pair_valid_ratio = sem_pair_valid.to(pair_dtype).mean()
 
             sem_high_conf_same_mask = sem_same_mask * (sem_pair_conf >= sem_conf_tau).to(pair_dtype)
+            sem_high_conf_same_ratio = sem_high_conf_same_mask.sum() / (sem_high_conf_same_mask.numel() + eps)
             semantic_pos_factor = 1.0 + sem_pos_ratio * sem_same_boost * sem_high_conf_same_mask * sem_pair_conf
 
     # Geometry determines whether propagation is trustworthy. Multi-view
@@ -582,6 +588,9 @@ def compute_graph_reliability(
         "semantic_neg_factor": semantic_neg_factor,
         "avg_sem_valid_views": avg_sem_valid_views,
         "avg_sem_confidence": avg_sem_confidence,
+        "sem_valid_point_ratio": sem_valid_point_ratio,
+        "sem_pair_valid_ratio": sem_pair_valid_ratio,
+        "sem_high_conf_same_ratio": sem_high_conf_same_ratio,
         "semantic_pos_keep_ratio": semantic_pos_keep_ratio,
         "semantic_neg_keep_ratio": semantic_neg_keep_ratio,
     }

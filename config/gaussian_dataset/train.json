@@ -21,7 +21,7 @@
     "graph_start_iter": 12000,
     "graph_interval": 10,
     "graph_knn_k": 8,
-    "graph_weight_lambda": 1.0,
+    "graph_weight_lambda": 0.3,
     "graph_warmup_iters": 4000,
     "graph_lambda_pos": 1.0,
     "graph_lambda_neg": 1.0,

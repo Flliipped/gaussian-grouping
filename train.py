@@ -175,6 +175,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         active_neg_ratio = torch.tensor(0.0, device=image.device)
         avg_sem_valid_views = torch.tensor(0.0, device=image.device)
         avg_sem_confidence = torch.tensor(0.0, device=image.device)
+        sem_valid_point_ratio = torch.tensor(0.0, device=image.device)
+        sem_pair_valid_ratio = torch.tensor(0.0, device=image.device)
+        sem_high_conf_same_ratio = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
         semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
@@ -245,6 +248,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 pos_reliability_thresh=opt.graph_pos_reliability_thresh,
                 neg_reliability_thresh=opt.graph_neg_reliability_thresh,
             )
+            sem_valid_point_ratio = graph_data.get("sem_valid_point_ratio", sem_valid_point_ratio)
+            sem_pair_valid_ratio = graph_data.get("sem_pair_valid_ratio", sem_pair_valid_ratio)
+            sem_high_conf_same_ratio = graph_data.get("sem_high_conf_same_ratio", sem_high_conf_same_ratio)
             loss_graph_raw, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_graph_contrastive(
                 features=gaussians._objects_dc.squeeze(1),
                 graph_data=graph_data,
@@ -298,6 +304,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"active_neg_ratio={active_neg_ratio.item():.6f}, "
                     + f"avg_sem_valid_views={avg_sem_valid_views.item():.6f}, "
                     + f"avg_sem_confidence={avg_sem_confidence.item():.6f}, "
+                    + f"sem_valid_point_ratio={sem_valid_point_ratio.item():.6f}, "
+                    + f"sem_pair_valid_ratio={sem_pair_valid_ratio.item():.6f}, "
+                    + f"sem_high_conf_same_ratio={sem_high_conf_same_ratio.item():.6f}, "
                     + f"semantic_pos_keep_ratio={semantic_pos_keep_ratio.item():.6f}, "
                     + f"semantic_neg_keep_ratio={semantic_neg_keep_ratio.item():.6f}"
                 )
@@ -319,7 +328,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -364,7 +373,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -412,6 +421,9 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/active_neg_ratio": active_neg_ratio.item(),
                 "train_loss_patches/avg_sem_valid_views": avg_sem_valid_views.item(),
                 "train_loss_patches/avg_sem_confidence": avg_sem_confidence.item(),
+                "train_loss_patches/sem_valid_point_ratio": sem_valid_point_ratio.item(),
+                "train_loss_patches/sem_pair_valid_ratio": sem_pair_valid_ratio.item(),
+                "train_loss_patches/sem_high_conf_same_ratio": sem_high_conf_same_ratio.item(),
                 "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
                 "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
             })
