@@ -8,7 +8,7 @@
 
 import os
 import torch
-from random import randint, sample
+from random import randint
 from utils.loss_utils import (
     compute_graph_reliability,
     l1_loss,
@@ -28,6 +28,34 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 import json
+
+
+def _build_graph_support_cache(cameras, num_support):
+    if cameras is None or len(cameras) == 0:
+        return {}
+
+    effective_support = min(max(int(num_support), 0), max(len(cameras) - 1, 0))
+    if effective_support <= 0:
+        return {camera.uid: [camera] for camera in cameras}
+
+    camera_centers = torch.stack(
+        [camera.camera_center.detach().float() for camera in cameras],
+        dim=0,
+    )
+    pairwise_dist = torch.cdist(camera_centers, camera_centers)
+    pairwise_dist.fill_diagonal_(float("inf"))
+
+    support_cache = {}
+    for camera_idx, camera in enumerate(cameras):
+        _, neighbor_idx = torch.topk(
+            pairwise_dist[camera_idx],
+            k=effective_support,
+            largest=False,
+        )
+        support_cache[camera.uid] = [camera] + [cameras[idx.item()] for idx in neighbor_idx]
+
+    return support_cache
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
@@ -55,6 +83,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    graph_support_cache = None
+    if opt.graph_use_multiview_semantics:
+        graph_support_cache = _build_graph_support_cache(
+            scene.getTrainCameras(),
+            opt.graph_support_views,
+        )
     for iteration in range(first_iter, opt.iterations + 1):
         if iteration == 1:
             print("xyz:", gaussians._xyz.shape)
@@ -173,11 +207,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             support_cameras = None
             support_visibility = None
             if opt.graph_use_multiview_semantics:
-                candidate_cameras = [cam for cam in scene.getTrainCameras() if cam.uid != viewpoint_cam.uid]
-                num_support = min(max(int(opt.graph_support_views), 0), len(candidate_cameras))
-                support_cameras = [viewpoint_cam]
-                if num_support > 0:
-                    support_cameras.extend(sample(candidate_cameras, num_support))
+                support_cameras = graph_support_cache.get(viewpoint_cam.uid, [viewpoint_cam])
 
                 visibility_masks = [visibility_filter.detach()]
                 if len(support_cameras) > 1:
@@ -202,6 +232,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 support_visibility=support_visibility,
                 sem_min_views=opt.graph_sem_min_views,
                 sem_conf_tau=opt.graph_sem_conf_tau,
+                sem_pos_ratio=opt.graph_sem_pos_ratio,
                 sem_num_classes=num_classes,
                 sem_ignore_label=opt.graph_sem_ignore_label,
                 sem_same_boost=opt.graph_sem_same_boost,

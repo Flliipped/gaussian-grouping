@@ -396,6 +396,7 @@ def compute_graph_reliability(
     support_visibility=None,
     sem_min_views=2,
     sem_conf_tau=0.7,
+    sem_pos_ratio=0.7,
     sem_num_classes=None,
     sem_ignore_label=-1,
     sem_same_boost=1.0,
@@ -528,43 +529,34 @@ def compute_graph_reliability(
             avg_sem_valid_views = (point_sem_valid.to(point_valid_view_count.dtype) * point_valid_view_count).sum() / (sem_valid_point_count + eps)
             avg_sem_confidence = (point_sem_valid.to(point_sem_confidence.dtype) * point_sem_confidence).sum() / (sem_valid_point_count + eps)
 
-            semantic_pos_factor = 1.0 + sem_same_boost * sem_same_mask * sem_pair_conf
-            semantic_pos_factor = semantic_pos_factor * torch.clamp(
-                1.0 - sem_conflict_penalty * sem_diff_mask * sem_pair_conf,
-                min=0.25,
-                max=2.0,
-            )
-            semantic_neg_factor = 1.0 + sem_neg_boost * sem_diff_mask * sem_pair_conf
+            sem_high_conf_same_mask = sem_same_mask * (sem_pair_conf >= sem_conf_tau).to(pair_dtype)
+            semantic_pos_factor = 1.0 + sem_pos_ratio * sem_same_boost * sem_high_conf_same_mask * sem_pair_conf
 
-    # Geometry does not assign semantics directly here; it only modulates
-    # whether semantic propagation between two Gaussians is trustworthy.
+    # Geometry determines whether propagation is trustworthy. Multi-view
+    # semantics are kept as a conservative reweighting signal instead of
+    # rewriting the graph topology or mining negatives.
     reliability_logit = (
         -alpha_dist * spatial_ratio
         + alpha_normal * normal_cosine
         - alpha_residual * plane_residual_ratio
-        + alpha_mv * mv_consistency
     )
     reliability = torch.sigmoid(reliability_logit)
 
     sem_known_mask = sem_pair_valid.to(pair_dtype)
-    semantic_agree_or_unknown = ((sem_same_mask > 0) | (~sem_pair_valid)).to(pair_dtype)
     reliability_high_mask = (reliability >= pos_reliability_thresh).to(pair_dtype)
     reliability_low_mask = (reliability <= neg_reliability_thresh).to(pair_dtype)
 
-    positive_mask = reliability_high_mask * geometry_positive_support * semantic_agree_or_unknown
+    positive_mask = reliability_high_mask * geometry_positive_support
 
     spatial_close_mask = (spatial_ratio <= 1.0).to(pair_dtype)
-    semantic_negative_promote_mask = spatial_close_mask * sem_diff_mask * (sem_pair_conf >= sem_conf_tau).to(pair_dtype)
-    negative_mask = spatial_close_mask * (
-        reliability_low_mask * geometry_break_mask + semantic_negative_promote_mask
-    )
+    negative_mask = spatial_close_mask * (reliability_low_mask * geometry_break_mask)
     negative_mask = torch.clamp(negative_mask * (1.0 - positive_mask), min=0.0, max=1.0)
     ignore_mask = torch.clamp(1.0 - torch.clamp(positive_mask + negative_mask, max=1.0), min=0.0, max=1.0)
 
     pos_reference = geometry_positive_support.sum()
-    neg_reference = (spatial_close_mask * geometry_break_mask + semantic_negative_promote_mask).sum()
+    neg_reference = (spatial_close_mask * geometry_break_mask).sum()
     semantic_pos_keep_ratio = (geometry_positive_support * semantic_pos_factor).sum() / (pos_reference + eps)
-    semantic_neg_keep_ratio = (negative_mask * semantic_neg_factor).sum() / (neg_reference + eps)
+    semantic_neg_keep_ratio = zero
 
     return {
         "valid": True,
@@ -644,7 +636,6 @@ def loss_graph_contrastive(
         hard_neg_scores = (
             cosine_sim
             + 0.5 * (1.0 - normal_cosine)
-            + graph_data["sem_diff_mask"] * graph_data["sem_pair_conf"]
         ).masked_fill(negative_mask == 0, -1e6)
         _, hard_neg_idx = hard_neg_scores.topk(effective_hard_neg_k, dim=1, largest=True)
         hard_neg_mask = torch.zeros_like(negative_mask)
@@ -655,7 +646,7 @@ def loss_graph_contrastive(
 
     neg_term = torch.clamp(cosine_sim - neg_margin, min=0.0)
     active_hard_neg_mask = hard_neg_mask * (cosine_sim > neg_margin).to(cosine_sim.dtype)
-    neg_pair_weight = active_hard_neg_mask * (1.0 - reliability) * semantic_neg_factor
+    neg_pair_weight = active_hard_neg_mask * (1.0 - reliability)
     neg_loss = (neg_pair_weight * (neg_term ** 2)).sum() / (neg_pair_weight.sum() + eps)
 
     loss = lambda_pos * pos_loss + lambda_neg * neg_loss
