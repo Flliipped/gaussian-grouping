@@ -204,6 +204,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_avg_margin = torch.tensor(0.0, device=image.device)
         proto_active_ratio = torch.tensor(0.0, device=image.device)
         proto_usage_max = torch.tensor(0.0, device=image.device)
+        proto_update_features = None
+        proto_update_probs = None
+        proto_update_confidence = None
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
         proto_active = opt.use_proto and iteration >= opt.proto_start_iter and iteration % opt.proto_interval == 0
@@ -319,12 +322,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_avg_margin = proto_outputs["avg_proto_margin"]
             proto_active_ratio = proto_outputs["active_proto_ratio"]
             proto_usage_max = proto_outputs["usage_max"]
-            prototype_bank.ema_update(
-                proto_outputs["update_features"],
-                proto_outputs["update_probs"],
-                proto_outputs["update_confidence"],
-                confidence_thresh=opt.proto_conf_thresh,
-            )
+            proto_update_features = proto_outputs["update_features"]
+            proto_update_probs = proto_outputs["update_probs"]
+            proto_update_confidence = proto_outputs["update_confidence"]
             loss = loss + loss_proto
 
         if iteration % 100 == 0 and (sugar_active or graph_active or proto_active):
@@ -399,6 +399,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         with torch.no_grad():
+            if proto_update_features is not None:
+                prototype_bank.ema_update(
+                    proto_update_features,
+                    proto_update_probs,
+                    proto_update_confidence,
+                    confidence_thresh=opt.proto_conf_thresh,
+                )
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
