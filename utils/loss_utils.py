@@ -768,7 +768,6 @@ def loss_prototype_learning(
     else:
         assign_margin = topk.values[:, 0]
     assigned_proto_idx = topk.indices[:, 0]
-    assigned_prototypes = prototype_bank.prototypes[assigned_proto_idx]
 
     unique_indices = graph_data["proto_unique_indices"]
     unique_features = selected_features[unique_indices]
@@ -810,7 +809,11 @@ def loss_prototype_learning(
     cons_loss = (cons_weight * prob_diff).sum() / (cons_weight.sum() + eps)
 
     total_loss = lambda_pull * pull_loss + lambda_sep * sep_loss + lambda_cons * cons_loss
-    usage = assignment_probs.mean(dim=0)
+    usage = torch.bincount(
+        unique_proto_idx,
+        minlength=prototype_bank.num_prototypes,
+    ).to(unique_features.dtype)
+    usage = usage / usage.sum().clamp_min(1.0)
     active_proto_ratio = (usage > (0.5 / max(prototype_bank.num_prototypes, 1))).to(usage.dtype).mean()
 
     return {

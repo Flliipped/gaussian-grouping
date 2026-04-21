@@ -53,15 +53,15 @@
 
     "use_proto": true,
     "num_prototypes": 16,
-    "proto_start_iter": 18000,
+    "proto_start_iter": 20000,
     "proto_interval": 10,
-    "proto_weight_lambda": 0.1,
-    "proto_warmup_iters": 2000,
-    "proto_tau": 0.2,
-    "proto_conf_thresh": 0.2,
+    "proto_weight_lambda": 0.03,
+    "proto_warmup_iters": 4000,
+    "proto_tau": 0.1,
+    "proto_conf_thresh": 0.3,
     "proto_ema_momentum": 0.95,
     "proto_lambda_pull": 1.0,
     "proto_lambda_sep": 0.1,
-    "proto_lambda_cons": 0.25,
+    "proto_lambda_cons": 0.1,
     "proto_sep_margin": 0.2
 }

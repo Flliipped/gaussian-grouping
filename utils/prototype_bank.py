@@ -111,7 +111,12 @@ class ScenePrototypeBank(nn.Module):
         selected_features = normalized_features[active_mask]
         selected_probs = probs.detach()[active_mask]
         selected_conf = confidence[active_mask].unsqueeze(-1)
-        weighted_probs = selected_probs * selected_conf
+        top_proto_idx = torch.argmax(selected_probs, dim=-1)
+        hard_probs = F.one_hot(
+            top_proto_idx,
+            num_classes=self.num_prototypes,
+        ).to(selected_probs.dtype)
+        weighted_probs = hard_probs * selected_conf
 
         proto_weight = weighted_probs.sum(dim=0)
         active_proto_mask = proto_weight > 0
@@ -129,6 +134,5 @@ class ScenePrototypeBank(nn.Module):
         )
         self.prototypes.copy_(updated)
 
-        usage_target = selected_probs.mean(dim=0)
+        usage_target = hard_probs.mean(dim=0)
         self.usage_ema.mul_(self.momentum).add_((1.0 - self.momentum) * usage_target)
-
