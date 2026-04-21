@@ -9,7 +9,7 @@
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
-from math import exp
+from math import exp, log
 from scipy.spatial import cKDTree
 from utils.general_utils import build_rotation
 from utils.multiview_utils import collect_multiview_labels, compute_point_label_consensus
@@ -494,6 +494,8 @@ def compute_graph_reliability(
     semantic_pos_factor = torch.ones_like(spatial_ratio)
     semantic_neg_factor = torch.ones_like(spatial_ratio)
     sem_pair_valid = torch.zeros_like(spatial_ratio, dtype=torch.bool)
+    point_sem_confidence = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=pair_dtype)
+    point_sem_valid = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=torch.bool)
 
     if support_cameras is not None and len(support_cameras) > 0:
         unique_global_point_ids = unique_point_ids if point_ids is None else point_ids[unique_point_ids]
@@ -548,6 +550,15 @@ def compute_graph_reliability(
     )
     reliability = torch.sigmoid(reliability_logit)
 
+    point_reliability_sum = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=pair_dtype)
+    point_reliability_count = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=pair_dtype)
+    sample_reliability = reliability.mean(dim=1)
+    point_reliability_sum.scatter_add_(0, sample_local, sample_reliability)
+    point_reliability_count.scatter_add_(0, sample_local, torch.ones_like(sample_reliability))
+    point_reliability_sum.scatter_add_(0, neighbor_local.reshape(-1), reliability.reshape(-1))
+    point_reliability_count.scatter_add_(0, neighbor_local.reshape(-1), torch.ones_like(reliability.reshape(-1)))
+    point_reliability = point_reliability_sum / point_reliability_count.clamp_min(1.0)
+
     sem_known_mask = sem_pair_valid.to(pair_dtype)
     reliability_high_mask = (reliability >= pos_reliability_thresh).to(pair_dtype)
     reliability_low_mask = (reliability <= neg_reliability_thresh).to(pair_dtype)
@@ -569,6 +580,7 @@ def compute_graph_reliability(
         "zero": zero,
         "xyz": xyz,
         "feature_indices": feature_indices,
+        "proto_unique_indices": unique_point_ids,
         "sample_indices": sample_indices,
         "neighbor_indices": neighbor_indices_tensor,
         "reliability": reliability,
@@ -588,6 +600,9 @@ def compute_graph_reliability(
         "semantic_neg_factor": semantic_neg_factor,
         "avg_sem_valid_views": avg_sem_valid_views,
         "avg_sem_confidence": avg_sem_confidence,
+        "point_reliability": point_reliability,
+        "point_sem_confidence": point_sem_confidence,
+        "point_sem_valid": point_sem_valid,
         "sem_valid_point_ratio": sem_valid_point_ratio,
         "sem_pair_valid_ratio": sem_pair_valid_ratio,
         "sem_high_conf_same_ratio": sem_high_conf_same_ratio,
@@ -702,6 +717,118 @@ def loss_graph_contrastive(
         graph_data["semantic_pos_keep_ratio"],
         graph_data["semantic_neg_keep_ratio"],
     )
+
+
+def loss_prototype_learning(
+    features,
+    prototype_bank,
+    graph_data,
+    lambda_val=1.0,
+    lambda_pull=1.0,
+    lambda_sep=0.1,
+    lambda_cons=0.1,
+    conf_thresh=0.2,
+    sep_margin=0.2,
+    eps=1e-8,
+):
+    zero = features.new_tensor(0.0)
+    if (
+        prototype_bank is None
+        or graph_data is None
+        or not graph_data.get("valid", False)
+        or features.numel() == 0
+    ):
+        return {
+            "loss": zero,
+            "pull_loss": zero,
+            "sep_loss": zero,
+            "cons_loss": zero,
+            "avg_entropy": zero,
+            "avg_assign_conf": zero,
+            "avg_proto_confidence": zero,
+            "confident_ratio": zero,
+            "avg_proto_margin": zero,
+            "active_proto_ratio": zero,
+            "usage_max": zero,
+            "update_features": None,
+            "update_probs": None,
+            "update_confidence": None,
+        }
+
+    feature_indices = graph_data["feature_indices"]
+    selected_features = F.normalize(features[feature_indices], dim=-1, eps=eps)
+    _, assignment_probs = prototype_bank.assign(selected_features)
+
+    entropy = -(assignment_probs * torch.log(assignment_probs.clamp_min(eps))).sum(dim=-1)
+    entropy = entropy / max(log(max(assignment_probs.shape[-1], 2)), eps)
+    topk = assignment_probs.topk(k=min(2, assignment_probs.shape[-1]), dim=-1)
+    assign_conf = topk.values[:, 0]
+    if topk.values.shape[-1] > 1:
+        assign_margin = topk.values[:, 0] - topk.values[:, 1]
+    else:
+        assign_margin = topk.values[:, 0]
+    assigned_proto_idx = topk.indices[:, 0]
+    assigned_prototypes = prototype_bank.prototypes[assigned_proto_idx]
+
+    unique_indices = graph_data["proto_unique_indices"]
+    unique_features = selected_features[unique_indices]
+    unique_probs = assignment_probs[unique_indices]
+    unique_entropy = entropy[unique_indices]
+    unique_assign_conf = assign_conf[unique_indices]
+    unique_assign_margin = assign_margin[unique_indices]
+    point_reliability = graph_data["point_reliability"].to(unique_features.dtype)
+    point_sem_confidence = graph_data["point_sem_confidence"].to(unique_features.dtype)
+    point_sem_valid = graph_data["point_sem_valid"]
+    point_sem_gate = torch.where(
+        point_sem_valid,
+        point_sem_confidence,
+        torch.ones_like(point_sem_confidence),
+    )
+
+    proto_confidence = (1.0 - unique_entropy) * point_reliability * point_sem_gate
+    confident_mask = (proto_confidence >= conf_thresh).to(unique_features.dtype)
+
+    unique_proto_idx = assigned_proto_idx[unique_indices]
+    unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
+    pull_weight = proto_confidence * confident_mask
+    pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
+    pull_loss = (pull_weight * pull_distance).sum() / (pull_weight.sum() + eps)
+
+    prototype_cosine = torch.matmul(prototype_bank.prototypes, prototype_bank.prototypes.t())
+    off_diag_mask = 1.0 - torch.eye(
+        prototype_bank.num_prototypes,
+        device=prototype_cosine.device,
+        dtype=prototype_cosine.dtype,
+    )
+    sep_penalty = torch.clamp(prototype_cosine - sep_margin, min=0.0) ** 2
+    sep_loss = (sep_penalty * off_diag_mask).sum() / (off_diag_mask.sum() + eps)
+
+    sample_probs = assignment_probs[graph_data["sample_indices"]]
+    neighbor_probs = assignment_probs[graph_data["neighbor_indices"]]
+    cons_weight = graph_data["positive_mask"] * graph_data["reliability"]
+    prob_diff = ((sample_probs.unsqueeze(1) - neighbor_probs) ** 2).mean(dim=-1)
+    cons_loss = (cons_weight * prob_diff).sum() / (cons_weight.sum() + eps)
+
+    total_loss = lambda_pull * pull_loss + lambda_sep * sep_loss + lambda_cons * cons_loss
+    usage = assignment_probs.mean(dim=0)
+    active_proto_ratio = (usage > (0.5 / max(prototype_bank.num_prototypes, 1))).to(usage.dtype).mean()
+
+    return {
+        "loss": lambda_val * total_loss,
+        "pull_loss": pull_loss,
+        "sep_loss": sep_loss,
+        "cons_loss": cons_loss,
+        "avg_entropy": unique_entropy.mean(),
+        "avg_assign_conf": unique_assign_conf.mean(),
+        "avg_proto_confidence": proto_confidence.mean(),
+        "confident_ratio": confident_mask.mean(),
+        "avg_proto_margin": unique_assign_margin.mean(),
+        "active_proto_ratio": active_proto_ratio,
+        "usage_max": usage.max(),
+        "update_features": unique_features.detach(),
+        "update_probs": unique_probs.detach(),
+        "update_confidence": proto_confidence.detach(),
+    }
 
 
 def loss_geo_contrastive_cosine(

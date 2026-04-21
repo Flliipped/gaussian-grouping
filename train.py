@@ -14,6 +14,7 @@ from utils.loss_utils import (
     l1_loss,
     loss_cls_3d,
     loss_graph_contrastive,
+    loss_prototype_learning,
     loss_sugar_surface_alignment,
     ssim,
 )
@@ -21,6 +22,7 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.prototype_bank import ScenePrototypeBank
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -75,6 +77,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    prototype_bank = None
+    if opt.use_proto:
+        prototype_bank = ScenePrototypeBank(
+            num_prototypes=opt.num_prototypes,
+            feature_dim=gaussians.num_objects,
+            tau=opt.proto_tau,
+            momentum=opt.proto_ema_momentum,
+            device=background.device,
+        )
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -151,6 +162,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_graph_raw = torch.tensor(0.0, device=image.device)
         loss_graph = torch.tensor(0.0, device=image.device)
         graph_coeff = torch.tensor(0.0, device=image.device)
+        loss_proto_raw = torch.tensor(0.0, device=image.device)
+        loss_proto = torch.tensor(0.0, device=image.device)
+        proto_coeff = torch.tensor(0.0, device=image.device)
         loss_sugar_raw = torch.tensor(0.0, device=image.device)
         loss_sugar = torch.tensor(0.0, device=image.device)
         sugar_coeff = torch.tensor(0.0, device=image.device)
@@ -180,8 +194,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sem_high_conf_same_ratio = torch.tensor(0.0, device=image.device)
         semantic_pos_keep_ratio = torch.tensor(0.0, device=image.device)
         semantic_neg_keep_ratio = torch.tensor(0.0, device=image.device)
+        proto_pull_loss = torch.tensor(0.0, device=image.device)
+        proto_sep_loss = torch.tensor(0.0, device=image.device)
+        proto_cons_loss = torch.tensor(0.0, device=image.device)
+        proto_avg_entropy = torch.tensor(0.0, device=image.device)
+        proto_avg_assign_conf = torch.tensor(0.0, device=image.device)
+        proto_avg_confidence = torch.tensor(0.0, device=image.device)
+        proto_confident_ratio = torch.tensor(0.0, device=image.device)
+        proto_avg_margin = torch.tensor(0.0, device=image.device)
+        proto_active_ratio = torch.tensor(0.0, device=image.device)
+        proto_usage_max = torch.tensor(0.0, device=image.device)
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
+        proto_active = opt.use_proto and iteration >= opt.proto_start_iter and iteration % opt.proto_interval == 0
+        graph_context_active = graph_active or proto_active
+        graph_data = None
 
         if sugar_active:
             sugar_warmup_iters = max(1, opt.sugar_warmup_iters)
@@ -202,11 +229,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_sugar = sugar_coeff * loss_sugar_raw
             loss = loss + loss_sugar
 
-        if graph_active:
-            warmup_iters = max(1, opt.graph_warmup_iters)
-            graph_progress = min(max((iteration - opt.graph_start_iter) / warmup_iters, 0.0), 1.0)
-            graph_coeff = image.new_tensor(opt.graph_weight_lambda * graph_progress)
-
+        if graph_context_active:
             support_cameras = None
             support_visibility = None
             if opt.graph_use_multiview_semantics:
@@ -251,6 +274,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sem_valid_point_ratio = graph_data.get("sem_valid_point_ratio", sem_valid_point_ratio)
             sem_pair_valid_ratio = graph_data.get("sem_pair_valid_ratio", sem_pair_valid_ratio)
             sem_high_conf_same_ratio = graph_data.get("sem_high_conf_same_ratio", sem_high_conf_same_ratio)
+
+        if graph_active and graph_data is not None and graph_data.get("valid", False):
+            warmup_iters = max(1, opt.graph_warmup_iters)
+            graph_progress = min(max((iteration - opt.graph_start_iter) / warmup_iters, 0.0), 1.0)
+            graph_coeff = image.new_tensor(opt.graph_weight_lambda * graph_progress)
             loss_graph_raw, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, semantic_pos_keep_ratio, semantic_neg_keep_ratio = loss_graph_contrastive(
                 features=gaussians._objects_dc.squeeze(1),
                 graph_data=graph_data,
@@ -264,7 +292,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_graph = graph_coeff * loss_graph_raw
             loss = loss + loss_graph
 
-        if iteration % 100 == 0 and (sugar_active or graph_active):
+        if proto_active and graph_data is not None and graph_data.get("valid", False):
+            proto_warmup_iters = max(1, opt.proto_warmup_iters)
+            proto_progress = min(max((iteration - opt.proto_start_iter) / proto_warmup_iters, 0.0), 1.0)
+            proto_coeff = image.new_tensor(opt.proto_weight_lambda * proto_progress)
+            proto_outputs = loss_prototype_learning(
+                features=gaussians._objects_dc.squeeze(1),
+                prototype_bank=prototype_bank,
+                graph_data=graph_data,
+                lambda_val=1.0,
+                lambda_pull=opt.proto_lambda_pull,
+                lambda_sep=opt.proto_lambda_sep,
+                lambda_cons=opt.proto_lambda_cons,
+                conf_thresh=opt.proto_conf_thresh,
+                sep_margin=opt.proto_sep_margin,
+            )
+            loss_proto_raw = proto_outputs["loss"]
+            loss_proto = proto_coeff * loss_proto_raw
+            proto_pull_loss = proto_outputs["pull_loss"]
+            proto_sep_loss = proto_outputs["sep_loss"]
+            proto_cons_loss = proto_outputs["cons_loss"]
+            proto_avg_entropy = proto_outputs["avg_entropy"]
+            proto_avg_assign_conf = proto_outputs["avg_assign_conf"]
+            proto_avg_confidence = proto_outputs["avg_proto_confidence"]
+            proto_confident_ratio = proto_outputs["confident_ratio"]
+            proto_avg_margin = proto_outputs["avg_proto_margin"]
+            proto_active_ratio = proto_outputs["active_proto_ratio"]
+            proto_usage_max = proto_outputs["usage_max"]
+            prototype_bank.ema_update(
+                proto_outputs["update_features"],
+                proto_outputs["update_probs"],
+                proto_outputs["update_confidence"],
+                confidence_thresh=opt.proto_conf_thresh,
+            )
+            loss = loss + loss_proto
+
+        if iteration % 100 == 0 and (sugar_active or graph_active or proto_active):
             loss_obj_3d_value = loss_obj_3d.item() if loss_obj_3d is not None else 0.0
             message = (
                 f"[Iter {iteration}] "
@@ -312,6 +375,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
             else:
                 print(message.rstrip(", "))
+            if proto_active:
+                print(
+                    f"[Iter {iteration}] "
+                    + f"proto_coeff={proto_coeff.item():.6f}, "
+                    + f"loss_proto_raw={loss_proto_raw.item():.6f}, "
+                    + f"loss_proto={loss_proto.item():.6f}, "
+                    + f"proto_pull_loss={proto_pull_loss.item():.6f}, "
+                    + f"proto_sep_loss={proto_sep_loss.item():.6f}, "
+                    + f"proto_cons_loss={proto_cons_loss.item():.6f}, "
+                    + f"proto_avg_entropy={proto_avg_entropy.item():.6f}, "
+                    + f"proto_avg_assign_conf={proto_avg_assign_conf.item():.6f}, "
+                    + f"proto_avg_confidence={proto_avg_confidence.item():.6f}, "
+                    + f"proto_confident_ratio={proto_confident_ratio.item():.6f}, "
+                    + f"proto_avg_margin={proto_avg_margin.item():.6f}, "
+                    + f"proto_active_ratio={proto_active_ratio.item():.6f}, "
+                    + f"proto_usage_max={proto_usage_max.item():.6f}"
+                )
 
 
         loss.backward()
@@ -328,11 +408,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 torch.save(classifier.state_dict(), os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),'classifier.pth'))
+                if prototype_bank is not None:
+                    torch.save(
+                        prototype_bank.state_dict(),
+                        os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration), 'prototype_bank.pth')
+                    )
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -373,7 +458,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -383,6 +468,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
             "train_loss_patches/sugar_coeff": sugar_coeff.item(),
             "train_loss_patches/graph_active": float(graph_active),
             "train_loss_patches/graph_coeff": graph_coeff.item(),
+            "train_loss_patches/proto_active": float(proto_active),
+            "train_loss_patches/proto_coeff": proto_coeff.item(),
             "iter_time": elapsed,
             "iter": iteration
         }
@@ -426,6 +513,22 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/sem_high_conf_same_ratio": sem_high_conf_same_ratio.item(),
                 "train_loss_patches/semantic_pos_keep_ratio": semantic_pos_keep_ratio.item(),
                 "train_loss_patches/semantic_neg_keep_ratio": semantic_neg_keep_ratio.item(),
+            })
+
+        if proto_active:
+            log_data.update({
+                "train_loss_patches/loss_proto_raw": loss_proto_raw.item(),
+                "train_loss_patches/loss_proto": loss_proto.item(),
+                "train_loss_patches/proto_pull_loss": proto_pull_loss.item(),
+                "train_loss_patches/proto_sep_loss": proto_sep_loss.item(),
+                "train_loss_patches/proto_cons_loss": proto_cons_loss.item(),
+                "train_loss_patches/proto_avg_entropy": proto_avg_entropy.item(),
+                "train_loss_patches/proto_avg_assign_conf": proto_avg_assign_conf.item(),
+                "train_loss_patches/proto_avg_confidence": proto_avg_confidence.item(),
+                "train_loss_patches/proto_confident_ratio": proto_confident_ratio.item(),
+                "train_loss_patches/proto_avg_margin": proto_avg_margin.item(),
+                "train_loss_patches/proto_active_ratio": proto_active_ratio.item(),
+                "train_loss_patches/proto_usage_max": proto_usage_max.item(),
             })
 
         wandb.log(log_data)
@@ -532,6 +635,19 @@ if __name__ == "__main__":
     args.graph_alpha_mv = config.get("graph_alpha_mv", args.graph_alpha_mv)
     args.graph_pos_reliability_thresh = config.get("graph_pos_reliability_thresh", args.graph_pos_reliability_thresh)
     args.graph_neg_reliability_thresh = config.get("graph_neg_reliability_thresh", args.graph_neg_reliability_thresh)
+    args.use_proto = config.get("use_proto", args.use_proto)
+    args.num_prototypes = config.get("num_prototypes", args.num_prototypes)
+    args.proto_start_iter = config.get("proto_start_iter", args.proto_start_iter)
+    args.proto_interval = config.get("proto_interval", args.proto_interval)
+    args.proto_weight_lambda = config.get("proto_weight_lambda", args.proto_weight_lambda)
+    args.proto_warmup_iters = config.get("proto_warmup_iters", args.proto_warmup_iters)
+    args.proto_tau = config.get("proto_tau", args.proto_tau)
+    args.proto_conf_thresh = config.get("proto_conf_thresh", args.proto_conf_thresh)
+    args.proto_ema_momentum = config.get("proto_ema_momentum", args.proto_ema_momentum)
+    args.proto_lambda_pull = config.get("proto_lambda_pull", args.proto_lambda_pull)
+    args.proto_lambda_sep = config.get("proto_lambda_sep", args.proto_lambda_sep)
+    args.proto_lambda_cons = config.get("proto_lambda_cons", args.proto_lambda_cons)
+    args.proto_sep_margin = config.get("proto_sep_margin", args.proto_sep_margin)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)

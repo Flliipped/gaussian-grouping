@@ -130,6 +130,20 @@ class OptimizationParams(ParamGroup):
         self.graph_alpha_residual = 2.0
         self.graph_alpha_mv = 1.0
 
+        self.use_proto = False
+        self.num_prototypes = 16
+        self.proto_start_iter = 18_000
+        self.proto_interval = 10
+        self.proto_weight_lambda = 0.1
+        self.proto_warmup_iters = 2000
+        self.proto_tau = 0.2
+        self.proto_conf_thresh = 0.2
+        self.proto_ema_momentum = 0.95
+        self.proto_lambda_pull = 1.0
+        self.proto_lambda_sep = 0.1
+        self.proto_lambda_cons = 0.25
+        self.proto_sep_margin = 0.2
+
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter
         self.geo_interval = self.graph_interval
