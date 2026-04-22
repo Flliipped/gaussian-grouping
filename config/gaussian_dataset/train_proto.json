@@ -58,10 +58,10 @@
     "proto_weight_lambda": 0.03,
     "proto_warmup_iters": 4000,
     "proto_tau": 0.1,
-    "proto_conf_thresh": 0.3,
+    "proto_conf_thresh": 0.35,
     "proto_ema_momentum": 0.95,
     "proto_lambda_pull": 1.0,
-    "proto_lambda_sep": 0.1,
-    "proto_lambda_cons": 0.1,
+    "proto_lambda_sep": 0.05,
+    "proto_lambda_cons": 0.3,
     "proto_sep_margin": 0.2
 }

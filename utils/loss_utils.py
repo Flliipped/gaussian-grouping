@@ -789,7 +789,7 @@ def loss_prototype_learning(
 
     unique_proto_idx = assigned_proto_idx[unique_indices]
     unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
-    pull_weight = proto_confidence * confident_mask
+    pull_weight = proto_confidence * unique_assign_conf * confident_mask
     pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
     pull_loss = (pull_weight * pull_distance).sum() / (pull_weight.sum() + eps)
 
@@ -804,8 +804,12 @@ def loss_prototype_learning(
 
     sample_probs = assignment_probs[graph_data["sample_indices"]]
     neighbor_probs = assignment_probs[graph_data["neighbor_indices"]]
-    cons_weight = graph_data["positive_mask"] * graph_data["reliability"]
-    prob_diff = ((sample_probs.unsqueeze(1) - neighbor_probs) ** 2).mean(dim=-1)
+    cons_weight = (
+        graph_data["positive_mask"]
+        * graph_data["reliability"]
+        * graph_data["semantic_pos_factor"]
+    )
+    prob_diff = ((sample_probs.unsqueeze(1) - neighbor_probs) ** 2).sum(dim=-1)
     cons_loss = (cons_weight * prob_diff).sum() / (cons_weight.sum() + eps)
 
     total_loss = lambda_pull * pull_loss + lambda_sep * sep_loss + lambda_cons * cons_loss
