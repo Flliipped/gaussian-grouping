@@ -143,6 +143,10 @@ class OptimizationParams(ParamGroup):
         self.proto_lambda_sep = 0.1
         self.proto_lambda_cons = 0.25
         self.proto_sep_margin = 0.2
+        self.proto_reliability_thresh = 0.0
+        self.proto_entropy_thresh = 1.0
+        self.proto_assign_conf_thresh = 0.0
+        self.proto_sem_invalid_weight = 1.0
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter

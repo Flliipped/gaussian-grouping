@@ -729,6 +729,10 @@ def loss_prototype_learning(
     lambda_cons=0.1,
     conf_thresh=0.2,
     sep_margin=0.2,
+    reliability_thresh=0.0,
+    entropy_thresh=1.0,
+    assign_conf_thresh=0.0,
+    sem_invalid_weight=1.0,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -781,15 +785,21 @@ def loss_prototype_learning(
     point_sem_gate = torch.where(
         point_sem_valid,
         point_sem_confidence,
-        torch.ones_like(point_sem_confidence),
+        torch.full_like(point_sem_confidence, sem_invalid_weight),
     )
+    interior_mask = (
+        (point_reliability >= reliability_thresh)
+        & (unique_entropy <= entropy_thresh)
+        & (unique_assign_conf >= assign_conf_thresh)
+    ).to(unique_features.dtype)
 
     proto_confidence = (1.0 - unique_entropy) * point_reliability * point_sem_gate
-    confident_mask = (proto_confidence >= conf_thresh).to(unique_features.dtype)
+    gated_proto_confidence = proto_confidence * interior_mask
+    confident_mask = (gated_proto_confidence >= conf_thresh).to(unique_features.dtype)
 
     unique_proto_idx = assigned_proto_idx[unique_indices]
     unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
-    pull_weight = proto_confidence * unique_assign_conf * confident_mask
+    pull_weight = gated_proto_confidence * unique_assign_conf * confident_mask
     pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
     pull_loss = (pull_weight * pull_distance).sum() / (pull_weight.sum() + eps)
 
@@ -827,14 +837,14 @@ def loss_prototype_learning(
         "cons_loss": cons_loss,
         "avg_entropy": unique_entropy.mean(),
         "avg_assign_conf": unique_assign_conf.mean(),
-        "avg_proto_confidence": proto_confidence.mean(),
+        "avg_proto_confidence": gated_proto_confidence.mean(),
         "confident_ratio": confident_mask.mean(),
         "avg_proto_margin": unique_assign_margin.mean(),
         "active_proto_ratio": active_proto_ratio,
         "usage_max": usage.max(),
         "update_features": unique_features.detach(),
         "update_probs": unique_probs.detach(),
-        "update_confidence": proto_confidence.detach(),
+        "update_confidence": gated_proto_confidence.detach(),
     }
 
 

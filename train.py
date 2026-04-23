@@ -309,6 +309,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 lambda_cons=opt.proto_lambda_cons,
                 conf_thresh=opt.proto_conf_thresh,
                 sep_margin=opt.proto_sep_margin,
+                reliability_thresh=opt.proto_reliability_thresh,
+                entropy_thresh=opt.proto_entropy_thresh,
+                assign_conf_thresh=opt.proto_assign_conf_thresh,
+                sem_invalid_weight=opt.proto_sem_invalid_weight,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -656,6 +660,10 @@ if __name__ == "__main__":
     args.proto_lambda_sep = config.get("proto_lambda_sep", args.proto_lambda_sep)
     args.proto_lambda_cons = config.get("proto_lambda_cons", args.proto_lambda_cons)
     args.proto_sep_margin = config.get("proto_sep_margin", args.proto_sep_margin)
+    args.proto_reliability_thresh = config.get("proto_reliability_thresh", args.proto_reliability_thresh)
+    args.proto_entropy_thresh = config.get("proto_entropy_thresh", args.proto_entropy_thresh)
+    args.proto_assign_conf_thresh = config.get("proto_assign_conf_thresh", args.proto_assign_conf_thresh)
+    args.proto_sem_invalid_weight = config.get("proto_sem_invalid_weight", args.proto_sem_invalid_weight)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
