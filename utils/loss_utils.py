@@ -733,6 +733,11 @@ def loss_prototype_learning(
     entropy_thresh=1.0,
     assign_conf_thresh=0.0,
     sem_invalid_weight=1.0,
+    update_conf_thresh=None,
+    update_reliability_thresh=None,
+    update_entropy_thresh=None,
+    update_assign_conf_thresh=None,
+    update_sem_invalid_weight=None,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -751,6 +756,8 @@ def loss_prototype_learning(
             "avg_assign_conf": zero,
             "avg_proto_confidence": zero,
             "confident_ratio": zero,
+            "update_avg_confidence": zero,
+            "update_confident_ratio": zero,
             "avg_proto_margin": zero,
             "active_proto_ratio": zero,
             "usage_max": zero,
@@ -758,6 +765,17 @@ def loss_prototype_learning(
             "update_probs": None,
             "update_confidence": None,
         }
+
+    if update_conf_thresh is None:
+        update_conf_thresh = conf_thresh
+    if update_reliability_thresh is None:
+        update_reliability_thresh = reliability_thresh
+    if update_entropy_thresh is None:
+        update_entropy_thresh = entropy_thresh
+    if update_assign_conf_thresh is None:
+        update_assign_conf_thresh = assign_conf_thresh
+    if update_sem_invalid_weight is None:
+        update_sem_invalid_weight = sem_invalid_weight
 
     feature_indices = graph_data["feature_indices"]
     selected_features = F.normalize(features[feature_indices], dim=-1, eps=eps)
@@ -782,24 +800,35 @@ def loss_prototype_learning(
     point_reliability = graph_data["point_reliability"].to(unique_features.dtype)
     point_sem_confidence = graph_data["point_sem_confidence"].to(unique_features.dtype)
     point_sem_valid = graph_data["point_sem_valid"]
-    point_sem_gate = torch.where(
+    pull_sem_gate = torch.where(
         point_sem_valid,
         point_sem_confidence,
         torch.full_like(point_sem_confidence, sem_invalid_weight),
     )
-    interior_mask = (
+    pull_mask = (
         (point_reliability >= reliability_thresh)
         & (unique_entropy <= entropy_thresh)
         & (unique_assign_conf >= assign_conf_thresh)
     ).to(unique_features.dtype)
+    update_sem_gate = torch.where(
+        point_sem_valid,
+        point_sem_confidence,
+        torch.full_like(point_sem_confidence, update_sem_invalid_weight),
+    )
+    update_mask = (
+        (point_reliability >= update_reliability_thresh)
+        & (unique_entropy <= update_entropy_thresh)
+        & (unique_assign_conf >= update_assign_conf_thresh)
+    ).to(unique_features.dtype)
 
-    proto_confidence = (1.0 - unique_entropy) * point_reliability * point_sem_gate
-    gated_proto_confidence = proto_confidence * interior_mask
-    confident_mask = (gated_proto_confidence >= conf_thresh).to(unique_features.dtype)
+    pull_confidence = (1.0 - unique_entropy) * point_reliability * pull_sem_gate * pull_mask
+    confident_mask = (pull_confidence >= conf_thresh).to(unique_features.dtype)
+    update_confidence = (1.0 - unique_entropy) * point_reliability * update_sem_gate * update_mask
+    update_confident_mask = (update_confidence >= update_conf_thresh).to(unique_features.dtype)
 
     unique_proto_idx = assigned_proto_idx[unique_indices]
     unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
-    pull_weight = gated_proto_confidence * unique_assign_conf * confident_mask
+    pull_weight = pull_confidence * unique_assign_conf * confident_mask
     pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
     pull_loss = (pull_weight * pull_distance).sum() / (pull_weight.sum() + eps)
 
@@ -837,14 +866,16 @@ def loss_prototype_learning(
         "cons_loss": cons_loss,
         "avg_entropy": unique_entropy.mean(),
         "avg_assign_conf": unique_assign_conf.mean(),
-        "avg_proto_confidence": gated_proto_confidence.mean(),
+        "avg_proto_confidence": pull_confidence.mean(),
         "confident_ratio": confident_mask.mean(),
+        "update_avg_confidence": update_confidence.mean(),
+        "update_confident_ratio": update_confident_mask.mean(),
         "avg_proto_margin": unique_assign_margin.mean(),
         "active_proto_ratio": active_proto_ratio,
         "usage_max": usage.max(),
         "update_features": unique_features.detach(),
         "update_probs": unique_probs.detach(),
-        "update_confidence": gated_proto_confidence.detach(),
+        "update_confidence": update_confidence.detach(),
     }
 
 

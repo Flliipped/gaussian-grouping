@@ -201,6 +201,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_avg_assign_conf = torch.tensor(0.0, device=image.device)
         proto_avg_confidence = torch.tensor(0.0, device=image.device)
         proto_confident_ratio = torch.tensor(0.0, device=image.device)
+        proto_update_avg_confidence = torch.tensor(0.0, device=image.device)
+        proto_update_confident_ratio = torch.tensor(0.0, device=image.device)
         proto_avg_margin = torch.tensor(0.0, device=image.device)
         proto_active_ratio = torch.tensor(0.0, device=image.device)
         proto_usage_max = torch.tensor(0.0, device=image.device)
@@ -313,6 +315,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 entropy_thresh=opt.proto_entropy_thresh,
                 assign_conf_thresh=opt.proto_assign_conf_thresh,
                 sem_invalid_weight=opt.proto_sem_invalid_weight,
+                update_conf_thresh=opt.proto_update_conf_thresh,
+                update_reliability_thresh=opt.proto_update_reliability_thresh,
+                update_entropy_thresh=opt.proto_update_entropy_thresh,
+                update_assign_conf_thresh=opt.proto_update_assign_conf_thresh,
+                update_sem_invalid_weight=opt.proto_update_sem_invalid_weight,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -323,6 +330,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_avg_assign_conf = proto_outputs["avg_assign_conf"]
             proto_avg_confidence = proto_outputs["avg_proto_confidence"]
             proto_confident_ratio = proto_outputs["confident_ratio"]
+            proto_update_avg_confidence = proto_outputs["update_avg_confidence"]
+            proto_update_confident_ratio = proto_outputs["update_confident_ratio"]
             proto_avg_margin = proto_outputs["avg_proto_margin"]
             proto_active_ratio = proto_outputs["active_proto_ratio"]
             proto_usage_max = proto_outputs["usage_max"]
@@ -392,6 +401,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"proto_avg_assign_conf={proto_avg_assign_conf.item():.6f}, "
                     + f"proto_avg_confidence={proto_avg_confidence.item():.6f}, "
                     + f"proto_confident_ratio={proto_confident_ratio.item():.6f}, "
+                    + f"proto_update_avg_confidence={proto_update_avg_confidence.item():.6f}, "
+                    + f"proto_update_confident_ratio={proto_update_confident_ratio.item():.6f}, "
                     + f"proto_avg_margin={proto_avg_margin.item():.6f}, "
                     + f"proto_active_ratio={proto_active_ratio.item():.6f}, "
                     + f"proto_usage_max={proto_usage_max.item():.6f}"
@@ -408,7 +419,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     proto_update_features,
                     proto_update_probs,
                     proto_update_confidence,
-                    confidence_thresh=opt.proto_conf_thresh,
+                    confidence_thresh=opt.proto_update_conf_thresh,
                 )
 
             # Progress bar
@@ -420,7 +431,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -470,7 +481,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -538,6 +549,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/proto_avg_assign_conf": proto_avg_assign_conf.item(),
                 "train_loss_patches/proto_avg_confidence": proto_avg_confidence.item(),
                 "train_loss_patches/proto_confident_ratio": proto_confident_ratio.item(),
+                "train_loss_patches/proto_update_avg_confidence": proto_update_avg_confidence.item(),
+                "train_loss_patches/proto_update_confident_ratio": proto_update_confident_ratio.item(),
                 "train_loss_patches/proto_avg_margin": proto_avg_margin.item(),
                 "train_loss_patches/proto_active_ratio": proto_active_ratio.item(),
                 "train_loss_patches/proto_usage_max": proto_usage_max.item(),
@@ -664,6 +677,11 @@ if __name__ == "__main__":
     args.proto_entropy_thresh = config.get("proto_entropy_thresh", args.proto_entropy_thresh)
     args.proto_assign_conf_thresh = config.get("proto_assign_conf_thresh", args.proto_assign_conf_thresh)
     args.proto_sem_invalid_weight = config.get("proto_sem_invalid_weight", args.proto_sem_invalid_weight)
+    args.proto_update_conf_thresh = config.get("proto_update_conf_thresh", config.get("proto_conf_thresh", args.proto_update_conf_thresh))
+    args.proto_update_reliability_thresh = config.get("proto_update_reliability_thresh", config.get("proto_reliability_thresh", args.proto_update_reliability_thresh))
+    args.proto_update_entropy_thresh = config.get("proto_update_entropy_thresh", config.get("proto_entropy_thresh", args.proto_update_entropy_thresh))
+    args.proto_update_assign_conf_thresh = config.get("proto_update_assign_conf_thresh", config.get("proto_assign_conf_thresh", args.proto_update_assign_conf_thresh))
+    args.proto_update_sem_invalid_weight = config.get("proto_update_sem_invalid_weight", config.get("proto_sem_invalid_weight", args.proto_update_sem_invalid_weight))
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
