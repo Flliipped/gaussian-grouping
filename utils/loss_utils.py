@@ -732,6 +732,10 @@ def loss_prototype_learning(
     cons_conf_power=1.0,
     cons_conf_normalize=True,
     cons_conf_norm_max=2.0,
+    cons_scene_weight=0.0,
+    cons_scene_floor=0.5,
+    cons_scene_conf_min=0.05,
+    cons_scene_conf_target=0.15,
     conf_thresh=0.2,
     sep_margin=0.2,
     reliability_thresh=0.0,
@@ -759,6 +763,7 @@ def loss_prototype_learning(
             "cons_loss": zero,
             "cons_conf_mean": zero,
             "cons_adaptive_factor_mean": zero,
+            "cons_scene_scale": zero,
             "avg_entropy": zero,
             "avg_assign_conf": zero,
             "avg_proto_confidence": zero,
@@ -858,8 +863,12 @@ def loss_prototype_learning(
     cons_weight = base_cons_weight
     cons_conf_mean = zero
     cons_adaptive_factor_mean = selected_features.new_tensor(1.0)
+    cons_scene_scale = selected_features.new_tensor(1.0)
+    positive_mask = graph_data["positive_mask"]
+    positive_count = positive_mask.sum()
+    pair_conf = None
 
-    if cons_conf_weight > 0.0:
+    if cons_conf_weight > 0.0 or cons_scene_weight > 0.0:
         selected_proto_conf = selected_features.new_zeros(selected_features.shape[0])
         unique_cons_conf = (pull_confidence * unique_assign_conf * confident_mask).detach()
         selected_proto_conf[unique_indices] = unique_cons_conf.clamp_min(0.0)
@@ -867,21 +876,20 @@ def loss_prototype_learning(
         sample_conf = selected_proto_conf[graph_data["sample_indices"]]
         neighbor_conf = selected_proto_conf[graph_data["neighbor_indices"]]
         pair_conf = torch.sqrt(sample_conf.unsqueeze(-1) * neighbor_conf).clamp_min(0.0)
-
-        positive_mask = graph_data["positive_mask"]
-        positive_count = positive_mask.sum()
         cons_conf_mean = (positive_mask * pair_conf).sum() / (positive_count + eps)
 
+    if cons_conf_weight > 0.0 and pair_conf is not None:
+        edge_pair_conf = pair_conf
         if cons_conf_normalize:
             pair_conf_mean = cons_conf_mean.clamp_min(eps)
-            pair_conf = pair_conf / pair_conf_mean
+            edge_pair_conf = edge_pair_conf / pair_conf_mean
             if cons_conf_norm_max is not None and cons_conf_norm_max > 0:
-                pair_conf = pair_conf.clamp(max=float(cons_conf_norm_max))
+                edge_pair_conf = edge_pair_conf.clamp(max=float(cons_conf_norm_max))
 
         blend = min(max(float(cons_conf_weight), 0.0), 1.0)
         floor = min(max(float(cons_conf_floor), 0.0), 1.0)
         power = max(float(cons_conf_power), 0.0)
-        adaptive_factor = floor + (1.0 - floor) * pair_conf.pow(power)
+        adaptive_factor = floor + (1.0 - floor) * edge_pair_conf.pow(power)
         adaptive_factor = (1.0 - blend) + blend * adaptive_factor
         cons_weight = base_cons_weight * adaptive_factor
         cons_adaptive_factor_mean = (
@@ -891,7 +899,23 @@ def loss_prototype_learning(
     prob_diff = ((sample_probs.unsqueeze(1) - neighbor_probs) ** 2).sum(dim=-1)
     cons_loss = (cons_weight * prob_diff).sum() / (cons_weight.sum() + eps)
 
-    total_loss = lambda_pull * pull_loss + lambda_sep * sep_loss + lambda_cons * cons_loss
+    if cons_scene_weight > 0.0:
+        scene_blend = min(max(float(cons_scene_weight), 0.0), 1.0)
+        scene_floor = min(max(float(cons_scene_floor), 0.0), 1.0)
+        scene_conf_min = max(float(cons_scene_conf_min), 0.0)
+        scene_conf_target = max(float(cons_scene_conf_target), scene_conf_min + eps)
+        scene_conf_progress = (
+            (cons_conf_mean.detach() - scene_conf_min)
+            / (scene_conf_target - scene_conf_min)
+        ).clamp(0.0, 1.0)
+        scene_scale = scene_floor + (1.0 - scene_floor) * scene_conf_progress
+        cons_scene_scale = (1.0 - scene_blend) + scene_blend * scene_scale
+
+    total_loss = (
+        lambda_pull * pull_loss
+        + lambda_sep * sep_loss
+        + lambda_cons * cons_scene_scale * cons_loss
+    )
     usage = torch.bincount(
         unique_proto_idx,
         minlength=prototype_bank.num_prototypes,
@@ -906,6 +930,7 @@ def loss_prototype_learning(
         "cons_loss": cons_loss,
         "cons_conf_mean": cons_conf_mean,
         "cons_adaptive_factor_mean": cons_adaptive_factor_mean,
+        "cons_scene_scale": cons_scene_scale,
         "avg_entropy": unique_entropy.mean(),
         "avg_assign_conf": unique_assign_conf.mean(),
         "avg_proto_confidence": pull_confidence.mean(),

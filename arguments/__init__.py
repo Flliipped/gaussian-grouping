@@ -147,6 +147,10 @@ class OptimizationParams(ParamGroup):
         self.proto_cons_conf_power = 1.0
         self.proto_cons_conf_normalize = True
         self.proto_cons_conf_norm_max = 2.0
+        self.proto_cons_scene_weight = 0.0
+        self.proto_cons_scene_floor = 0.5
+        self.proto_cons_scene_conf_min = 0.05
+        self.proto_cons_scene_conf_target = 0.15
         self.proto_sep_margin = 0.2
         self.proto_reliability_thresh = 0.0
         self.proto_entropy_thresh = 1.0
