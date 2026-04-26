@@ -736,6 +736,9 @@ def loss_prototype_learning(
     cons_scene_floor=0.5,
     cons_scene_conf_min=0.05,
     cons_scene_conf_target=0.15,
+    cons_agree_weight=0.0,
+    cons_agree_floor=0.4,
+    cons_agree_conf_thresh=0.0,
     conf_thresh=0.2,
     sep_margin=0.2,
     reliability_thresh=0.0,
@@ -764,6 +767,8 @@ def loss_prototype_learning(
             "cons_conf_mean": zero,
             "cons_adaptive_factor_mean": zero,
             "cons_scene_scale": zero,
+            "cons_agree_ratio": zero,
+            "cons_agree_factor_mean": zero,
             "avg_entropy": zero,
             "avg_assign_conf": zero,
             "avg_proto_confidence": zero,
@@ -864,6 +869,8 @@ def loss_prototype_learning(
     cons_conf_mean = zero
     cons_adaptive_factor_mean = selected_features.new_tensor(1.0)
     cons_scene_scale = selected_features.new_tensor(1.0)
+    cons_agree_ratio = zero
+    cons_agree_factor_mean = selected_features.new_tensor(1.0)
     positive_mask = graph_data["positive_mask"]
     positive_count = positive_mask.sum()
     pair_conf = None
@@ -894,6 +901,35 @@ def loss_prototype_learning(
         cons_weight = base_cons_weight * adaptive_factor
         cons_adaptive_factor_mean = (
             positive_mask * adaptive_factor
+        ).sum() / (positive_count + eps)
+
+    if cons_agree_weight > 0.0:
+        sample_proto_idx = assigned_proto_idx[graph_data["sample_indices"]]
+        neighbor_proto_idx = assigned_proto_idx[graph_data["neighbor_indices"]]
+        sample_assign_conf = assign_conf[graph_data["sample_indices"]]
+        neighbor_assign_conf = assign_conf[graph_data["neighbor_indices"]]
+
+        same_proto = sample_proto_idx.unsqueeze(-1) == neighbor_proto_idx
+        conf_thresh_value = float(cons_agree_conf_thresh)
+        if conf_thresh_value > 0.0:
+            confident_pair = (
+                (sample_assign_conf.unsqueeze(-1) >= conf_thresh_value)
+                & (neighbor_assign_conf >= conf_thresh_value)
+            )
+            agree_mask = same_proto & confident_pair
+        else:
+            agree_mask = same_proto
+
+        agree_mask = agree_mask.to(base_cons_weight.dtype)
+        agree_ratio = (positive_mask * agree_mask).sum() / (positive_count + eps)
+        agree_blend = min(max(float(cons_agree_weight), 0.0), 1.0)
+        agree_floor = min(max(float(cons_agree_floor), 0.0), 1.0)
+        agree_factor = agree_floor + (1.0 - agree_floor) * agree_mask
+        agree_factor = (1.0 - agree_blend) + agree_blend * agree_factor
+        cons_weight = cons_weight * agree_factor
+        cons_agree_ratio = agree_ratio
+        cons_agree_factor_mean = (
+            positive_mask * agree_factor
         ).sum() / (positive_count + eps)
 
     prob_diff = ((sample_probs.unsqueeze(1) - neighbor_probs) ** 2).sum(dim=-1)
@@ -931,6 +967,8 @@ def loss_prototype_learning(
         "cons_conf_mean": cons_conf_mean,
         "cons_adaptive_factor_mean": cons_adaptive_factor_mean,
         "cons_scene_scale": cons_scene_scale,
+        "cons_agree_ratio": cons_agree_ratio,
+        "cons_agree_factor_mean": cons_agree_factor_mean,
         "avg_entropy": unique_entropy.mean(),
         "avg_assign_conf": unique_assign_conf.mean(),
         "avg_proto_confidence": pull_confidence.mean(),

@@ -200,6 +200,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_cons_conf_mean = torch.tensor(0.0, device=image.device)
         proto_cons_adaptive_factor_mean = torch.tensor(0.0, device=image.device)
         proto_cons_scene_scale = torch.tensor(0.0, device=image.device)
+        proto_cons_agree_ratio = torch.tensor(0.0, device=image.device)
+        proto_cons_agree_factor_mean = torch.tensor(0.0, device=image.device)
         proto_avg_entropy = torch.tensor(0.0, device=image.device)
         proto_avg_assign_conf = torch.tensor(0.0, device=image.device)
         proto_avg_confidence = torch.tensor(0.0, device=image.device)
@@ -321,6 +323,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 cons_scene_floor=opt.proto_cons_scene_floor,
                 cons_scene_conf_min=opt.proto_cons_scene_conf_min,
                 cons_scene_conf_target=opt.proto_cons_scene_conf_target,
+                cons_agree_weight=opt.proto_cons_agree_weight,
+                cons_agree_floor=opt.proto_cons_agree_floor,
+                cons_agree_conf_thresh=opt.proto_cons_agree_conf_thresh,
                 conf_thresh=opt.proto_conf_thresh,
                 sep_margin=opt.proto_sep_margin,
                 reliability_thresh=opt.proto_reliability_thresh,
@@ -341,6 +346,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_cons_conf_mean = proto_outputs["cons_conf_mean"]
             proto_cons_adaptive_factor_mean = proto_outputs["cons_adaptive_factor_mean"]
             proto_cons_scene_scale = proto_outputs["cons_scene_scale"]
+            proto_cons_agree_ratio = proto_outputs["cons_agree_ratio"]
+            proto_cons_agree_factor_mean = proto_outputs["cons_agree_factor_mean"]
             proto_avg_entropy = proto_outputs["avg_entropy"]
             proto_avg_assign_conf = proto_outputs["avg_assign_conf"]
             proto_avg_confidence = proto_outputs["avg_proto_confidence"]
@@ -415,6 +422,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"proto_cons_conf_mean={proto_cons_conf_mean.item():.6f}, "
                     + f"proto_cons_adaptive_factor_mean={proto_cons_adaptive_factor_mean.item():.6f}, "
                     + f"proto_cons_scene_scale={proto_cons_scene_scale.item():.6f}, "
+                    + f"proto_cons_agree_ratio={proto_cons_agree_ratio.item():.6f}, "
+                    + f"proto_cons_agree_factor_mean={proto_cons_agree_factor_mean.item():.6f}, "
                     + f"proto_avg_entropy={proto_avg_entropy.item():.6f}, "
                     + f"proto_avg_assign_conf={proto_avg_assign_conf.item():.6f}, "
                     + f"proto_avg_confidence={proto_avg_confidence.item():.6f}, "
@@ -449,7 +458,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_cons_agree_ratio, proto_cons_agree_factor_mean, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -499,7 +508,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_cons_agree_ratio, proto_cons_agree_factor_mean, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -566,6 +575,8 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/proto_cons_conf_mean": proto_cons_conf_mean.item(),
                 "train_loss_patches/proto_cons_adaptive_factor_mean": proto_cons_adaptive_factor_mean.item(),
                 "train_loss_patches/proto_cons_scene_scale": proto_cons_scene_scale.item(),
+                "train_loss_patches/proto_cons_agree_ratio": proto_cons_agree_ratio.item(),
+                "train_loss_patches/proto_cons_agree_factor_mean": proto_cons_agree_factor_mean.item(),
                 "train_loss_patches/proto_avg_entropy": proto_avg_entropy.item(),
                 "train_loss_patches/proto_avg_assign_conf": proto_avg_assign_conf.item(),
                 "train_loss_patches/proto_avg_confidence": proto_avg_confidence.item(),
@@ -702,6 +713,9 @@ if __name__ == "__main__":
     args.proto_cons_scene_floor = config.get("proto_cons_scene_floor", args.proto_cons_scene_floor)
     args.proto_cons_scene_conf_min = config.get("proto_cons_scene_conf_min", args.proto_cons_scene_conf_min)
     args.proto_cons_scene_conf_target = config.get("proto_cons_scene_conf_target", args.proto_cons_scene_conf_target)
+    args.proto_cons_agree_weight = config.get("proto_cons_agree_weight", args.proto_cons_agree_weight)
+    args.proto_cons_agree_floor = config.get("proto_cons_agree_floor", args.proto_cons_agree_floor)
+    args.proto_cons_agree_conf_thresh = config.get("proto_cons_agree_conf_thresh", args.proto_cons_agree_conf_thresh)
     args.proto_sep_margin = config.get("proto_sep_margin", args.proto_sep_margin)
     args.proto_reliability_thresh = config.get("proto_reliability_thresh", args.proto_reliability_thresh)
     args.proto_entropy_thresh = config.get("proto_entropy_thresh", args.proto_entropy_thresh)
