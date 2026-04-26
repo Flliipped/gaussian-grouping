@@ -32,6 +32,94 @@ import wandb
 import json
 
 
+def _proto_diag_scalar(proto_diag, key, default=0.0):
+    if not proto_diag or key not in proto_diag:
+        return default
+
+    value = proto_diag[key]
+    if torch.is_tensor(value):
+        value = value.detach()
+        if value.numel() == 0:
+            return default
+        if value.numel() > 1:
+            value = value.float().mean()
+        return value.item()
+    return float(value)
+
+
+def _proto_diag_tensor(proto_diag, key):
+    if not proto_diag or key not in proto_diag:
+        return None
+
+    value = proto_diag[key]
+    if not torch.is_tensor(value):
+        return None
+    value = value.detach()
+    if value.numel() == 0:
+        return None
+    return value
+
+
+def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
+    if not proto_diag:
+        return
+
+    scalar_keys = [
+        "proto_dead_count",
+        "proto_active_update_count",
+        "proto_usage_entropy",
+        "proto_update_usage_entropy",
+        "proto_usage_min",
+        "proto_usage_max",
+        "proto_usage_std",
+        "proto_update_usage_min",
+        "proto_update_usage_max",
+        "proto_update_usage_std",
+        "proto_pair_cosine_mean",
+        "proto_pair_cosine_max",
+        "proto_pair_cosine_p90",
+        "proto_entropy_p10",
+        "proto_entropy_p50",
+        "proto_entropy_p90",
+        "proto_assign_conf_p10",
+        "proto_assign_conf_p50",
+        "proto_assign_conf_p90",
+        "proto_margin_p10",
+        "proto_margin_p50",
+        "proto_margin_p90",
+        "proto_update_selected_count",
+        "proto_update_selected_ratio",
+        "proto_update_confidence_p50",
+        "proto_update_confidence_p90",
+        "proto_neg_boundary_entropy",
+        "proto_neg_boundary_assign_conf",
+        "proto_neg_boundary_selected_ratio",
+        "proto_uncertain_boundary_entropy",
+        "proto_uncertain_boundary_assign_conf",
+        "proto_uncertain_boundary_selected_ratio",
+    ]
+    for key in scalar_keys:
+        if key in proto_diag:
+            log_data[f"train_loss_patches/{key}"] = _proto_diag_scalar(proto_diag, key)
+
+    if iteration % 500 != 0:
+        return
+
+    for key in ["proto_usage_histogram", "proto_update_usage_histogram"]:
+        histogram = _proto_diag_tensor(proto_diag, key)
+        if histogram is not None:
+            log_data[f"train_loss_patches/{key}"] = wandb.Histogram(histogram.float().cpu().numpy())
+
+    usage_histogram = _proto_diag_tensor(proto_diag, "proto_usage_histogram")
+    update_usage_histogram = _proto_diag_tensor(proto_diag, "proto_update_usage_histogram")
+    if usage_histogram is not None and usage_histogram.numel() <= 32:
+        for proto_idx, usage_value in enumerate(usage_histogram.float().cpu().tolist()):
+            log_data[f"train_loss_patches/proto_usage_{proto_idx:02d}"] = usage_value
+    if update_usage_histogram is not None and update_usage_histogram.numel() <= 32:
+        for proto_idx, usage_value in enumerate(update_usage_histogram.float().cpu().tolist()):
+            log_data[f"train_loss_patches/proto_update_usage_{proto_idx:02d}"] = usage_value
+
+
 def _build_graph_support_cache(cameras, num_support):
     if cameras is None or len(cameras) == 0:
         return {}
@@ -214,6 +302,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_update_features = None
         proto_update_probs = None
         proto_update_confidence = None
+        proto_diag = {}
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
         proto_active = opt.use_proto and iteration >= opt.proto_start_iter and iteration % opt.proto_interval == 0
@@ -360,6 +449,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_update_features = proto_outputs["update_features"]
             proto_update_probs = proto_outputs["update_probs"]
             proto_update_confidence = proto_outputs["update_confidence"]
+            proto_diag = {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in proto_outputs.items()
+                if key.startswith("proto_")
+            }
             loss = loss + loss_proto
 
         if iteration % 100 == 0 and (sugar_active or graph_active or proto_active):
@@ -434,6 +528,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"proto_active_ratio={proto_active_ratio.item():.6f}, "
                     + f"proto_usage_max={proto_usage_max.item():.6f}"
                 )
+                if proto_diag:
+                    print(
+                        f"[Iter {iteration}] "
+                        + "proto_diag: "
+                        + f"dead={_proto_diag_scalar(proto_diag, 'proto_dead_count'):.0f}, "
+                        + f"active_update={_proto_diag_scalar(proto_diag, 'proto_active_update_count'):.0f}, "
+                        + f"usage_entropy={_proto_diag_scalar(proto_diag, 'proto_usage_entropy'):.6f}, "
+                        + f"update_usage_entropy={_proto_diag_scalar(proto_diag, 'proto_update_usage_entropy'):.6f}, "
+                        + f"usage_min={_proto_diag_scalar(proto_diag, 'proto_usage_min'):.6f}, "
+                        + f"usage_max={_proto_diag_scalar(proto_diag, 'proto_usage_max'):.6f}, "
+                        + f"usage_std={_proto_diag_scalar(proto_diag, 'proto_usage_std'):.6f}, "
+                        + f"update_usage_min={_proto_diag_scalar(proto_diag, 'proto_update_usage_min'):.6f}, "
+                        + f"update_usage_max={_proto_diag_scalar(proto_diag, 'proto_update_usage_max'):.6f}, "
+                        + f"update_usage_std={_proto_diag_scalar(proto_diag, 'proto_update_usage_std'):.6f}, "
+                        + f"pair_cos_max={_proto_diag_scalar(proto_diag, 'proto_pair_cosine_max'):.6f}, "
+                        + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
+                        + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
+                        + f"update_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_update_selected_ratio'):.6f}, "
+                        + f"neg_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_neg_boundary_selected_ratio'):.6f}, "
+                        + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}"
+                    )
 
 
         loss.backward()
@@ -458,7 +573,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_cons_agree_ratio, proto_cons_agree_factor_mean, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb)
+            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_cons_agree_ratio, proto_cons_agree_factor_mean, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, proto_diag, use_wandb)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -508,7 +623,7 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_cons_agree_ratio, proto_cons_agree_factor_mean, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, use_wandb):
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, loss_sugar_raw, loss_sugar, sugar_coeff, sugar_active, sugar_axis_align_cosine, sugar_plane_residual, sugar_flat_ratio, loss_graph_raw, loss_graph, graph_coeff, graph_active, graph_pos_ratio, graph_neg_ratio, graph_ignore_ratio, avg_reliability, avg_pos_reliability, avg_neg_reliability, avg_mv_consistency, avg_plane_residual, pos_loss, neg_loss, avg_feature_norm, avg_normal_cosine, avg_pos_cosine, avg_neg_cosine, avg_hard_neg_cosine, active_neg_ratio, avg_sem_valid_views, avg_sem_confidence, sem_valid_point_ratio, sem_pair_valid_ratio, sem_high_conf_same_ratio, semantic_pos_keep_ratio, semantic_neg_keep_ratio, loss_proto_raw, loss_proto, proto_coeff, proto_active, proto_pull_loss, proto_sep_loss, proto_cons_loss, proto_cons_conf_mean, proto_cons_adaptive_factor_mean, proto_cons_scene_scale, proto_cons_agree_ratio, proto_cons_agree_factor_mean, proto_avg_entropy, proto_avg_assign_conf, proto_avg_confidence, proto_confident_ratio, proto_update_avg_confidence, proto_update_confident_ratio, proto_avg_margin, proto_active_ratio, proto_usage_max, proto_diag, use_wandb):
 
     if use_wandb:
         log_data = {
@@ -587,6 +702,7 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                 "train_loss_patches/proto_active_ratio": proto_active_ratio.item(),
                 "train_loss_patches/proto_usage_max": proto_usage_max.item(),
             })
+            _add_proto_diag_wandb_logs(log_data, proto_diag, iteration)
 
         wandb.log(log_data)
 

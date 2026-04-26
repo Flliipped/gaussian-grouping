@@ -719,6 +719,274 @@ def loss_graph_contrastive(
     )
 
 
+def _prototype_zero_diagnostics(zero, num_prototypes=0):
+    with torch.no_grad():
+        zero = zero.detach()
+        histogram = zero.new_zeros((max(int(num_prototypes), 0),))
+        return {
+            "proto_usage_histogram": histogram,
+            "proto_update_usage_histogram": histogram.clone(),
+            "proto_dead_count": zero,
+            "proto_active_update_count": zero,
+            "proto_usage_entropy": zero,
+            "proto_update_usage_entropy": zero,
+            "proto_usage_min": zero,
+            "proto_usage_max": zero,
+            "proto_usage_std": zero,
+            "proto_update_usage_min": zero,
+            "proto_update_usage_max": zero,
+            "proto_update_usage_std": zero,
+            "proto_pair_cosine_mean": zero,
+            "proto_pair_cosine_max": zero,
+            "proto_pair_cosine_p90": zero,
+            "proto_entropy_p10": zero,
+            "proto_entropy_p50": zero,
+            "proto_entropy_p90": zero,
+            "proto_assign_conf_p10": zero,
+            "proto_assign_conf_p50": zero,
+            "proto_assign_conf_p90": zero,
+            "proto_margin_p10": zero,
+            "proto_margin_p50": zero,
+            "proto_margin_p90": zero,
+            "proto_update_selected_count": zero,
+            "proto_update_selected_ratio": zero,
+            "proto_update_confidence_p50": zero,
+            "proto_update_confidence_p90": zero,
+            "proto_neg_boundary_entropy": zero,
+            "proto_neg_boundary_assign_conf": zero,
+            "proto_neg_boundary_selected_ratio": zero,
+            "proto_uncertain_boundary_entropy": zero,
+            "proto_uncertain_boundary_assign_conf": zero,
+            "proto_uncertain_boundary_selected_ratio": zero,
+        }
+
+
+def _safe_quantiles(values, zero):
+    values = values.detach().reshape(-1)
+    if values.numel() == 0:
+        return zero, zero, zero
+
+    finite_values = values[torch.isfinite(values)]
+    if finite_values.numel() == 0:
+        return zero, zero, zero
+
+    sorted_values, _ = torch.sort(finite_values)
+    count = sorted_values.numel()
+    quantile_positions = sorted_values.new_tensor([0.1, 0.5, 0.9]) * (count - 1)
+    lower_indices = quantile_positions.floor().long().clamp(min=0, max=count - 1)
+    upper_indices = quantile_positions.ceil().long().clamp(min=0, max=count - 1)
+    weights = quantile_positions - lower_indices.to(dtype=quantile_positions.dtype)
+    quantiles = (
+        sorted_values[lower_indices] * (1.0 - weights)
+        + sorted_values[upper_indices] * weights
+    ).to(dtype=zero.dtype)
+    return quantiles[0], quantiles[1], quantiles[2]
+
+
+def _normalized_hist_entropy(histogram, zero, eps=1e-8):
+    histogram = histogram.detach().reshape(-1)
+    if histogram.numel() == 0:
+        return zero
+
+    positive_hist = histogram[histogram > 0]
+    if positive_hist.numel() == 0:
+        return zero
+
+    entropy = -(positive_hist * torch.log(positive_hist.clamp_min(eps))).sum()
+    entropy = entropy / max(log(max(histogram.numel(), 2)), eps)
+    return entropy.to(dtype=zero.dtype).detach()
+
+
+def _usage_stats(histogram, zero):
+    histogram = histogram.detach().reshape(-1)
+    if histogram.numel() == 0:
+        return zero, zero, zero
+
+    return (
+        histogram.min().to(dtype=zero.dtype).detach(),
+        histogram.max().to(dtype=zero.dtype).detach(),
+        histogram.std(unbiased=False).to(dtype=zero.dtype).detach(),
+    )
+
+
+def _boundary_unique_mask(graph_data, unique_indices, num_selected_points, edge_mask):
+    # Geometry-boundary proxy only: this is not a GT object boundary.
+    edge_mask = edge_mask.detach() > 0
+    if edge_mask.numel() == 0 or not edge_mask.any():
+        return torch.zeros(
+            (unique_indices.shape[0],),
+            device=unique_indices.device,
+            dtype=torch.bool,
+        )
+
+    sample_indices = graph_data["sample_indices"].detach()
+    neighbor_indices = graph_data["neighbor_indices"].detach()
+    active_sample_indices = sample_indices.unsqueeze(-1).expand_as(neighbor_indices)[edge_mask]
+    active_neighbor_indices = neighbor_indices[edge_mask]
+    active_point_indices = torch.cat([active_sample_indices, active_neighbor_indices], dim=0)
+
+    point_mask = torch.zeros(
+        (num_selected_points,),
+        device=unique_indices.device,
+        dtype=torch.bool,
+    )
+    point_mask[active_point_indices] = True
+    return point_mask[unique_indices.detach()]
+
+
+def _boundary_proto_stats(boundary_mask, entropy, assign_conf, selected_mask, zero, eps=1e-8):
+    boundary_mask = boundary_mask.detach().bool()
+    if boundary_mask.numel() == 0 or not boundary_mask.any():
+        return zero, zero, zero
+
+    boundary_count = boundary_mask.to(dtype=zero.dtype).sum().clamp_min(eps)
+    boundary_entropy = entropy.detach()[boundary_mask].mean().to(dtype=zero.dtype).detach()
+    boundary_assign_conf = assign_conf.detach()[boundary_mask].mean().to(dtype=zero.dtype).detach()
+    boundary_selected_ratio = (
+        (selected_mask.detach().bool() & boundary_mask).to(dtype=zero.dtype).sum()
+        / boundary_count
+    ).detach()
+    return boundary_entropy, boundary_assign_conf, boundary_selected_ratio
+
+
+def _prototype_diagnostics(
+    prototype_bank,
+    graph_data,
+    unique_indices,
+    num_selected_points,
+    unique_proto_idx,
+    unique_entropy,
+    unique_assign_conf,
+    unique_assign_margin,
+    update_confidence,
+    update_confident_mask,
+    zero,
+    eps=1e-8,
+):
+    with torch.no_grad():
+        num_prototypes = prototype_bank.num_prototypes
+        diagnostics = _prototype_zero_diagnostics(zero, num_prototypes)
+
+        proto_idx = unique_proto_idx.detach().long().reshape(-1)
+        update_selected = update_confident_mask.detach().bool().reshape(-1)
+        if proto_idx.numel() == 0:
+            return diagnostics
+
+        usage_counts = torch.bincount(proto_idx, minlength=num_prototypes).to(dtype=zero.dtype)
+        usage_histogram = usage_counts / usage_counts.sum().clamp_min(1.0)
+        update_proto_idx = proto_idx[update_selected]
+        update_usage_counts = torch.bincount(
+            update_proto_idx,
+            minlength=num_prototypes,
+        ).to(dtype=zero.dtype)
+        update_usage_histogram = update_usage_counts / update_usage_counts.sum().clamp_min(1.0)
+
+        usage_min, usage_max, usage_std = _usage_stats(usage_histogram, zero)
+        update_usage_min, update_usage_max, update_usage_std = _usage_stats(update_usage_histogram, zero)
+
+        entropy_p10, entropy_p50, entropy_p90 = _safe_quantiles(unique_entropy, zero)
+        assign_conf_p10, assign_conf_p50, assign_conf_p90 = _safe_quantiles(unique_assign_conf, zero)
+        margin_p10, margin_p50, margin_p90 = _safe_quantiles(unique_assign_margin, zero)
+
+        selected_update_confidence = update_confidence.detach().reshape(-1)[update_selected]
+        _, update_confidence_p50, update_confidence_p90 = _safe_quantiles(selected_update_confidence, zero)
+
+        pair_cosine_mean = zero
+        pair_cosine_max = zero
+        pair_cosine_p90 = zero
+        if num_prototypes >= 2:
+            prototypes = F.normalize(prototype_bank.prototypes.detach(), dim=-1, eps=eps)
+            prototype_cosine = torch.matmul(prototypes, prototypes.t())
+            off_diag_mask = ~torch.eye(
+                num_prototypes,
+                device=prototype_cosine.device,
+                dtype=torch.bool,
+            )
+            pair_cosine_values = prototype_cosine[off_diag_mask]
+            finite_pair_cosine = pair_cosine_values[torch.isfinite(pair_cosine_values)]
+            if finite_pair_cosine.numel() > 0:
+                pair_cosine_mean = finite_pair_cosine.mean().to(dtype=zero.dtype).detach()
+                pair_cosine_max = finite_pair_cosine.max().to(dtype=zero.dtype).detach()
+                _, _, pair_cosine_p90 = _safe_quantiles(finite_pair_cosine, zero)
+
+        neg_edge_mask = graph_data["negative_mask"].detach() > 0
+        uncertain_edge_mask = neg_edge_mask | (graph_data["ignore_mask"].detach() > 0)
+        neg_boundary_mask = _boundary_unique_mask(
+            graph_data,
+            unique_indices,
+            num_selected_points,
+            neg_edge_mask,
+        )
+        uncertain_boundary_mask = _boundary_unique_mask(
+            graph_data,
+            unique_indices,
+            num_selected_points,
+            uncertain_edge_mask,
+        )
+        (
+            neg_boundary_entropy,
+            neg_boundary_assign_conf,
+            neg_boundary_selected_ratio,
+        ) = _boundary_proto_stats(
+            neg_boundary_mask,
+            unique_entropy,
+            unique_assign_conf,
+            update_selected,
+            zero,
+            eps=eps,
+        )
+        (
+            uncertain_boundary_entropy,
+            uncertain_boundary_assign_conf,
+            uncertain_boundary_selected_ratio,
+        ) = _boundary_proto_stats(
+            uncertain_boundary_mask,
+            unique_entropy,
+            unique_assign_conf,
+            update_selected,
+            zero,
+            eps=eps,
+        )
+
+        diagnostics.update({
+            "proto_usage_histogram": usage_histogram.detach(),
+            "proto_update_usage_histogram": update_usage_histogram.detach(),
+            "proto_dead_count": (usage_counts == 0).to(dtype=zero.dtype).sum().detach(),
+            "proto_active_update_count": (update_usage_counts > 0).to(dtype=zero.dtype).sum().detach(),
+            "proto_usage_entropy": _normalized_hist_entropy(usage_histogram, zero, eps=eps),
+            "proto_update_usage_entropy": _normalized_hist_entropy(update_usage_histogram, zero, eps=eps),
+            "proto_usage_min": usage_min,
+            "proto_usage_max": usage_max,
+            "proto_usage_std": usage_std,
+            "proto_update_usage_min": update_usage_min,
+            "proto_update_usage_max": update_usage_max,
+            "proto_update_usage_std": update_usage_std,
+            "proto_pair_cosine_mean": pair_cosine_mean,
+            "proto_pair_cosine_max": pair_cosine_max,
+            "proto_pair_cosine_p90": pair_cosine_p90,
+            "proto_entropy_p10": entropy_p10,
+            "proto_entropy_p50": entropy_p50,
+            "proto_entropy_p90": entropy_p90,
+            "proto_assign_conf_p10": assign_conf_p10,
+            "proto_assign_conf_p50": assign_conf_p50,
+            "proto_assign_conf_p90": assign_conf_p90,
+            "proto_margin_p10": margin_p10,
+            "proto_margin_p50": margin_p50,
+            "proto_margin_p90": margin_p90,
+            "proto_update_selected_count": update_selected.to(dtype=zero.dtype).sum().detach(),
+            "proto_update_selected_ratio": update_selected.to(dtype=zero.dtype).mean().detach(),
+            "proto_update_confidence_p50": update_confidence_p50,
+            "proto_update_confidence_p90": update_confidence_p90,
+            "proto_neg_boundary_entropy": neg_boundary_entropy,
+            "proto_neg_boundary_assign_conf": neg_boundary_assign_conf,
+            "proto_neg_boundary_selected_ratio": neg_boundary_selected_ratio,
+            "proto_uncertain_boundary_entropy": uncertain_boundary_entropy,
+            "proto_uncertain_boundary_assign_conf": uncertain_boundary_assign_conf,
+            "proto_uncertain_boundary_selected_ratio": uncertain_boundary_selected_ratio,
+        })
+        return diagnostics
+
+
 def loss_prototype_learning(
     features,
     prototype_bank,
@@ -759,6 +1027,7 @@ def loss_prototype_learning(
         or not graph_data.get("valid", False)
         or features.numel() == 0
     ):
+        num_prototypes = prototype_bank.num_prototypes if prototype_bank is not None else 0
         return {
             "loss": zero,
             "pull_loss": zero,
@@ -778,6 +1047,7 @@ def loss_prototype_learning(
             "avg_proto_margin": zero,
             "active_proto_ratio": zero,
             "usage_max": zero,
+            **_prototype_zero_diagnostics(zero, num_prototypes),
             "update_features": None,
             "update_probs": None,
             "update_confidence": None,
@@ -958,6 +1228,20 @@ def loss_prototype_learning(
     ).to(unique_features.dtype)
     usage = usage / usage.sum().clamp_min(1.0)
     active_proto_ratio = (usage > (0.5 / max(prototype_bank.num_prototypes, 1))).to(usage.dtype).mean()
+    proto_diagnostics = _prototype_diagnostics(
+        prototype_bank=prototype_bank,
+        graph_data=graph_data,
+        unique_indices=unique_indices,
+        num_selected_points=selected_features.shape[0],
+        unique_proto_idx=unique_proto_idx,
+        unique_entropy=unique_entropy,
+        unique_assign_conf=unique_assign_conf,
+        unique_assign_margin=unique_assign_margin,
+        update_confidence=update_confidence,
+        update_confident_mask=update_confident_mask,
+        zero=zero,
+        eps=eps,
+    )
 
     return {
         "loss": lambda_val * total_loss,
@@ -978,6 +1262,7 @@ def loss_prototype_learning(
         "avg_proto_margin": unique_assign_margin.mean(),
         "active_proto_ratio": active_proto_ratio,
         "usage_max": usage.max(),
+        **proto_diagnostics,
         "update_features": unique_features.detach(),
         "update_probs": unique_probs.detach(),
         "update_confidence": update_confidence.detach(),
