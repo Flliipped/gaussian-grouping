@@ -91,6 +91,12 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_update_selected_ratio",
         "proto_update_confidence_p50",
         "proto_update_confidence_p90",
+        "proto_push_loss",
+        "proto_push_active_ratio",
+        "proto_push_weight_mean",
+        "proto_update_boundary_weight_mean",
+        "proto_update_neg_boundary_weight_mean",
+        "proto_update_ignore_boundary_weight_mean",
         "proto_neg_boundary_entropy",
         "proto_neg_boundary_assign_conf",
         "proto_neg_boundary_selected_ratio",
@@ -299,9 +305,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_avg_margin = torch.tensor(0.0, device=image.device)
         proto_active_ratio = torch.tensor(0.0, device=image.device)
         proto_usage_max = torch.tensor(0.0, device=image.device)
+        proto_push_loss = torch.tensor(0.0, device=image.device)
         proto_update_features = None
         proto_update_probs = None
         proto_update_confidence = None
+        proto_update_sample_weight = None
         proto_diag = {}
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
@@ -426,12 +434,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 update_entropy_thresh=opt.proto_update_entropy_thresh,
                 update_assign_conf_thresh=opt.proto_update_assign_conf_thresh,
                 update_sem_invalid_weight=opt.proto_update_sem_invalid_weight,
+                boundary_safe_update=opt.proto_boundary_safe_update,
+                update_neg_boundary_weight=opt.proto_update_neg_boundary_weight,
+                update_ignore_boundary_weight=opt.proto_update_ignore_boundary_weight,
+                lambda_push=opt.proto_lambda_push,
+                push_margin=opt.proto_push_margin,
+                push_conf_thresh=opt.proto_push_conf_thresh,
+                push_neg_boundary_weight=opt.proto_push_neg_boundary_weight,
+                push_ignore_boundary_weight=opt.proto_push_ignore_boundary_weight,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
             proto_pull_loss = proto_outputs["pull_loss"]
             proto_sep_loss = proto_outputs["sep_loss"]
             proto_cons_loss = proto_outputs["cons_loss"]
+            proto_push_loss = proto_outputs["push_loss"]
             proto_cons_conf_mean = proto_outputs["cons_conf_mean"]
             proto_cons_adaptive_factor_mean = proto_outputs["cons_adaptive_factor_mean"]
             proto_cons_scene_scale = proto_outputs["cons_scene_scale"]
@@ -449,6 +466,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_update_features = proto_outputs["update_features"]
             proto_update_probs = proto_outputs["update_probs"]
             proto_update_confidence = proto_outputs["update_confidence"]
+            proto_update_sample_weight = proto_outputs["update_sample_weight"]
             proto_diag = {
                 key: value.detach() if torch.is_tensor(value) else value
                 for key, value in proto_outputs.items()
@@ -513,6 +531,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     + f"proto_pull_loss={proto_pull_loss.item():.6f}, "
                     + f"proto_sep_loss={proto_sep_loss.item():.6f}, "
                     + f"proto_cons_loss={proto_cons_loss.item():.6f}, "
+                    + f"proto_push_loss={proto_push_loss.item():.6f}, "
                     + f"proto_cons_conf_mean={proto_cons_conf_mean.item():.6f}, "
                     + f"proto_cons_adaptive_factor_mean={proto_cons_adaptive_factor_mean.item():.6f}, "
                     + f"proto_cons_scene_scale={proto_cons_scene_scale.item():.6f}, "
@@ -543,6 +562,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"update_usage_max={_proto_diag_scalar(proto_diag, 'proto_update_usage_max'):.6f}, "
                         + f"update_usage_std={_proto_diag_scalar(proto_diag, 'proto_update_usage_std'):.6f}, "
                         + f"pair_cos_max={_proto_diag_scalar(proto_diag, 'proto_pair_cosine_max'):.6f}, "
+                        + f"push_active={_proto_diag_scalar(proto_diag, 'proto_push_active_ratio'):.6f}, "
+                        + f"push_weight_mean={_proto_diag_scalar(proto_diag, 'proto_push_weight_mean'):.6f}, "
+                        + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
                         + f"update_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_update_selected_ratio'):.6f}, "
@@ -562,6 +584,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     proto_update_probs,
                     proto_update_confidence,
                     confidence_thresh=opt.proto_update_conf_thresh,
+                    sample_weight=proto_update_sample_weight,
                 )
 
             # Progress bar
@@ -842,6 +865,14 @@ if __name__ == "__main__":
     args.proto_update_entropy_thresh = config.get("proto_update_entropy_thresh", config.get("proto_entropy_thresh", args.proto_update_entropy_thresh))
     args.proto_update_assign_conf_thresh = config.get("proto_update_assign_conf_thresh", config.get("proto_assign_conf_thresh", args.proto_update_assign_conf_thresh))
     args.proto_update_sem_invalid_weight = config.get("proto_update_sem_invalid_weight", config.get("proto_sem_invalid_weight", args.proto_update_sem_invalid_weight))
+    args.proto_boundary_safe_update = config.get("proto_boundary_safe_update", args.proto_boundary_safe_update)
+    args.proto_update_neg_boundary_weight = config.get("proto_update_neg_boundary_weight", args.proto_update_neg_boundary_weight)
+    args.proto_update_ignore_boundary_weight = config.get("proto_update_ignore_boundary_weight", args.proto_update_ignore_boundary_weight)
+    args.proto_lambda_push = config.get("proto_lambda_push", args.proto_lambda_push)
+    args.proto_push_margin = config.get("proto_push_margin", args.proto_push_margin)
+    args.proto_push_conf_thresh = config.get("proto_push_conf_thresh", args.proto_push_conf_thresh)
+    args.proto_push_neg_boundary_weight = config.get("proto_push_neg_boundary_weight", args.proto_push_neg_boundary_weight)
+    args.proto_push_ignore_boundary_weight = config.get("proto_push_ignore_boundary_weight", args.proto_push_ignore_boundary_weight)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)

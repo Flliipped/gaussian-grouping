@@ -164,6 +164,14 @@ class OptimizationParams(ParamGroup):
         self.proto_update_entropy_thresh = self.proto_entropy_thresh
         self.proto_update_assign_conf_thresh = self.proto_assign_conf_thresh
         self.proto_update_sem_invalid_weight = self.proto_sem_invalid_weight
+        self.proto_boundary_safe_update = False
+        self.proto_update_neg_boundary_weight = 1.0
+        self.proto_update_ignore_boundary_weight = 1.0
+        self.proto_lambda_push = 0.0
+        self.proto_push_margin = 0.1
+        self.proto_push_conf_thresh = 0.0
+        self.proto_push_neg_boundary_weight = 0.0
+        self.proto_push_ignore_boundary_weight = 0.3
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter

@@ -93,7 +93,7 @@ class ScenePrototypeBank(nn.Module):
         return logits, probs
 
     @torch.no_grad()
-    def ema_update(self, features, probs, confidence, confidence_thresh=0.2):
+    def ema_update(self, features, probs, confidence, confidence_thresh=0.2, sample_weight=None):
         if features.numel() == 0:
             return
 
@@ -110,13 +110,31 @@ class ScenePrototypeBank(nn.Module):
 
         selected_features = normalized_features[active_mask]
         selected_probs = probs.detach()[active_mask]
-        selected_conf = confidence[active_mask].unsqueeze(-1)
+        selected_conf = confidence[active_mask]
+        use_sample_weight = sample_weight is not None
+        if use_sample_weight:
+            sample_weight = sample_weight.detach().to(
+                device=confidence.device,
+                dtype=confidence.dtype,
+            ).reshape(-1).clamp(min=0.0)
+            if sample_weight.shape[0] != confidence.shape[0]:
+                raise ValueError(
+                    "sample_weight must have the same length as confidence in ScenePrototypeBank.ema_update"
+                )
+            selected_conf = selected_conf * sample_weight[active_mask]
+            nonzero_weight_mask = selected_conf > 0
+            if not nonzero_weight_mask.any():
+                return
+            selected_features = selected_features[nonzero_weight_mask]
+            selected_probs = selected_probs[nonzero_weight_mask]
+            selected_conf = selected_conf[nonzero_weight_mask]
+
         top_proto_idx = torch.argmax(selected_probs, dim=-1)
         hard_probs = F.one_hot(
             top_proto_idx,
             num_classes=self.num_prototypes,
         ).to(selected_probs.dtype)
-        weighted_probs = hard_probs * selected_conf
+        weighted_probs = hard_probs * selected_conf.unsqueeze(-1)
 
         proto_weight = weighted_probs.sum(dim=0)
         active_proto_mask = proto_weight > 0
@@ -134,5 +152,8 @@ class ScenePrototypeBank(nn.Module):
         )
         self.prototypes.copy_(updated)
 
-        usage_target = hard_probs.mean(dim=0)
+        if use_sample_weight:
+            usage_target = proto_weight / selected_conf.sum().clamp_min(self.eps)
+        else:
+            usage_target = hard_probs.mean(dim=0)
         self.usage_ema.mul_(self.momentum).add_((1.0 - self.momentum) * usage_target)

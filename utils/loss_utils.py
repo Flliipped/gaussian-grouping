@@ -752,6 +752,12 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_update_selected_ratio": zero,
             "proto_update_confidence_p50": zero,
             "proto_update_confidence_p90": zero,
+            "proto_push_loss": zero,
+            "proto_push_active_ratio": zero,
+            "proto_push_weight_mean": zero,
+            "proto_update_boundary_weight_mean": zero,
+            "proto_update_neg_boundary_weight_mean": zero,
+            "proto_update_ignore_boundary_weight_mean": zero,
             "proto_neg_boundary_entropy": zero,
             "proto_neg_boundary_assign_conf": zero,
             "proto_neg_boundary_selected_ratio": zero,
@@ -847,6 +853,96 @@ def _boundary_proto_stats(boundary_mask, entropy, assign_conf, selected_mask, ze
         / boundary_count
     ).detach()
     return boundary_entropy, boundary_assign_conf, boundary_selected_ratio
+
+
+def _prototype_boundary_masks(graph_data, unique_indices, num_selected_points):
+    with torch.no_grad():
+        neg_edge_mask = graph_data["negative_mask"].detach() > 0
+        ignore_edge_mask = graph_data["ignore_mask"].detach() > 0
+        neg_boundary_mask = _boundary_unique_mask(
+            graph_data,
+            unique_indices,
+            num_selected_points,
+            neg_edge_mask,
+        )
+        ignore_boundary_mask = _boundary_unique_mask(
+            graph_data,
+            unique_indices,
+            num_selected_points,
+            ignore_edge_mask,
+        ) & (~neg_boundary_mask)
+        return neg_boundary_mask.detach(), ignore_boundary_mask.detach()
+
+
+def _selected_weight_mean(weights, selected_mask, zero, eps=1e-8):
+    with torch.no_grad():
+        selected_mask = selected_mask.detach().bool()
+        if selected_mask.numel() == 0 or not selected_mask.any():
+            return zero
+        return (
+            weights.detach()[selected_mask].mean().to(dtype=zero.dtype).detach()
+        )
+
+
+def _feature_side_prototype_push_loss(
+    unique_features,
+    prototype_bank,
+    unique_proto_idx,
+    pull_confidence,
+    unique_assign_conf,
+    confident_mask,
+    neg_boundary_mask,
+    ignore_boundary_mask,
+    push_margin=0.1,
+    push_conf_thresh=0.0,
+    push_neg_boundary_weight=0.0,
+    push_ignore_boundary_weight=0.3,
+    zero=None,
+    eps=1e-8,
+):
+    if zero is None:
+        zero = unique_features.new_tensor(0.0)
+    if unique_features.numel() == 0 or prototype_bank.num_prototypes < 2:
+        return zero, zero, zero
+
+    prototypes = F.normalize(prototype_bank.prototypes.detach(), dim=-1, eps=eps)
+    proto_cosine = torch.matmul(unique_features, prototypes.t()).clamp(-1.0, 1.0)
+    target_proto_idx = unique_proto_idx.detach().long()
+    target_mask = F.one_hot(
+        target_proto_idx,
+        num_classes=prototype_bank.num_prototypes,
+    ).to(dtype=torch.bool)
+    s_pos = proto_cosine.gather(1, target_proto_idx.unsqueeze(-1)).squeeze(-1)
+    s_neg = proto_cosine.masked_fill(target_mask, -1e6).max(dim=-1).values
+    push_penalty = torch.relu(float(push_margin) + s_neg - s_pos)
+
+    with torch.no_grad():
+        boundary_weight = unique_features.new_ones(unique_features.shape[0])
+        boundary_weight = torch.where(
+            ignore_boundary_mask.detach().bool(),
+            boundary_weight.new_full(boundary_weight.shape, float(push_ignore_boundary_weight)),
+            boundary_weight,
+        )
+        boundary_weight = torch.where(
+            neg_boundary_mask.detach().bool(),
+            boundary_weight.new_full(boundary_weight.shape, float(push_neg_boundary_weight)),
+            boundary_weight,
+        )
+
+        push_mask = confident_mask.detach().bool()
+        if push_conf_thresh is not None and float(push_conf_thresh) > 0.0:
+            push_mask = push_mask & (pull_confidence.detach() >= float(push_conf_thresh))
+        push_weight = (
+            pull_confidence.detach().clamp_min(0.0)
+            * unique_assign_conf.detach().clamp_min(0.0)
+            * boundary_weight
+            * push_mask.to(dtype=unique_features.dtype)
+        )
+
+    push_loss = (push_weight * push_penalty).sum() / (push_weight.sum() + eps)
+    push_active_ratio = (push_weight > 0).to(unique_features.dtype).mean()
+    push_weight_mean = push_weight.mean()
+    return push_loss, push_active_ratio.detach(), push_weight_mean.detach()
 
 
 def _prototype_diagnostics(
@@ -1018,6 +1114,14 @@ def loss_prototype_learning(
     update_entropy_thresh=None,
     update_assign_conf_thresh=None,
     update_sem_invalid_weight=None,
+    boundary_safe_update=False,
+    update_neg_boundary_weight=1.0,
+    update_ignore_boundary_weight=1.0,
+    lambda_push=0.0,
+    push_margin=0.1,
+    push_conf_thresh=0.0,
+    push_neg_boundary_weight=0.0,
+    push_ignore_boundary_weight=0.3,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -1033,6 +1137,7 @@ def loss_prototype_learning(
             "pull_loss": zero,
             "sep_loss": zero,
             "cons_loss": zero,
+            "push_loss": zero,
             "cons_conf_mean": zero,
             "cons_adaptive_factor_mean": zero,
             "cons_scene_scale": zero,
@@ -1051,6 +1156,7 @@ def loss_prototype_learning(
             "update_features": None,
             "update_probs": None,
             "update_confidence": None,
+            "update_sample_weight": None,
         }
 
     if update_conf_thresh is None:
@@ -1112,6 +1218,46 @@ def loss_prototype_learning(
     confident_mask = (pull_confidence >= conf_thresh).to(unique_features.dtype)
     update_confidence = (1.0 - unique_entropy) * point_reliability * update_sem_gate * update_mask
     update_confident_mask = (update_confidence >= update_conf_thresh).to(unique_features.dtype)
+
+    neg_boundary_mask, ignore_boundary_mask = _prototype_boundary_masks(
+        graph_data,
+        unique_indices,
+        selected_features.shape[0],
+    )
+    update_sample_weight = None
+    with torch.no_grad():
+        update_boundary_weight = unique_features.new_ones(unique_features.shape[0])
+        if boundary_safe_update:
+            update_boundary_weight = torch.where(
+                ignore_boundary_mask,
+                update_boundary_weight.new_full(update_boundary_weight.shape, float(update_ignore_boundary_weight)),
+                update_boundary_weight,
+            )
+            update_boundary_weight = torch.where(
+                neg_boundary_mask,
+                update_boundary_weight.new_full(update_boundary_weight.shape, float(update_neg_boundary_weight)),
+                update_boundary_weight,
+            )
+            update_sample_weight = update_boundary_weight.detach()
+        selected_update_mask = update_confident_mask.detach().bool()
+        proto_update_boundary_weight_mean = _selected_weight_mean(
+            update_boundary_weight,
+            selected_update_mask,
+            zero,
+            eps=eps,
+        )
+        proto_update_neg_boundary_weight_mean = _selected_weight_mean(
+            update_boundary_weight,
+            selected_update_mask & neg_boundary_mask,
+            zero,
+            eps=eps,
+        )
+        proto_update_ignore_boundary_weight_mean = _selected_weight_mean(
+            update_boundary_weight,
+            selected_update_mask & ignore_boundary_mask,
+            zero,
+            eps=eps,
+        )
 
     unique_proto_idx = assigned_proto_idx[unique_indices]
     unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
@@ -1217,10 +1363,32 @@ def loss_prototype_learning(
         scene_scale = scene_floor + (1.0 - scene_floor) * scene_conf_progress
         cons_scene_scale = (1.0 - scene_blend) + scene_blend * scene_scale
 
+    push_loss = zero
+    proto_push_active_ratio = zero
+    proto_push_weight_mean = zero
+    if lambda_push > 0.0:
+        push_loss, proto_push_active_ratio, proto_push_weight_mean = _feature_side_prototype_push_loss(
+            unique_features=unique_features,
+            prototype_bank=prototype_bank,
+            unique_proto_idx=unique_proto_idx,
+            pull_confidence=pull_confidence,
+            unique_assign_conf=unique_assign_conf,
+            confident_mask=confident_mask,
+            neg_boundary_mask=neg_boundary_mask,
+            ignore_boundary_mask=ignore_boundary_mask,
+            push_margin=push_margin,
+            push_conf_thresh=push_conf_thresh,
+            push_neg_boundary_weight=push_neg_boundary_weight,
+            push_ignore_boundary_weight=push_ignore_boundary_weight,
+            zero=zero,
+            eps=eps,
+        )
+
     total_loss = (
         lambda_pull * pull_loss
         + lambda_sep * sep_loss
         + lambda_cons * cons_scene_scale * cons_loss
+        + lambda_push * push_loss
     )
     usage = torch.bincount(
         unique_proto_idx,
@@ -1248,6 +1416,7 @@ def loss_prototype_learning(
         "pull_loss": pull_loss,
         "sep_loss": sep_loss,
         "cons_loss": cons_loss,
+        "push_loss": push_loss,
         "cons_conf_mean": cons_conf_mean,
         "cons_adaptive_factor_mean": cons_adaptive_factor_mean,
         "cons_scene_scale": cons_scene_scale,
@@ -1263,9 +1432,16 @@ def loss_prototype_learning(
         "active_proto_ratio": active_proto_ratio,
         "usage_max": usage.max(),
         **proto_diagnostics,
+        "proto_push_loss": push_loss,
+        "proto_push_active_ratio": proto_push_active_ratio,
+        "proto_push_weight_mean": proto_push_weight_mean,
+        "proto_update_boundary_weight_mean": proto_update_boundary_weight_mean,
+        "proto_update_neg_boundary_weight_mean": proto_update_neg_boundary_weight_mean,
+        "proto_update_ignore_boundary_weight_mean": proto_update_ignore_boundary_weight_mean,
         "update_features": unique_features.detach(),
         "update_probs": unique_probs.detach(),
         "update_confidence": update_confidence.detach(),
+        "update_sample_weight": update_sample_weight,
     }
 
 
