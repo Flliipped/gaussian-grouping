@@ -755,6 +755,7 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_push_loss": zero,
             "proto_push_active_ratio": zero,
             "proto_push_weight_mean": zero,
+            "proto_push_penalty_mean": zero,
             "proto_update_boundary_weight_mean": zero,
             "proto_update_neg_boundary_weight_mean": zero,
             "proto_update_ignore_boundary_weight_mean": zero,
@@ -888,12 +889,14 @@ def _feature_side_prototype_push_loss(
     unique_features,
     prototype_bank,
     unique_proto_idx,
-    pull_confidence,
+    push_confidence,
     unique_assign_conf,
-    confident_mask,
+    push_mask,
     neg_boundary_mask,
     ignore_boundary_mask,
+    push_mode="hinge",
     push_margin=0.1,
+    push_temperature=0.1,
     push_conf_thresh=0.0,
     push_neg_boundary_weight=0.0,
     push_ignore_boundary_weight=0.3,
@@ -903,18 +906,27 @@ def _feature_side_prototype_push_loss(
     if zero is None:
         zero = unique_features.new_tensor(0.0)
     if unique_features.numel() == 0 or prototype_bank.num_prototypes < 2:
-        return zero, zero, zero
+        return zero, zero, zero, zero
 
     prototypes = F.normalize(prototype_bank.prototypes.detach(), dim=-1, eps=eps)
     proto_cosine = torch.matmul(unique_features, prototypes.t()).clamp(-1.0, 1.0)
     target_proto_idx = unique_proto_idx.detach().long()
-    target_mask = F.one_hot(
-        target_proto_idx,
-        num_classes=prototype_bank.num_prototypes,
-    ).to(dtype=torch.bool)
-    s_pos = proto_cosine.gather(1, target_proto_idx.unsqueeze(-1)).squeeze(-1)
-    s_neg = proto_cosine.masked_fill(target_mask, -1e6).max(dim=-1).values
-    push_penalty = torch.relu(float(push_margin) + s_neg - s_pos)
+    mode = str(push_mode).lower()
+    if mode in ("nce", "ce", "infonce"):
+        temperature = max(float(push_temperature), eps)
+        push_penalty = F.cross_entropy(
+            proto_cosine / temperature,
+            target_proto_idx,
+            reduction="none",
+        )
+    else:
+        target_mask = F.one_hot(
+            target_proto_idx,
+            num_classes=prototype_bank.num_prototypes,
+        ).to(dtype=torch.bool)
+        s_pos = proto_cosine.gather(1, target_proto_idx.unsqueeze(-1)).squeeze(-1)
+        s_neg = proto_cosine.masked_fill(target_mask, -1e6).max(dim=-1).values
+        push_penalty = torch.relu(float(push_margin) + s_neg - s_pos)
 
     with torch.no_grad():
         boundary_weight = unique_features.new_ones(unique_features.shape[0])
@@ -929,11 +941,11 @@ def _feature_side_prototype_push_loss(
             boundary_weight,
         )
 
-        push_mask = confident_mask.detach().bool()
+        push_mask = push_mask.detach().bool()
         if push_conf_thresh is not None and float(push_conf_thresh) > 0.0:
-            push_mask = push_mask & (pull_confidence.detach() >= float(push_conf_thresh))
+            push_mask = push_mask & (push_confidence.detach() >= float(push_conf_thresh))
         push_weight = (
-            pull_confidence.detach().clamp_min(0.0)
+            push_confidence.detach().clamp_min(0.0)
             * unique_assign_conf.detach().clamp_min(0.0)
             * boundary_weight
             * push_mask.to(dtype=unique_features.dtype)
@@ -942,7 +954,13 @@ def _feature_side_prototype_push_loss(
     push_loss = (push_weight * push_penalty).sum() / (push_weight.sum() + eps)
     push_active_ratio = (push_weight > 0).to(unique_features.dtype).mean()
     push_weight_mean = push_weight.mean()
-    return push_loss, push_active_ratio.detach(), push_weight_mean.detach()
+    with torch.no_grad():
+        active_mask = push_weight.detach() > 0
+        if active_mask.any():
+            push_penalty_mean = push_penalty.detach()[active_mask].mean().to(dtype=zero.dtype)
+        else:
+            push_penalty_mean = zero
+    return push_loss, push_active_ratio.detach(), push_weight_mean.detach(), push_penalty_mean.detach()
 
 
 def _prototype_diagnostics(
@@ -1118,8 +1136,14 @@ def loss_prototype_learning(
     update_neg_boundary_weight=1.0,
     update_ignore_boundary_weight=1.0,
     lambda_push=0.0,
+    push_mode="hinge",
     push_margin=0.1,
+    push_temperature=0.1,
     push_conf_thresh=0.0,
+    push_use_confident_mask=True,
+    push_reliability_thresh=-1.0,
+    push_entropy_thresh=-1.0,
+    push_assign_conf_thresh=-1.0,
     push_neg_boundary_weight=0.0,
     push_ignore_boundary_weight=0.3,
     eps=1e-8,
@@ -1138,6 +1162,10 @@ def loss_prototype_learning(
             "sep_loss": zero,
             "cons_loss": zero,
             "push_loss": zero,
+            "proto_push_loss": zero,
+            "proto_push_active_ratio": zero,
+            "proto_push_weight_mean": zero,
+            "proto_push_penalty_mean": zero,
             "cons_conf_mean": zero,
             "cons_adaptive_factor_mean": zero,
             "cons_scene_scale": zero,
@@ -1366,17 +1394,51 @@ def loss_prototype_learning(
     push_loss = zero
     proto_push_active_ratio = zero
     proto_push_weight_mean = zero
+    proto_push_penalty_mean = zero
     if lambda_push > 0.0:
-        push_loss, proto_push_active_ratio, proto_push_weight_mean = _feature_side_prototype_push_loss(
+        if bool(push_use_confident_mask):
+            push_confidence = pull_confidence
+            push_candidate_mask = confident_mask.detach().bool()
+        else:
+            effective_push_reliability_thresh = (
+                reliability_thresh
+                if push_reliability_thresh is None or float(push_reliability_thresh) < 0.0
+                else float(push_reliability_thresh)
+            )
+            effective_push_entropy_thresh = (
+                entropy_thresh
+                if push_entropy_thresh is None or float(push_entropy_thresh) < 0.0
+                else float(push_entropy_thresh)
+            )
+            effective_push_assign_conf_thresh = (
+                assign_conf_thresh
+                if push_assign_conf_thresh is None or float(push_assign_conf_thresh) < 0.0
+                else float(push_assign_conf_thresh)
+            )
+            push_candidate_mask = (
+                (point_reliability >= effective_push_reliability_thresh)
+                & (unique_entropy <= effective_push_entropy_thresh)
+                & (unique_assign_conf >= effective_push_assign_conf_thresh)
+            )
+            push_confidence = (
+                (1.0 - unique_entropy)
+                * point_reliability
+                * pull_sem_gate
+                * push_candidate_mask.to(unique_features.dtype)
+            )
+
+        push_loss, proto_push_active_ratio, proto_push_weight_mean, proto_push_penalty_mean = _feature_side_prototype_push_loss(
             unique_features=unique_features,
             prototype_bank=prototype_bank,
             unique_proto_idx=unique_proto_idx,
-            pull_confidence=pull_confidence,
+            push_confidence=push_confidence,
             unique_assign_conf=unique_assign_conf,
-            confident_mask=confident_mask,
+            push_mask=push_candidate_mask,
             neg_boundary_mask=neg_boundary_mask,
             ignore_boundary_mask=ignore_boundary_mask,
+            push_mode=push_mode,
             push_margin=push_margin,
+            push_temperature=push_temperature,
             push_conf_thresh=push_conf_thresh,
             push_neg_boundary_weight=push_neg_boundary_weight,
             push_ignore_boundary_weight=push_ignore_boundary_weight,
@@ -1435,6 +1497,7 @@ def loss_prototype_learning(
         "proto_push_loss": push_loss,
         "proto_push_active_ratio": proto_push_active_ratio,
         "proto_push_weight_mean": proto_push_weight_mean,
+        "proto_push_penalty_mean": proto_push_penalty_mean,
         "proto_update_boundary_weight_mean": proto_update_boundary_weight_mean,
         "proto_update_neg_boundary_weight_mean": proto_update_neg_boundary_weight_mean,
         "proto_update_ignore_boundary_weight_mean": proto_update_ignore_boundary_weight_mean,

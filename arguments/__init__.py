@@ -168,8 +168,14 @@ class OptimizationParams(ParamGroup):
         self.proto_update_neg_boundary_weight = 1.0
         self.proto_update_ignore_boundary_weight = 1.0
         self.proto_lambda_push = 0.0
+        self.proto_push_mode = "hinge"
         self.proto_push_margin = 0.1
+        self.proto_push_temperature = 0.1
         self.proto_push_conf_thresh = 0.0
+        self.proto_push_use_confident_mask = True
+        self.proto_push_reliability_thresh = -1.0
+        self.proto_push_entropy_thresh = -1.0
+        self.proto_push_assign_conf_thresh = -1.0
         self.proto_push_neg_boundary_weight = 0.0
         self.proto_push_ignore_boundary_weight = 0.3
 

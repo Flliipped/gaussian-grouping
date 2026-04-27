@@ -94,6 +94,7 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_push_loss",
         "proto_push_active_ratio",
         "proto_push_weight_mean",
+        "proto_push_penalty_mean",
         "proto_update_boundary_weight_mean",
         "proto_update_neg_boundary_weight_mean",
         "proto_update_ignore_boundary_weight_mean",
@@ -438,8 +439,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 update_neg_boundary_weight=opt.proto_update_neg_boundary_weight,
                 update_ignore_boundary_weight=opt.proto_update_ignore_boundary_weight,
                 lambda_push=opt.proto_lambda_push,
+                push_mode=opt.proto_push_mode,
                 push_margin=opt.proto_push_margin,
+                push_temperature=opt.proto_push_temperature,
                 push_conf_thresh=opt.proto_push_conf_thresh,
+                push_use_confident_mask=opt.proto_push_use_confident_mask,
+                push_reliability_thresh=opt.proto_push_reliability_thresh,
+                push_entropy_thresh=opt.proto_push_entropy_thresh,
+                push_assign_conf_thresh=opt.proto_push_assign_conf_thresh,
                 push_neg_boundary_weight=opt.proto_push_neg_boundary_weight,
                 push_ignore_boundary_weight=opt.proto_push_ignore_boundary_weight,
             )
@@ -869,8 +876,14 @@ if __name__ == "__main__":
     args.proto_update_neg_boundary_weight = config.get("proto_update_neg_boundary_weight", args.proto_update_neg_boundary_weight)
     args.proto_update_ignore_boundary_weight = config.get("proto_update_ignore_boundary_weight", args.proto_update_ignore_boundary_weight)
     args.proto_lambda_push = config.get("proto_lambda_push", args.proto_lambda_push)
+    args.proto_push_mode = config.get("proto_push_mode", args.proto_push_mode)
     args.proto_push_margin = config.get("proto_push_margin", args.proto_push_margin)
+    args.proto_push_temperature = config.get("proto_push_temperature", args.proto_push_temperature)
     args.proto_push_conf_thresh = config.get("proto_push_conf_thresh", args.proto_push_conf_thresh)
+    args.proto_push_use_confident_mask = config.get("proto_push_use_confident_mask", args.proto_push_use_confident_mask)
+    args.proto_push_reliability_thresh = config.get("proto_push_reliability_thresh", args.proto_push_reliability_thresh)
+    args.proto_push_entropy_thresh = config.get("proto_push_entropy_thresh", args.proto_push_entropy_thresh)
+    args.proto_push_assign_conf_thresh = config.get("proto_push_assign_conf_thresh", args.proto_push_assign_conf_thresh)
     args.proto_push_neg_boundary_weight = config.get("proto_push_neg_boundary_weight", args.proto_push_neg_boundary_weight)
     args.proto_push_ignore_boundary_weight = config.get("proto_push_ignore_boundary_weight", args.proto_push_ignore_boundary_weight)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
