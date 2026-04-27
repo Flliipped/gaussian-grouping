@@ -95,6 +95,18 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_push_active_ratio",
         "proto_push_weight_mean",
         "proto_push_penalty_mean",
+        "proto_boundary_exposure_mean",
+        "proto_boundary_exposure_std",
+        "proto_boundary_exposure_p90",
+        "proto_neg_boundary_exposure_mean",
+        "proto_ignore_boundary_exposure_mean",
+        "proto_ambiguous_ratio",
+        "proto_ambiguous_score_mean",
+        "proto_ambiguous_entropy_mean",
+        "proto_ambiguous_boundary_exposure_mean",
+        "proto_ambiguous_margin_mean",
+        "proto_ambiguous_ratio_in_boundary",
+        "proto_ambiguous_ratio_in_interior",
         "proto_update_boundary_weight_mean",
         "proto_update_neg_boundary_weight_mean",
         "proto_update_ignore_boundary_weight_mean",
@@ -426,6 +438,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 cons_agree_conf_thresh=opt.proto_cons_agree_conf_thresh,
                 conf_thresh=opt.proto_conf_thresh,
                 sep_margin=opt.proto_sep_margin,
+                pull_mode=opt.proto_pull_mode,
+                pull_topk=opt.proto_pull_topk,
                 reliability_thresh=opt.proto_reliability_thresh,
                 entropy_thresh=opt.proto_entropy_thresh,
                 assign_conf_thresh=opt.proto_assign_conf_thresh,
@@ -449,6 +463,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 push_assign_conf_thresh=opt.proto_push_assign_conf_thresh,
                 push_neg_boundary_weight=opt.proto_push_neg_boundary_weight,
                 push_ignore_boundary_weight=opt.proto_push_ignore_boundary_weight,
+                boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
+                ambiguity_thresh=opt.proto_ambiguity_thresh,
+                ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -863,6 +880,8 @@ if __name__ == "__main__":
     args.proto_cons_agree_floor = config.get("proto_cons_agree_floor", args.proto_cons_agree_floor)
     args.proto_cons_agree_conf_thresh = config.get("proto_cons_agree_conf_thresh", args.proto_cons_agree_conf_thresh)
     args.proto_sep_margin = config.get("proto_sep_margin", args.proto_sep_margin)
+    args.proto_pull_mode = config.get("proto_pull_mode", args.proto_pull_mode)
+    args.proto_pull_topk = config.get("proto_pull_topk", args.proto_pull_topk)
     args.proto_reliability_thresh = config.get("proto_reliability_thresh", args.proto_reliability_thresh)
     args.proto_entropy_thresh = config.get("proto_entropy_thresh", args.proto_entropy_thresh)
     args.proto_assign_conf_thresh = config.get("proto_assign_conf_thresh", args.proto_assign_conf_thresh)
@@ -886,6 +905,9 @@ if __name__ == "__main__":
     args.proto_push_assign_conf_thresh = config.get("proto_push_assign_conf_thresh", args.proto_push_assign_conf_thresh)
     args.proto_push_neg_boundary_weight = config.get("proto_push_neg_boundary_weight", args.proto_push_neg_boundary_weight)
     args.proto_push_ignore_boundary_weight = config.get("proto_push_ignore_boundary_weight", args.proto_push_ignore_boundary_weight)
+    args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
+    args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
+    args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)

@@ -756,6 +756,18 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_push_active_ratio": zero,
             "proto_push_weight_mean": zero,
             "proto_push_penalty_mean": zero,
+            "proto_boundary_exposure_mean": zero,
+            "proto_boundary_exposure_std": zero,
+            "proto_boundary_exposure_p90": zero,
+            "proto_neg_boundary_exposure_mean": zero,
+            "proto_ignore_boundary_exposure_mean": zero,
+            "proto_ambiguous_ratio": zero,
+            "proto_ambiguous_score_mean": zero,
+            "proto_ambiguous_entropy_mean": zero,
+            "proto_ambiguous_boundary_exposure_mean": zero,
+            "proto_ambiguous_margin_mean": zero,
+            "proto_ambiguous_ratio_in_boundary": zero,
+            "proto_ambiguous_ratio_in_interior": zero,
             "proto_update_boundary_weight_mean": zero,
             "proto_update_neg_boundary_weight_mean": zero,
             "proto_update_ignore_boundary_weight_mean": zero,
@@ -841,6 +853,77 @@ def _boundary_unique_mask(graph_data, unique_indices, num_selected_points, edge_
     return point_mask[unique_indices.detach()]
 
 
+def _scatter_edge_exposure(graph_data, num_selected_points, edge_mask, dtype):
+    edge_mask = edge_mask.detach().bool()
+    point_count = torch.zeros(
+        (num_selected_points,),
+        device=edge_mask.device,
+        dtype=dtype,
+    )
+    if edge_mask.numel() == 0 or not edge_mask.any():
+        return point_count
+
+    sample_indices = graph_data["sample_indices"].detach()
+    neighbor_indices = graph_data["neighbor_indices"].detach()
+    active_sample_indices = sample_indices.unsqueeze(-1).expand_as(neighbor_indices)[edge_mask]
+    active_neighbor_indices = neighbor_indices[edge_mask]
+    active_point_indices = torch.cat([active_sample_indices, active_neighbor_indices], dim=0)
+    point_count.scatter_add_(
+        0,
+        active_point_indices,
+        torch.ones_like(active_point_indices, dtype=dtype),
+    )
+    return point_count
+
+
+def _prototype_boundary_exposure_scores(
+    graph_data,
+    unique_indices,
+    num_selected_points,
+    ignore_weight=0.3,
+    eps=1e-8,
+):
+    with torch.no_grad():
+        dtype = graph_data["negative_mask"].dtype
+        positive_edge_mask = graph_data["positive_mask"].detach() > 0
+        neg_edge_mask = graph_data["negative_mask"].detach() > 0
+        ignore_edge_mask = graph_data["ignore_mask"].detach() > 0
+        valid_edge_mask = positive_edge_mask | neg_edge_mask | ignore_edge_mask
+
+        valid_count = _scatter_edge_exposure(
+            graph_data,
+            num_selected_points,
+            valid_edge_mask,
+            dtype,
+        )
+        neg_count = _scatter_edge_exposure(
+            graph_data,
+            num_selected_points,
+            neg_edge_mask,
+            dtype,
+        )
+        ignore_count = _scatter_edge_exposure(
+            graph_data,
+            num_selected_points,
+            ignore_edge_mask,
+            dtype,
+        )
+
+        denom = valid_count.clamp_min(float(eps))
+        neg_exposure = neg_count / denom
+        ignore_exposure = ignore_count / denom
+        boundary_exposure = (
+            neg_exposure + float(ignore_weight) * ignore_exposure
+        ).clamp(0.0, 1.0)
+
+        unique_indices = unique_indices.detach()
+        return (
+            neg_exposure[unique_indices].detach(),
+            ignore_exposure[unique_indices].detach(),
+            boundary_exposure[unique_indices].detach(),
+        )
+
+
 def _boundary_proto_stats(boundary_mask, entropy, assign_conf, selected_mask, zero, eps=1e-8):
     boundary_mask = boundary_mask.detach().bool()
     if boundary_mask.numel() == 0 or not boundary_mask.any():
@@ -883,6 +966,14 @@ def _selected_weight_mean(weights, selected_mask, zero, eps=1e-8):
         return (
             weights.detach()[selected_mask].mean().to(dtype=zero.dtype).detach()
         )
+
+
+def _safe_masked_mean(values, mask, zero):
+    values = values.detach().reshape(-1)
+    mask = mask.detach().bool().reshape(-1)
+    if values.numel() == 0 or mask.numel() == 0 or not mask.any():
+        return zero
+    return values[mask].mean().to(dtype=zero.dtype).detach()
 
 
 def _feature_side_prototype_push_loss(
@@ -974,7 +1065,12 @@ def _prototype_diagnostics(
     unique_assign_margin,
     update_confidence,
     update_confident_mask,
+    neg_boundary_exposure,
+    ignore_boundary_exposure,
+    boundary_exposure,
     zero,
+    ambiguity_thresh=0.05,
+    ambiguity_boundary_thresh=0.2,
     eps=1e-8,
 ):
     with torch.no_grad():
@@ -1001,6 +1097,7 @@ def _prototype_diagnostics(
         entropy_p10, entropy_p50, entropy_p90 = _safe_quantiles(unique_entropy, zero)
         assign_conf_p10, assign_conf_p50, assign_conf_p90 = _safe_quantiles(unique_assign_conf, zero)
         margin_p10, margin_p50, margin_p90 = _safe_quantiles(unique_assign_margin, zero)
+        _, _, boundary_exposure_p90 = _safe_quantiles(boundary_exposure, zero)
 
         selected_update_confidence = update_confidence.detach().reshape(-1)[update_selected]
         _, update_confidence_p50, update_confidence_p90 = _safe_quantiles(selected_update_confidence, zero)
@@ -1061,6 +1158,19 @@ def _prototype_diagnostics(
             zero,
             eps=eps,
         )
+        boundary_exposure = boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
+        neg_boundary_exposure = neg_boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
+        ignore_boundary_exposure = ignore_boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
+        ambiguity_score = (
+            unique_entropy.detach().reshape(-1).to(dtype=zero.dtype)
+            * (1.0 - unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)).clamp_min(0.0)
+            * boundary_exposure
+        )
+        ambiguous_mask = ambiguity_score >= float(ambiguity_thresh)
+        exposure_boundary_mask = boundary_exposure >= float(ambiguity_boundary_thresh)
+        exposure_interior_mask = ~exposure_boundary_mask
+        boundary_count = exposure_boundary_mask.to(dtype=zero.dtype).sum().clamp_min(eps)
+        interior_count = exposure_interior_mask.to(dtype=zero.dtype).sum().clamp_min(eps)
 
         diagnostics.update({
             "proto_usage_histogram": usage_histogram.detach(),
@@ -1091,6 +1201,22 @@ def _prototype_diagnostics(
             "proto_update_selected_ratio": update_selected.to(dtype=zero.dtype).mean().detach(),
             "proto_update_confidence_p50": update_confidence_p50,
             "proto_update_confidence_p90": update_confidence_p90,
+            "proto_boundary_exposure_mean": boundary_exposure.mean().detach(),
+            "proto_boundary_exposure_std": boundary_exposure.std(unbiased=False).detach(),
+            "proto_boundary_exposure_p90": boundary_exposure_p90,
+            "proto_neg_boundary_exposure_mean": neg_boundary_exposure.mean().detach(),
+            "proto_ignore_boundary_exposure_mean": ignore_boundary_exposure.mean().detach(),
+            "proto_ambiguous_ratio": ambiguous_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_ambiguous_score_mean": ambiguity_score.mean().detach(),
+            "proto_ambiguous_entropy_mean": _safe_masked_mean(unique_entropy, ambiguous_mask, zero),
+            "proto_ambiguous_boundary_exposure_mean": _safe_masked_mean(boundary_exposure, ambiguous_mask, zero),
+            "proto_ambiguous_margin_mean": _safe_masked_mean(unique_assign_margin, ambiguous_mask, zero),
+            "proto_ambiguous_ratio_in_boundary": (
+                (ambiguous_mask & exposure_boundary_mask).to(dtype=zero.dtype).sum() / boundary_count
+            ).detach(),
+            "proto_ambiguous_ratio_in_interior": (
+                (ambiguous_mask & exposure_interior_mask).to(dtype=zero.dtype).sum() / interior_count
+            ).detach(),
             "proto_neg_boundary_entropy": neg_boundary_entropy,
             "proto_neg_boundary_assign_conf": neg_boundary_assign_conf,
             "proto_neg_boundary_selected_ratio": neg_boundary_selected_ratio,
@@ -1123,6 +1249,8 @@ def loss_prototype_learning(
     cons_agree_conf_thresh=0.0,
     conf_thresh=0.2,
     sep_margin=0.2,
+    pull_mode="hard",
+    pull_topk=2,
     reliability_thresh=0.0,
     entropy_thresh=1.0,
     assign_conf_thresh=0.0,
@@ -1146,6 +1274,9 @@ def loss_prototype_learning(
     push_assign_conf_thresh=-1.0,
     push_neg_boundary_weight=0.0,
     push_ignore_boundary_weight=0.3,
+    boundary_exposure_ignore_weight=0.3,
+    ambiguity_thresh=0.05,
+    ambiguity_boundary_thresh=0.2,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -1252,6 +1383,13 @@ def loss_prototype_learning(
         unique_indices,
         selected_features.shape[0],
     )
+    neg_boundary_exposure, ignore_boundary_exposure, boundary_exposure = _prototype_boundary_exposure_scores(
+        graph_data,
+        unique_indices,
+        selected_features.shape[0],
+        ignore_weight=boundary_exposure_ignore_weight,
+        eps=eps,
+    )
     update_sample_weight = None
     with torch.no_grad():
         update_boundary_weight = unique_features.new_ones(unique_features.shape[0])
@@ -1288,9 +1426,28 @@ def loss_prototype_learning(
         )
 
     unique_proto_idx = assigned_proto_idx[unique_indices]
-    unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
     pull_weight = pull_confidence * unique_assign_conf * confident_mask
-    pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
+    pull_mode_value = str(pull_mode).lower()
+    if pull_mode_value in ("topk_soft", "soft_topk", "soft"):
+        effective_pull_topk = min(
+            max(int(pull_topk), 1),
+            max(prototype_bank.num_prototypes, 1),
+        )
+        pull_topk_values, pull_topk_indices = unique_probs.topk(
+            k=effective_pull_topk,
+            dim=-1,
+        )
+        pull_topk_weights = (
+            pull_topk_values / pull_topk_values.sum(dim=-1, keepdim=True).clamp_min(eps)
+        ).detach()
+        pull_topk_prototypes = prototype_bank.prototypes[pull_topk_indices]
+        pull_topk_distance = 1.0 - (
+            unique_features.unsqueeze(1) * pull_topk_prototypes
+        ).sum(dim=-1).clamp(-1.0, 1.0)
+        pull_distance = (pull_topk_weights * pull_topk_distance).sum(dim=-1)
+    else:
+        unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
+        pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
     pull_loss = (pull_weight * pull_distance).sum() / (pull_weight.sum() + eps)
 
     prototype_cosine = torch.matmul(prototype_bank.prototypes, prototype_bank.prototypes.t())
@@ -1469,7 +1626,12 @@ def loss_prototype_learning(
         unique_assign_margin=unique_assign_margin,
         update_confidence=update_confidence,
         update_confident_mask=update_confident_mask,
+        neg_boundary_exposure=neg_boundary_exposure,
+        ignore_boundary_exposure=ignore_boundary_exposure,
+        boundary_exposure=boundary_exposure,
         zero=zero,
+        ambiguity_thresh=ambiguity_thresh,
+        ambiguity_boundary_thresh=ambiguity_boundary_thresh,
         eps=eps,
     )
 

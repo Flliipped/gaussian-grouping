@@ -155,6 +155,8 @@ class OptimizationParams(ParamGroup):
         self.proto_cons_agree_floor = 0.4
         self.proto_cons_agree_conf_thresh = 0.0
         self.proto_sep_margin = 0.2
+        self.proto_pull_mode = "hard"
+        self.proto_pull_topk = 2
         self.proto_reliability_thresh = 0.0
         self.proto_entropy_thresh = 1.0
         self.proto_assign_conf_thresh = 0.0
@@ -178,6 +180,9 @@ class OptimizationParams(ParamGroup):
         self.proto_push_assign_conf_thresh = -1.0
         self.proto_push_neg_boundary_weight = 0.0
         self.proto_push_ignore_boundary_weight = 0.3
+        self.proto_boundary_exposure_ignore_weight = 0.3
+        self.proto_ambiguity_thresh = 0.05
+        self.proto_ambiguity_boundary_thresh = 0.2
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter
