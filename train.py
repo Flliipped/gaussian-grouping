@@ -121,10 +121,14 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_uncertain_boundary_assign_conf",
         "proto_uncertain_boundary_selected_ratio",
         "proto_split_probe_active",
+        "proto_split_prefilter_candidate_count",
+        "proto_split_prefilter_candidate_ratio",
         "proto_split_candidate_count",
         "proto_split_candidate_ratio",
         "proto_split_candidate_score_mean",
         "proto_split_candidate_score_p90",
+        "proto_split_candidate_score_min",
+        "proto_split_selection_cutoff_score",
         "proto_split_candidate_entropy_mean",
         "proto_split_candidate_margin_mean",
         "proto_split_candidate_boundary_exposure_mean",
@@ -156,6 +160,36 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
     if update_usage_histogram is not None and update_usage_histogram.numel() <= 32:
         for proto_idx, usage_value in enumerate(update_usage_histogram.float().cpu().tolist()):
             log_data[f"train_loss_patches/proto_update_usage_{proto_idx:02d}"] = usage_value
+
+
+def _export_split_probe_candidates(model_path, iteration, proto_diag, max_count=512):
+    candidate_indices = _proto_diag_tensor(proto_diag, "proto_split_candidate_global_indices")
+    if candidate_indices is None or candidate_indices.numel() == 0:
+        return
+
+    max_count = int(max_count)
+    export_count = candidate_indices.numel() if max_count <= 0 else min(candidate_indices.numel(), max_count)
+    if export_count <= 0:
+        return
+
+    scores = _proto_diag_tensor(proto_diag, "proto_split_candidate_scores")
+    top1_proto = _proto_diag_tensor(proto_diag, "proto_split_candidate_top1_proto")
+    top2_proto = _proto_diag_tensor(proto_diag, "proto_split_candidate_top2_proto")
+    if scores is not None and scores.numel() == candidate_indices.numel():
+        _, export_order = scores.float().topk(export_count, largest=True)
+    else:
+        export_order = torch.arange(export_count, device=candidate_indices.device)
+
+    export_dir = os.path.join(model_path, "split_probe")
+    os.makedirs(export_dir, exist_ok=True)
+    payload = {
+        "iteration": int(iteration),
+        "global_indices": candidate_indices[export_order].detach().cpu(),
+        "scores": scores[export_order].detach().cpu() if scores is not None else None,
+        "top1_proto": top1_proto[export_order].detach().cpu() if top1_proto is not None else None,
+        "top2_proto": top2_proto[export_order].detach().cpu() if top2_proto is not None else None,
+    }
+    torch.save(payload, os.path.join(export_dir, f"candidates_{iteration:06d}.pth"))
 
 
 def _build_graph_support_cache(cameras, num_support):
@@ -498,6 +532,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 split_probe_entropy_thresh=opt.split_probe_entropy_thresh,
                 split_probe_margin_thresh=opt.split_probe_margin_thresh,
                 split_probe_second_conf_thresh=opt.split_probe_second_conf_thresh,
+                split_probe_top_ratio=opt.split_probe_top_ratio,
+                split_probe_max_candidates=opt.split_probe_max_candidates,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -626,6 +662,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"update_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_update_selected_ratio'):.6f}, "
                         + f"neg_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_neg_boundary_selected_ratio'):.6f}, "
                         + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}, "
+                        + f"split_prefilter_ratio={_proto_diag_scalar(proto_diag, 'proto_split_prefilter_candidate_ratio'):.6f}, "
                         + f"split_candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_split_candidate_ratio'):.6f}, "
                         + f"split_candidate_score={_proto_diag_scalar(proto_diag, 'proto_split_candidate_score_mean'):.6f}, "
                         + f"split_candidate_top2={_proto_diag_scalar(proto_diag, 'proto_split_candidate_top2_conf_mean'):.6f}"
@@ -644,6 +681,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     proto_update_confidence,
                     confidence_thresh=opt.proto_update_conf_thresh,
                     sample_weight=proto_update_sample_weight,
+                )
+            if (
+                opt.use_split_probe
+                and opt.split_probe_save_interval > 0
+                and iteration >= opt.split_probe_start_iter
+                and iteration % opt.split_probe_save_interval == 0
+            ):
+                _export_split_probe_candidates(
+                    scene.model_path,
+                    iteration,
+                    proto_diag,
+                    max_count=opt.split_probe_export_max_count,
                 )
 
             # Progress bar
@@ -953,6 +1002,10 @@ if __name__ == "__main__":
     args.split_probe_entropy_thresh = config.get("split_probe_entropy_thresh", args.split_probe_entropy_thresh)
     args.split_probe_margin_thresh = config.get("split_probe_margin_thresh", args.split_probe_margin_thresh)
     args.split_probe_second_conf_thresh = config.get("split_probe_second_conf_thresh", args.split_probe_second_conf_thresh)
+    args.split_probe_top_ratio = config.get("split_probe_top_ratio", args.split_probe_top_ratio)
+    args.split_probe_max_candidates = config.get("split_probe_max_candidates", args.split_probe_max_candidates)
+    args.split_probe_save_interval = config.get("split_probe_save_interval", args.split_probe_save_interval)
+    args.split_probe_export_max_count = config.get("split_probe_export_max_count", args.split_probe_export_max_count)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)

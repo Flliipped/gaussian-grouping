@@ -193,6 +193,10 @@ class OptimizationParams(ParamGroup):
         self.split_probe_entropy_thresh = 0.1
         self.split_probe_margin_thresh = 0.65
         self.split_probe_second_conf_thresh = 0.08
+        self.split_probe_top_ratio = 0.0
+        self.split_probe_max_candidates = 0
+        self.split_probe_save_interval = 500
+        self.split_probe_export_max_count = 512
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter

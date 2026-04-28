@@ -782,10 +782,14 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_uncertain_boundary_assign_conf": zero,
             "proto_uncertain_boundary_selected_ratio": zero,
             "proto_split_probe_active": zero,
+            "proto_split_prefilter_candidate_count": zero,
+            "proto_split_prefilter_candidate_ratio": zero,
             "proto_split_candidate_count": zero,
             "proto_split_candidate_ratio": zero,
             "proto_split_candidate_score_mean": zero,
             "proto_split_candidate_score_p90": zero,
+            "proto_split_candidate_score_min": zero,
+            "proto_split_selection_cutoff_score": zero,
             "proto_split_candidate_entropy_mean": zero,
             "proto_split_candidate_margin_mean": zero,
             "proto_split_candidate_boundary_exposure_mean": zero,
@@ -996,10 +1000,13 @@ def _safe_masked_mean(values, mask, zero):
 
 
 def _prototype_split_candidate_diagnostics(
+    unique_global_indices,
     unique_entropy,
     unique_assign_conf,
     unique_assign_margin,
     unique_top2_conf,
+    unique_top1_proto_idx,
+    unique_top2_proto_idx,
     point_reliability,
     boundary_exposure,
     unique_scale,
@@ -1010,15 +1017,21 @@ def _prototype_split_candidate_diagnostics(
     entropy_thresh=0.1,
     margin_thresh=0.65,
     second_conf_thresh=0.08,
+    top_ratio=0.0,
+    max_candidates=0,
     eps=1e-8,
 ):
     with torch.no_grad():
         diagnostics = {
             "proto_split_probe_active": zero.new_tensor(float(bool(split_probe_enabled))),
+            "proto_split_prefilter_candidate_count": zero,
+            "proto_split_prefilter_candidate_ratio": zero,
             "proto_split_candidate_count": zero,
             "proto_split_candidate_ratio": zero,
             "proto_split_candidate_score_mean": zero,
             "proto_split_candidate_score_p90": zero,
+            "proto_split_candidate_score_min": zero,
+            "proto_split_selection_cutoff_score": zero,
             "proto_split_candidate_entropy_mean": zero,
             "proto_split_candidate_margin_mean": zero,
             "proto_split_candidate_boundary_exposure_mean": zero,
@@ -1030,9 +1043,20 @@ def _prototype_split_candidate_diagnostics(
             "proto_split_boundary_top2_conf_mean": zero,
             "proto_split_boundary_score_mean": zero,
         }
+        empty_long = unique_global_indices.detach().new_empty((0,))
+        empty_score = zero.new_empty((0,))
+        diagnostics.update({
+            "proto_split_candidate_global_indices": empty_long,
+            "proto_split_candidate_top1_proto": empty_long.clone(),
+            "proto_split_candidate_top2_proto": empty_long.clone(),
+            "proto_split_candidate_scores": empty_score,
+        })
         if not split_probe_enabled:
             return diagnostics
 
+        global_indices = unique_global_indices.detach().reshape(-1).long()
+        top1_proto_idx = unique_top1_proto_idx.detach().reshape(-1).long()
+        top2_proto_idx = unique_top2_proto_idx.detach().reshape(-1).long()
         entropy = unique_entropy.detach().reshape(-1).to(dtype=zero.dtype)
         top1_conf = unique_assign_conf.detach().reshape(-1).to(dtype=zero.dtype)
         margin = unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)
@@ -1056,23 +1080,58 @@ def _prototype_split_candidate_diagnostics(
             & (margin <= float(margin_thresh))
             & (top2_conf >= float(second_conf_thresh))
         )
-        candidate_count = candidate_mask.to(dtype=zero.dtype).sum()
+        prefilter_count = candidate_mask.to(dtype=zero.dtype).sum()
+        prefilter_ratio = prefilter_count / entropy.numel()
+
+        selected_mask = candidate_mask
+        selection_cutoff = zero
+        candidate_count_int = int(candidate_mask.to(dtype=torch.long).sum().item())
+        if candidate_count_int > 0:
+            cap = candidate_count_int
+            if float(top_ratio) > 0.0:
+                ratio_cap = int(max(1, round(entropy.numel() * float(top_ratio))))
+                cap = min(cap, ratio_cap)
+            if int(max_candidates) > 0:
+                cap = min(cap, int(max_candidates))
+            if cap < candidate_count_int:
+                masked_score = split_score.masked_fill(~candidate_mask, -float("inf"))
+                selected_values, selected_indices = masked_score.topk(cap, largest=True)
+                selected_mask = torch.zeros_like(candidate_mask)
+                selected_mask[selected_indices] = True
+                selection_cutoff = selected_values[-1].to(dtype=zero.dtype)
+            else:
+                selection_cutoff = split_score[candidate_mask].min().to(dtype=zero.dtype)
+
+        candidate_count = selected_mask.to(dtype=zero.dtype).sum()
         candidate_ratio = candidate_count / entropy.numel()
 
+        selected_scores = split_score[selected_mask]
+        if selected_scores.numel() > 0:
+            candidate_score_min = selected_scores.min().to(dtype=zero.dtype).detach()
+        else:
+            candidate_score_min = zero
         _, _, split_score_p90 = _safe_quantiles(split_score, zero)
         diagnostics.update({
+            "proto_split_prefilter_candidate_count": prefilter_count.detach(),
+            "proto_split_prefilter_candidate_ratio": prefilter_ratio.detach(),
             "proto_split_candidate_count": candidate_count.detach(),
             "proto_split_candidate_ratio": candidate_ratio.detach(),
-            "proto_split_candidate_score_mean": _safe_masked_mean(split_score, candidate_mask, zero),
+            "proto_split_candidate_score_mean": _safe_masked_mean(split_score, selected_mask, zero),
             "proto_split_candidate_score_p90": split_score_p90,
-            "proto_split_candidate_entropy_mean": _safe_masked_mean(entropy, candidate_mask, zero),
-            "proto_split_candidate_margin_mean": _safe_masked_mean(margin, candidate_mask, zero),
-            "proto_split_candidate_boundary_exposure_mean": _safe_masked_mean(exposure, candidate_mask, zero),
-            "proto_split_candidate_reliability_mean": _safe_masked_mean(reliability, candidate_mask, zero),
-            "proto_split_candidate_top1_conf_mean": _safe_masked_mean(top1_conf, candidate_mask, zero),
-            "proto_split_candidate_top2_conf_mean": _safe_masked_mean(top2_conf, candidate_mask, zero),
+            "proto_split_candidate_score_min": candidate_score_min,
+            "proto_split_selection_cutoff_score": selection_cutoff.detach(),
+            "proto_split_candidate_entropy_mean": _safe_masked_mean(entropy, selected_mask, zero),
+            "proto_split_candidate_margin_mean": _safe_masked_mean(margin, selected_mask, zero),
+            "proto_split_candidate_boundary_exposure_mean": _safe_masked_mean(exposure, selected_mask, zero),
+            "proto_split_candidate_reliability_mean": _safe_masked_mean(reliability, selected_mask, zero),
+            "proto_split_candidate_top1_conf_mean": _safe_masked_mean(top1_conf, selected_mask, zero),
+            "proto_split_candidate_top2_conf_mean": _safe_masked_mean(top2_conf, selected_mask, zero),
             "proto_split_boundary_top2_conf_mean": _safe_masked_mean(top2_conf, boundary_mask, zero),
             "proto_split_boundary_score_mean": _safe_masked_mean(split_score, boundary_mask, zero),
+            "proto_split_candidate_global_indices": global_indices[selected_mask].detach(),
+            "proto_split_candidate_top1_proto": top1_proto_idx[selected_mask].detach(),
+            "proto_split_candidate_top2_proto": top2_proto_idx[selected_mask].detach(),
+            "proto_split_candidate_scores": selected_scores.detach(),
         })
 
         if unique_scale is not None:
@@ -1080,8 +1139,8 @@ def _prototype_split_candidate_diagnostics(
             if scale.numel() == entropy.numel():
                 scale_mean = scale.mean().clamp_min(eps)
                 diagnostics.update({
-                    "proto_split_candidate_scale_mean": _safe_masked_mean(scale, candidate_mask, zero),
-                    "proto_split_candidate_scale_ratio_mean": _safe_masked_mean(scale / scale_mean, candidate_mask, zero),
+                    "proto_split_candidate_scale_mean": _safe_masked_mean(scale, selected_mask, zero),
+                    "proto_split_candidate_scale_ratio_mean": _safe_masked_mean(scale / scale_mean, selected_mask, zero),
                 })
 
         return diagnostics
@@ -1175,6 +1234,8 @@ def _prototype_diagnostics(
     unique_assign_conf,
     unique_assign_margin,
     unique_top2_conf,
+    unique_top2_proto_idx,
+    unique_global_indices,
     point_reliability,
     update_confidence,
     update_confident_mask,
@@ -1191,6 +1252,8 @@ def _prototype_diagnostics(
     split_probe_entropy_thresh=0.1,
     split_probe_margin_thresh=0.65,
     split_probe_second_conf_thresh=0.08,
+    split_probe_top_ratio=0.0,
+    split_probe_max_candidates=0,
     eps=1e-8,
 ):
     with torch.no_grad():
@@ -1350,10 +1413,13 @@ def _prototype_diagnostics(
             "proto_uncertain_boundary_selected_ratio": uncertain_boundary_selected_ratio,
         })
         diagnostics.update(_prototype_split_candidate_diagnostics(
+            unique_global_indices=unique_global_indices,
             unique_entropy=unique_entropy,
             unique_assign_conf=unique_assign_conf,
             unique_assign_margin=unique_assign_margin,
             unique_top2_conf=unique_top2_conf,
+            unique_top1_proto_idx=unique_proto_idx,
+            unique_top2_proto_idx=unique_top2_proto_idx,
             point_reliability=point_reliability,
             boundary_exposure=boundary_exposure,
             unique_scale=unique_scale,
@@ -1364,6 +1430,8 @@ def _prototype_diagnostics(
             entropy_thresh=split_probe_entropy_thresh,
             margin_thresh=split_probe_margin_thresh,
             second_conf_thresh=split_probe_second_conf_thresh,
+            top_ratio=split_probe_top_ratio,
+            max_candidates=split_probe_max_candidates,
             eps=eps,
         ))
         return diagnostics
@@ -1428,6 +1496,8 @@ def loss_prototype_learning(
     split_probe_entropy_thresh=0.1,
     split_probe_margin_thresh=0.65,
     split_probe_second_conf_thresh=0.08,
+    split_probe_top_ratio=0.0,
+    split_probe_max_candidates=0,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -1491,18 +1561,22 @@ def loss_prototype_learning(
     if topk.values.shape[-1] > 1:
         assign_margin = topk.values[:, 0] - topk.values[:, 1]
         top2_conf = topk.values[:, 1]
+        top2_proto_idx = topk.indices[:, 1]
     else:
         assign_margin = topk.values[:, 0]
         top2_conf = torch.zeros_like(assign_conf)
+        top2_proto_idx = topk.indices[:, 0]
     assigned_proto_idx = topk.indices[:, 0]
 
     unique_indices = graph_data["proto_unique_indices"]
+    unique_global_indices = feature_indices[unique_indices]
     unique_features = selected_features[unique_indices]
     unique_probs = assignment_probs[unique_indices]
     unique_entropy = entropy[unique_indices]
     unique_assign_conf = assign_conf[unique_indices]
     unique_assign_margin = assign_margin[unique_indices]
     unique_top2_conf = top2_conf[unique_indices]
+    unique_top2_proto_idx = top2_proto_idx[unique_indices]
     unique_scale = None
     if gaussian_scales is not None:
         selected_scales = gaussian_scales[feature_indices]
@@ -1795,6 +1869,8 @@ def loss_prototype_learning(
         unique_assign_conf=unique_assign_conf,
         unique_assign_margin=unique_assign_margin,
         unique_top2_conf=unique_top2_conf,
+        unique_top2_proto_idx=unique_top2_proto_idx,
+        unique_global_indices=unique_global_indices,
         point_reliability=point_reliability,
         update_confidence=update_confidence,
         update_confident_mask=update_confident_mask,
@@ -1811,6 +1887,8 @@ def loss_prototype_learning(
         split_probe_entropy_thresh=split_probe_entropy_thresh,
         split_probe_margin_thresh=split_probe_margin_thresh,
         split_probe_second_conf_thresh=split_probe_second_conf_thresh,
+        split_probe_top_ratio=split_probe_top_ratio,
+        split_probe_max_candidates=split_probe_max_candidates,
         eps=eps,
     )
 
