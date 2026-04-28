@@ -89,6 +89,10 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_margin_p90",
         "proto_update_selected_count",
         "proto_update_selected_ratio",
+        "proto_update_conf_mean",
+        "proto_update_conf_std",
+        "proto_active_update_ratio",
+        "proto_high_conf_update_ratio",
         "proto_update_confidence_p50",
         "proto_update_confidence_p90",
         "proto_push_loss",
@@ -449,6 +453,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 update_entropy_thresh=opt.proto_update_entropy_thresh,
                 update_assign_conf_thresh=opt.proto_update_assign_conf_thresh,
                 update_sem_invalid_weight=opt.proto_update_sem_invalid_weight,
+                update_mode=opt.proto_update_mode,
+                update_boundary_gamma=opt.proto_update_boundary_gamma,
                 boundary_safe_update=opt.proto_boundary_safe_update,
                 update_neg_boundary_weight=opt.proto_update_neg_boundary_weight,
                 update_ignore_boundary_weight=opt.proto_update_ignore_boundary_weight,
@@ -891,6 +897,8 @@ if __name__ == "__main__":
     args.proto_update_entropy_thresh = config.get("proto_update_entropy_thresh", config.get("proto_entropy_thresh", args.proto_update_entropy_thresh))
     args.proto_update_assign_conf_thresh = config.get("proto_update_assign_conf_thresh", config.get("proto_assign_conf_thresh", args.proto_update_assign_conf_thresh))
     args.proto_update_sem_invalid_weight = config.get("proto_update_sem_invalid_weight", config.get("proto_sem_invalid_weight", args.proto_update_sem_invalid_weight))
+    args.proto_update_mode = config.get("proto_update_mode", args.proto_update_mode)
+    args.proto_update_boundary_gamma = config.get("proto_update_boundary_gamma", args.proto_update_boundary_gamma)
     args.proto_boundary_safe_update = config.get("proto_boundary_safe_update", args.proto_boundary_safe_update)
     args.proto_update_neg_boundary_weight = config.get("proto_update_neg_boundary_weight", args.proto_update_neg_boundary_weight)
     args.proto_update_ignore_boundary_weight = config.get("proto_update_ignore_boundary_weight", args.proto_update_ignore_boundary_weight)

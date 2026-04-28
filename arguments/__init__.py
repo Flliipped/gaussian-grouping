@@ -166,6 +166,8 @@ class OptimizationParams(ParamGroup):
         self.proto_update_entropy_thresh = self.proto_entropy_thresh
         self.proto_update_assign_conf_thresh = self.proto_assign_conf_thresh
         self.proto_update_sem_invalid_weight = self.proto_sem_invalid_weight
+        self.proto_update_mode = "legacy"
+        self.proto_update_boundary_gamma = 1.0
         self.proto_boundary_safe_update = False
         self.proto_update_neg_boundary_weight = 1.0
         self.proto_update_ignore_boundary_weight = 1.0

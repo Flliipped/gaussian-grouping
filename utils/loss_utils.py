@@ -750,6 +750,10 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_margin_p90": zero,
             "proto_update_selected_count": zero,
             "proto_update_selected_ratio": zero,
+            "proto_update_conf_mean": zero,
+            "proto_update_conf_std": zero,
+            "proto_active_update_ratio": zero,
+            "proto_high_conf_update_ratio": zero,
             "proto_update_confidence_p50": zero,
             "proto_update_confidence_p90": zero,
             "proto_push_loss": zero,
@@ -1101,6 +1105,7 @@ def _prototype_diagnostics(
 
         selected_update_confidence = update_confidence.detach().reshape(-1)[update_selected]
         _, update_confidence_p50, update_confidence_p90 = _safe_quantiles(selected_update_confidence, zero)
+        detached_update_confidence = update_confidence.detach().reshape(-1).to(dtype=zero.dtype)
 
         pair_cosine_mean = zero
         pair_cosine_max = zero
@@ -1199,6 +1204,10 @@ def _prototype_diagnostics(
             "proto_margin_p90": margin_p90,
             "proto_update_selected_count": update_selected.to(dtype=zero.dtype).sum().detach(),
             "proto_update_selected_ratio": update_selected.to(dtype=zero.dtype).mean().detach(),
+            "proto_update_conf_mean": detached_update_confidence.mean().detach(),
+            "proto_update_conf_std": detached_update_confidence.std(unbiased=False).detach(),
+            "proto_active_update_ratio": update_selected.to(dtype=zero.dtype).mean().detach(),
+            "proto_high_conf_update_ratio": update_selected.to(dtype=zero.dtype).mean().detach(),
             "proto_update_confidence_p50": update_confidence_p50,
             "proto_update_confidence_p90": update_confidence_p90,
             "proto_boundary_exposure_mean": boundary_exposure.mean().detach(),
@@ -1260,6 +1269,8 @@ def loss_prototype_learning(
     update_entropy_thresh=None,
     update_assign_conf_thresh=None,
     update_sem_invalid_weight=None,
+    update_mode="legacy",
+    update_boundary_gamma=1.0,
     boundary_safe_update=False,
     update_neg_boundary_weight=1.0,
     update_ignore_boundary_weight=1.0,
@@ -1373,11 +1384,6 @@ def loss_prototype_learning(
         & (unique_assign_conf >= update_assign_conf_thresh)
     ).to(unique_features.dtype)
 
-    pull_confidence = (1.0 - unique_entropy) * point_reliability * pull_sem_gate * pull_mask
-    confident_mask = (pull_confidence >= conf_thresh).to(unique_features.dtype)
-    update_confidence = (1.0 - unique_entropy) * point_reliability * update_sem_gate * update_mask
-    update_confident_mask = (update_confidence >= update_conf_thresh).to(unique_features.dtype)
-
     neg_boundary_mask, ignore_boundary_mask = _prototype_boundary_masks(
         graph_data,
         unique_indices,
@@ -1390,6 +1396,20 @@ def loss_prototype_learning(
         ignore_weight=boundary_exposure_ignore_weight,
         eps=eps,
     )
+
+    pull_confidence = (1.0 - unique_entropy) * point_reliability * pull_sem_gate * pull_mask
+    confident_mask = (pull_confidence >= conf_thresh).to(unique_features.dtype)
+    update_confidence = (1.0 - unique_entropy) * point_reliability * update_sem_gate * update_mask
+    update_mode_value = str(update_mode).lower()
+    if update_mode_value in ("boundary_exposure", "boundary_score", "exposure"):
+        # Boundary exposure is a detached graph diagnostic, not a GT boundary.
+        # Gamma < 1 keeps the first confidence-update experiment conservative.
+        update_boundary_factor = (
+            1.0 - boundary_exposure.to(dtype=update_confidence.dtype)
+        ).clamp(0.0, 1.0).pow(max(float(update_boundary_gamma), 0.0))
+        update_confidence = update_confidence * update_boundary_factor
+    update_confident_mask = (update_confidence >= update_conf_thresh).to(unique_features.dtype)
+
     update_sample_weight = None
     with torch.no_grad():
         update_boundary_weight = unique_features.new_ones(unique_features.shape[0])
