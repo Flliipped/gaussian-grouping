@@ -781,6 +781,21 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_uncertain_boundary_entropy": zero,
             "proto_uncertain_boundary_assign_conf": zero,
             "proto_uncertain_boundary_selected_ratio": zero,
+            "proto_split_probe_active": zero,
+            "proto_split_candidate_count": zero,
+            "proto_split_candidate_ratio": zero,
+            "proto_split_candidate_score_mean": zero,
+            "proto_split_candidate_score_p90": zero,
+            "proto_split_candidate_entropy_mean": zero,
+            "proto_split_candidate_margin_mean": zero,
+            "proto_split_candidate_boundary_exposure_mean": zero,
+            "proto_split_candidate_reliability_mean": zero,
+            "proto_split_candidate_scale_mean": zero,
+            "proto_split_candidate_scale_ratio_mean": zero,
+            "proto_split_candidate_top1_conf_mean": zero,
+            "proto_split_candidate_top2_conf_mean": zero,
+            "proto_split_boundary_top2_conf_mean": zero,
+            "proto_split_boundary_score_mean": zero,
         }
 
 
@@ -980,6 +995,98 @@ def _safe_masked_mean(values, mask, zero):
     return values[mask].mean().to(dtype=zero.dtype).detach()
 
 
+def _prototype_split_candidate_diagnostics(
+    unique_entropy,
+    unique_assign_conf,
+    unique_assign_margin,
+    unique_top2_conf,
+    point_reliability,
+    boundary_exposure,
+    unique_scale,
+    zero,
+    split_probe_enabled=False,
+    score_thresh=0.005,
+    boundary_thresh=0.2,
+    entropy_thresh=0.1,
+    margin_thresh=0.65,
+    second_conf_thresh=0.08,
+    eps=1e-8,
+):
+    with torch.no_grad():
+        diagnostics = {
+            "proto_split_probe_active": zero.new_tensor(float(bool(split_probe_enabled))),
+            "proto_split_candidate_count": zero,
+            "proto_split_candidate_ratio": zero,
+            "proto_split_candidate_score_mean": zero,
+            "proto_split_candidate_score_p90": zero,
+            "proto_split_candidate_entropy_mean": zero,
+            "proto_split_candidate_margin_mean": zero,
+            "proto_split_candidate_boundary_exposure_mean": zero,
+            "proto_split_candidate_reliability_mean": zero,
+            "proto_split_candidate_scale_mean": zero,
+            "proto_split_candidate_scale_ratio_mean": zero,
+            "proto_split_candidate_top1_conf_mean": zero,
+            "proto_split_candidate_top2_conf_mean": zero,
+            "proto_split_boundary_top2_conf_mean": zero,
+            "proto_split_boundary_score_mean": zero,
+        }
+        if not split_probe_enabled:
+            return diagnostics
+
+        entropy = unique_entropy.detach().reshape(-1).to(dtype=zero.dtype)
+        top1_conf = unique_assign_conf.detach().reshape(-1).to(dtype=zero.dtype)
+        margin = unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)
+        top2_conf = unique_top2_conf.detach().reshape(-1).to(dtype=zero.dtype)
+        reliability = point_reliability.detach().reshape(-1).to(dtype=zero.dtype)
+        exposure = boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
+        if entropy.numel() == 0:
+            return diagnostics
+
+        split_score = (
+            entropy
+            * (1.0 - margin).clamp_min(0.0)
+            * exposure
+            * top2_conf.clamp_min(0.0)
+        )
+        boundary_mask = exposure >= float(boundary_thresh)
+        candidate_mask = (
+            boundary_mask
+            & (split_score >= float(score_thresh))
+            & (entropy >= float(entropy_thresh))
+            & (margin <= float(margin_thresh))
+            & (top2_conf >= float(second_conf_thresh))
+        )
+        candidate_count = candidate_mask.to(dtype=zero.dtype).sum()
+        candidate_ratio = candidate_count / entropy.numel()
+
+        _, _, split_score_p90 = _safe_quantiles(split_score, zero)
+        diagnostics.update({
+            "proto_split_candidate_count": candidate_count.detach(),
+            "proto_split_candidate_ratio": candidate_ratio.detach(),
+            "proto_split_candidate_score_mean": _safe_masked_mean(split_score, candidate_mask, zero),
+            "proto_split_candidate_score_p90": split_score_p90,
+            "proto_split_candidate_entropy_mean": _safe_masked_mean(entropy, candidate_mask, zero),
+            "proto_split_candidate_margin_mean": _safe_masked_mean(margin, candidate_mask, zero),
+            "proto_split_candidate_boundary_exposure_mean": _safe_masked_mean(exposure, candidate_mask, zero),
+            "proto_split_candidate_reliability_mean": _safe_masked_mean(reliability, candidate_mask, zero),
+            "proto_split_candidate_top1_conf_mean": _safe_masked_mean(top1_conf, candidate_mask, zero),
+            "proto_split_candidate_top2_conf_mean": _safe_masked_mean(top2_conf, candidate_mask, zero),
+            "proto_split_boundary_top2_conf_mean": _safe_masked_mean(top2_conf, boundary_mask, zero),
+            "proto_split_boundary_score_mean": _safe_masked_mean(split_score, boundary_mask, zero),
+        })
+
+        if unique_scale is not None:
+            scale = unique_scale.detach().reshape(-1).to(dtype=zero.dtype)
+            if scale.numel() == entropy.numel():
+                scale_mean = scale.mean().clamp_min(eps)
+                diagnostics.update({
+                    "proto_split_candidate_scale_mean": _safe_masked_mean(scale, candidate_mask, zero),
+                    "proto_split_candidate_scale_ratio_mean": _safe_masked_mean(scale / scale_mean, candidate_mask, zero),
+                })
+
+        return diagnostics
+
+
 def _feature_side_prototype_push_loss(
     unique_features,
     prototype_bank,
@@ -1067,14 +1174,23 @@ def _prototype_diagnostics(
     unique_entropy,
     unique_assign_conf,
     unique_assign_margin,
+    unique_top2_conf,
+    point_reliability,
     update_confidence,
     update_confident_mask,
     neg_boundary_exposure,
     ignore_boundary_exposure,
     boundary_exposure,
+    unique_scale,
     zero,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
+    split_probe_enabled=False,
+    split_probe_score_thresh=0.005,
+    split_probe_boundary_thresh=0.2,
+    split_probe_entropy_thresh=0.1,
+    split_probe_margin_thresh=0.65,
+    split_probe_second_conf_thresh=0.08,
     eps=1e-8,
 ):
     with torch.no_grad():
@@ -1233,6 +1349,23 @@ def _prototype_diagnostics(
             "proto_uncertain_boundary_assign_conf": uncertain_boundary_assign_conf,
             "proto_uncertain_boundary_selected_ratio": uncertain_boundary_selected_ratio,
         })
+        diagnostics.update(_prototype_split_candidate_diagnostics(
+            unique_entropy=unique_entropy,
+            unique_assign_conf=unique_assign_conf,
+            unique_assign_margin=unique_assign_margin,
+            unique_top2_conf=unique_top2_conf,
+            point_reliability=point_reliability,
+            boundary_exposure=boundary_exposure,
+            unique_scale=unique_scale,
+            zero=zero,
+            split_probe_enabled=split_probe_enabled,
+            score_thresh=split_probe_score_thresh,
+            boundary_thresh=split_probe_boundary_thresh,
+            entropy_thresh=split_probe_entropy_thresh,
+            margin_thresh=split_probe_margin_thresh,
+            second_conf_thresh=split_probe_second_conf_thresh,
+            eps=eps,
+        ))
         return diagnostics
 
 
@@ -1240,6 +1373,7 @@ def loss_prototype_learning(
     features,
     prototype_bank,
     graph_data,
+    gaussian_scales=None,
     lambda_val=1.0,
     lambda_pull=1.0,
     lambda_sep=0.1,
@@ -1288,6 +1422,12 @@ def loss_prototype_learning(
     boundary_exposure_ignore_weight=0.3,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
+    split_probe_enabled=False,
+    split_probe_score_thresh=0.005,
+    split_probe_boundary_thresh=0.2,
+    split_probe_entropy_thresh=0.1,
+    split_probe_margin_thresh=0.65,
+    split_probe_second_conf_thresh=0.08,
     eps=1e-8,
 ):
     zero = features.new_tensor(0.0)
@@ -1350,8 +1490,10 @@ def loss_prototype_learning(
     assign_conf = topk.values[:, 0]
     if topk.values.shape[-1] > 1:
         assign_margin = topk.values[:, 0] - topk.values[:, 1]
+        top2_conf = topk.values[:, 1]
     else:
         assign_margin = topk.values[:, 0]
+        top2_conf = torch.zeros_like(assign_conf)
     assigned_proto_idx = topk.indices[:, 0]
 
     unique_indices = graph_data["proto_unique_indices"]
@@ -1360,6 +1502,14 @@ def loss_prototype_learning(
     unique_entropy = entropy[unique_indices]
     unique_assign_conf = assign_conf[unique_indices]
     unique_assign_margin = assign_margin[unique_indices]
+    unique_top2_conf = top2_conf[unique_indices]
+    unique_scale = None
+    if gaussian_scales is not None:
+        selected_scales = gaussian_scales[feature_indices]
+        if selected_scales.ndim > 1:
+            unique_scale = selected_scales[unique_indices].mean(dim=-1)
+        else:
+            unique_scale = selected_scales[unique_indices]
     point_reliability = graph_data["point_reliability"].to(unique_features.dtype)
     point_sem_confidence = graph_data["point_sem_confidence"].to(unique_features.dtype)
     point_sem_valid = graph_data["point_sem_valid"]
@@ -1644,14 +1794,23 @@ def loss_prototype_learning(
         unique_entropy=unique_entropy,
         unique_assign_conf=unique_assign_conf,
         unique_assign_margin=unique_assign_margin,
+        unique_top2_conf=unique_top2_conf,
+        point_reliability=point_reliability,
         update_confidence=update_confidence,
         update_confident_mask=update_confident_mask,
         neg_boundary_exposure=neg_boundary_exposure,
         ignore_boundary_exposure=ignore_boundary_exposure,
         boundary_exposure=boundary_exposure,
+        unique_scale=unique_scale,
         zero=zero,
         ambiguity_thresh=ambiguity_thresh,
         ambiguity_boundary_thresh=ambiguity_boundary_thresh,
+        split_probe_enabled=split_probe_enabled,
+        split_probe_score_thresh=split_probe_score_thresh,
+        split_probe_boundary_thresh=split_probe_boundary_thresh,
+        split_probe_entropy_thresh=split_probe_entropy_thresh,
+        split_probe_margin_thresh=split_probe_margin_thresh,
+        split_probe_second_conf_thresh=split_probe_second_conf_thresh,
         eps=eps,
     )
 

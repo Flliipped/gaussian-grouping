@@ -185,6 +185,14 @@ class OptimizationParams(ParamGroup):
         self.proto_boundary_exposure_ignore_weight = 0.3
         self.proto_ambiguity_thresh = 0.05
         self.proto_ambiguity_boundary_thresh = 0.2
+        self.use_split_probe = False
+        self.split_probe_start_iter = 24_000
+        self.split_probe_interval = 10
+        self.split_probe_score_thresh = 0.005
+        self.split_probe_boundary_thresh = 0.2
+        self.split_probe_entropy_thresh = 0.1
+        self.split_probe_margin_thresh = 0.65
+        self.split_probe_second_conf_thresh = 0.08
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter

@@ -120,6 +120,21 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_uncertain_boundary_entropy",
         "proto_uncertain_boundary_assign_conf",
         "proto_uncertain_boundary_selected_ratio",
+        "proto_split_probe_active",
+        "proto_split_candidate_count",
+        "proto_split_candidate_ratio",
+        "proto_split_candidate_score_mean",
+        "proto_split_candidate_score_p90",
+        "proto_split_candidate_entropy_mean",
+        "proto_split_candidate_margin_mean",
+        "proto_split_candidate_boundary_exposure_mean",
+        "proto_split_candidate_reliability_mean",
+        "proto_split_candidate_scale_mean",
+        "proto_split_candidate_scale_ratio_mean",
+        "proto_split_candidate_top1_conf_mean",
+        "proto_split_candidate_top2_conf_mean",
+        "proto_split_boundary_top2_conf_mean",
+        "proto_split_boundary_score_mean",
     ]
     for key in scalar_keys:
         if key in proto_diag:
@@ -424,6 +439,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 features=gaussians._objects_dc.squeeze(1),
                 prototype_bank=prototype_bank,
                 graph_data=graph_data,
+                gaussian_scales=gaussians.get_scaling.detach(),
                 lambda_val=1.0,
                 lambda_pull=opt.proto_lambda_pull,
                 lambda_sep=opt.proto_lambda_sep,
@@ -472,6 +488,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
+                split_probe_enabled=(
+                    opt.use_split_probe
+                    and iteration >= opt.split_probe_start_iter
+                    and iteration % opt.split_probe_interval == 0
+                ),
+                split_probe_score_thresh=opt.split_probe_score_thresh,
+                split_probe_boundary_thresh=opt.split_probe_boundary_thresh,
+                split_probe_entropy_thresh=opt.split_probe_entropy_thresh,
+                split_probe_margin_thresh=opt.split_probe_margin_thresh,
+                split_probe_second_conf_thresh=opt.split_probe_second_conf_thresh,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -599,7 +625,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
                         + f"update_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_update_selected_ratio'):.6f}, "
                         + f"neg_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_neg_boundary_selected_ratio'):.6f}, "
-                        + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}"
+                        + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}, "
+                        + f"split_candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_split_candidate_ratio'):.6f}, "
+                        + f"split_candidate_score={_proto_diag_scalar(proto_diag, 'proto_split_candidate_score_mean'):.6f}, "
+                        + f"split_candidate_top2={_proto_diag_scalar(proto_diag, 'proto_split_candidate_top2_conf_mean'):.6f}"
                     )
 
 
@@ -916,6 +945,14 @@ if __name__ == "__main__":
     args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
     args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
     args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)
+    args.use_split_probe = config.get("use_split_probe", args.use_split_probe)
+    args.split_probe_start_iter = config.get("split_probe_start_iter", args.split_probe_start_iter)
+    args.split_probe_interval = config.get("split_probe_interval", args.split_probe_interval)
+    args.split_probe_score_thresh = config.get("split_probe_score_thresh", args.split_probe_score_thresh)
+    args.split_probe_boundary_thresh = config.get("split_probe_boundary_thresh", args.split_probe_boundary_thresh)
+    args.split_probe_entropy_thresh = config.get("split_probe_entropy_thresh", args.split_probe_entropy_thresh)
+    args.split_probe_margin_thresh = config.get("split_probe_margin_thresh", args.split_probe_margin_thresh)
+    args.split_probe_second_conf_thresh = config.get("split_probe_second_conf_thresh", args.split_probe_second_conf_thresh)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
