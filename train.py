@@ -140,6 +140,9 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_split_boundary_top2_conf_mean",
         "proto_split_boundary_score_mean",
         "proto_split_actual_count",
+        "proto_split_actual_child_count",
+        "proto_split_net_point_delta",
+        "proto_split_keep_parent",
         "proto_split_total_points",
     ]
     for key in scalar_keys:
@@ -766,13 +769,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 opt,
                 iteration,
             )
+            net_point_delta = 2 * split_actual_count
+            if opt.split_prune_original:
+                net_point_delta -= split_actual_count
             if proto_diag:
                 proto_diag["proto_split_actual_count"] = image.new_tensor(float(split_actual_count)).detach()
+                proto_diag["proto_split_actual_child_count"] = image.new_tensor(float(2 * split_actual_count)).detach()
+                proto_diag["proto_split_net_point_delta"] = image.new_tensor(float(net_point_delta)).detach()
+                proto_diag["proto_split_keep_parent"] = image.new_tensor(float(not opt.split_prune_original)).detach()
                 proto_diag["proto_split_total_points"] = image.new_tensor(float(gaussians.get_xyz.shape[0])).detach()
             if split_actual_count > 0:
                 print(
                     f"[Iter {iteration}] prototype-disagreement split: "
                     f"split {split_actual_count} ambiguous Gaussians, "
+                    f"net_delta={net_point_delta}, "
                     f"total_points={gaussians.get_xyz.shape[0]}"
                 )
 
