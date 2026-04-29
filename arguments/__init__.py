@@ -197,6 +197,15 @@ class OptimizationParams(ParamGroup):
         self.split_probe_max_candidates = 0
         self.split_probe_save_interval = 500
         self.split_probe_export_max_count = 512
+        self.use_ambiguous_split = False
+        self.split_start_iter = 26_000
+        self.split_interval = 1000
+        self.split_max_candidates = 128
+        self.split_scale_shrink = 0.7
+        self.split_offset_scale = 0.35
+        self.split_feature_blend = 0.6
+        self.split_opacity_scale = 0.5
+        self.split_prune_original = True
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter

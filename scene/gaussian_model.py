@@ -7,6 +7,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -536,6 +537,134 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    @torch.no_grad()
+    def split_ambiguous_gaussians(
+        self,
+        selected_idx,
+        top1_proto_idx,
+        top2_proto_idx,
+        prototypes,
+        split_scale_shrink=0.7,
+        split_offset_scale=0.35,
+        split_feature_blend=0.6,
+        split_opacity_scale=0.5,
+        prune_original=True,
+    ):
+        if selected_idx is None or top1_proto_idx is None or top2_proto_idx is None:
+            return 0
+        if prototypes is None or prototypes.numel() == 0:
+            return 0
+
+        device = self._xyz.device
+        selected_idx = selected_idx.detach().to(device=device, dtype=torch.long).reshape(-1)
+        top1_proto_idx = top1_proto_idx.detach().to(device=device, dtype=torch.long).reshape(-1)
+        top2_proto_idx = top2_proto_idx.detach().to(device=device, dtype=torch.long).reshape(-1)
+        if selected_idx.numel() == 0:
+            return 0
+
+        count = min(selected_idx.numel(), top1_proto_idx.numel(), top2_proto_idx.numel())
+        selected_idx = selected_idx[:count]
+        top1_proto_idx = top1_proto_idx[:count]
+        top2_proto_idx = top2_proto_idx[:count]
+
+        num_points = self.get_xyz.shape[0]
+        proto_count = prototypes.shape[0]
+        valid_mask = (
+            (selected_idx >= 0)
+            & (selected_idx < num_points)
+            & (top1_proto_idx >= 0)
+            & (top1_proto_idx < proto_count)
+            & (top2_proto_idx >= 0)
+            & (top2_proto_idx < proto_count)
+        )
+        if not valid_mask.any():
+            return 0
+
+        selected_idx = selected_idx[valid_mask]
+        top1_proto_idx = top1_proto_idx[valid_mask]
+        top2_proto_idx = top2_proto_idx[valid_mask]
+
+        keep_positions = []
+        seen_indices = set()
+        for position, point_idx in enumerate(selected_idx.detach().cpu().tolist()):
+            if point_idx in seen_indices:
+                continue
+            seen_indices.add(point_idx)
+            keep_positions.append(position)
+        if not keep_positions:
+            return 0
+        keep_positions = torch.tensor(keep_positions, device=device, dtype=torch.long)
+        selected_idx = selected_idx[keep_positions]
+        top1_proto_idx = top1_proto_idx[keep_positions]
+        top2_proto_idx = top2_proto_idx[keep_positions]
+
+        prototypes = prototypes.detach().to(device=device, dtype=self._objects_dc.dtype)
+        if prototypes.shape[-1] != self._objects_dc.shape[-1]:
+            return 0
+        prototypes = F.normalize(prototypes, dim=-1, eps=1e-8)
+
+        base_xyz = self._xyz[selected_idx]
+        base_scaling = self.get_scaling[selected_idx]
+        base_rotation = self._rotation[selected_idx]
+        base_features_dc = self._features_dc[selected_idx]
+        base_features_rest = self._features_rest[selected_idx]
+
+        axis_idx = torch.argmax(base_scaling, dim=-1)
+        rotation_matrix = build_rotation(base_rotation)
+        split_axis = torch.gather(
+            rotation_matrix,
+            2,
+            axis_idx.view(-1, 1, 1).expand(-1, 3, 1),
+        ).squeeze(-1)
+        split_axis = F.normalize(split_axis, dim=-1, eps=1e-8)
+        max_scale = base_scaling.max(dim=-1, keepdim=True).values
+        offset = split_axis * max_scale * max(float(split_offset_scale), 0.0)
+
+        new_xyz = torch.cat([base_xyz + offset, base_xyz - offset], dim=0)
+        shrink = max(float(split_scale_shrink), 1e-4)
+        child_scaling = self.scaling_inverse_activation((base_scaling * shrink).clamp_min(1e-8))
+        new_scaling = torch.cat([child_scaling, child_scaling], dim=0)
+        new_rotation = torch.cat([base_rotation, base_rotation], dim=0)
+        new_features_dc = torch.cat([base_features_dc, base_features_dc], dim=0)
+        new_features_rest = torch.cat([base_features_rest, base_features_rest], dim=0)
+
+        opacity_scale = min(max(float(split_opacity_scale), 1e-4), 1.0)
+        child_opacity = (self.get_opacity[selected_idx] * opacity_scale).clamp(1e-6, 1.0 - 1e-6)
+        child_opacity = inverse_sigmoid(child_opacity)
+        new_opacity = torch.cat([child_opacity, child_opacity], dim=0)
+
+        parent_objects = self._objects_dc[selected_idx].squeeze(1)
+        parent_norm = parent_objects.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        parent_dir = F.normalize(parent_objects, dim=-1, eps=1e-8)
+        blend = min(max(float(split_feature_blend), 0.0), 1.0)
+        proto1 = prototypes[top1_proto_idx]
+        proto2 = prototypes[top2_proto_idx]
+        child1_objects = F.normalize((1.0 - blend) * parent_dir + blend * proto1, dim=-1, eps=1e-8) * parent_norm
+        child2_objects = F.normalize((1.0 - blend) * parent_dir + blend * proto2, dim=-1, eps=1e-8) * parent_norm
+        new_objects_dc = torch.cat([child1_objects, child2_objects], dim=0).unsqueeze(1)
+
+        n_init_points = num_points
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_objects_dc,
+        )
+
+        if prune_original:
+            prune_filter = torch.zeros(
+                n_init_points + 2 * selected_idx.numel(),
+                device=device,
+                dtype=torch.bool,
+            )
+            prune_filter[selected_idx] = True
+            self.prune_points(prune_filter)
+
+        return int(selected_idx.numel())
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

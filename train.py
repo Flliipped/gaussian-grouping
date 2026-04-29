@@ -139,6 +139,8 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_split_candidate_top2_conf_mean",
         "proto_split_boundary_top2_conf_mean",
         "proto_split_boundary_score_mean",
+        "proto_split_actual_count",
+        "proto_split_total_points",
     ]
     for key in scalar_keys:
         if key in proto_diag:
@@ -190,6 +192,56 @@ def _export_split_probe_candidates(model_path, iteration, proto_diag, max_count=
         "top2_proto": top2_proto[export_order].detach().cpu() if top2_proto is not None else None,
     }
     torch.save(payload, os.path.join(export_dir, f"candidates_{iteration:06d}.pth"))
+
+
+def _apply_ambiguous_split(gaussians, prototype_bank, proto_diag, opt, iteration):
+    if not getattr(opt, "use_ambiguous_split", False):
+        return 0
+    if prototype_bank is None or proto_diag is None:
+        return 0
+
+    split_start_iter = max(int(opt.split_start_iter), int(opt.densify_until_iter))
+    if iteration < split_start_iter:
+        return 0
+    if iteration >= int(opt.iterations):
+        return 0
+    if int(opt.split_interval) <= 0 or iteration % int(opt.split_interval) != 0:
+        return 0
+    if hasattr(prototype_bank, "initialized") and not bool(prototype_bank.initialized.item()):
+        return 0
+
+    candidate_indices = _proto_diag_tensor(proto_diag, "proto_split_candidate_global_indices")
+    top1_proto = _proto_diag_tensor(proto_diag, "proto_split_candidate_top1_proto")
+    top2_proto = _proto_diag_tensor(proto_diag, "proto_split_candidate_top2_proto")
+    if candidate_indices is None or top1_proto is None or top2_proto is None:
+        return 0
+    if candidate_indices.numel() == 0:
+        return 0
+
+    scores = _proto_diag_tensor(proto_diag, "proto_split_candidate_scores")
+    split_count = candidate_indices.numel()
+    max_candidates = int(opt.split_max_candidates)
+    if max_candidates > 0:
+        split_count = min(split_count, max_candidates)
+    if split_count <= 0:
+        return 0
+
+    if scores is not None and scores.numel() == candidate_indices.numel():
+        _, order = scores.float().topk(split_count, largest=True)
+    else:
+        order = torch.arange(split_count, device=candidate_indices.device)
+
+    return gaussians.split_ambiguous_gaussians(
+        candidate_indices[order],
+        top1_proto[order],
+        top2_proto[order],
+        prototype_bank.prototypes,
+        split_scale_shrink=opt.split_scale_shrink,
+        split_offset_scale=opt.split_offset_scale,
+        split_feature_blend=opt.split_feature_blend,
+        split_opacity_scale=opt.split_opacity_scale,
+        prune_original=opt.split_prune_original,
+    )
 
 
 def _build_graph_support_cache(cameras, num_support):
@@ -379,7 +431,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_diag = {}
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
-        proto_active = opt.use_proto and iteration >= opt.proto_start_iter and iteration % opt.proto_interval == 0
+        split_due = (
+            opt.use_ambiguous_split
+            and iteration >= max(opt.split_start_iter, opt.densify_until_iter)
+            and iteration < opt.iterations
+            and opt.split_interval > 0
+            and iteration % opt.split_interval == 0
+        )
+        split_probe_due = (
+            opt.use_split_probe
+            and iteration >= opt.split_probe_start_iter
+            and opt.split_probe_interval > 0
+            and iteration % opt.split_probe_interval == 0
+        )
+        proto_active = (
+            opt.use_proto
+            and iteration >= opt.proto_start_iter
+            and (iteration % opt.proto_interval == 0 or split_due)
+        )
         graph_context_active = graph_active or proto_active
         graph_data = None
 
@@ -522,11 +591,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
-                split_probe_enabled=(
-                    opt.use_split_probe
-                    and iteration >= opt.split_probe_start_iter
-                    and iteration % opt.split_probe_interval == 0
-                ),
+                split_probe_enabled=(split_probe_due or split_due),
                 split_probe_score_thresh=opt.split_probe_score_thresh,
                 split_probe_boundary_thresh=opt.split_probe_boundary_thresh,
                 split_probe_entropy_thresh=opt.split_probe_entropy_thresh,
@@ -693,6 +758,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     iteration,
                     proto_diag,
                     max_count=opt.split_probe_export_max_count,
+                )
+            split_actual_count = _apply_ambiguous_split(
+                gaussians,
+                prototype_bank,
+                proto_diag,
+                opt,
+                iteration,
+            )
+            if proto_diag:
+                proto_diag["proto_split_actual_count"] = image.new_tensor(float(split_actual_count)).detach()
+                proto_diag["proto_split_total_points"] = image.new_tensor(float(gaussians.get_xyz.shape[0])).detach()
+            if split_actual_count > 0:
+                print(
+                    f"[Iter {iteration}] prototype-disagreement split: "
+                    f"split {split_actual_count} ambiguous Gaussians, "
+                    f"total_points={gaussians.get_xyz.shape[0]}"
                 )
 
             # Progress bar
@@ -1006,6 +1087,15 @@ if __name__ == "__main__":
     args.split_probe_max_candidates = config.get("split_probe_max_candidates", args.split_probe_max_candidates)
     args.split_probe_save_interval = config.get("split_probe_save_interval", args.split_probe_save_interval)
     args.split_probe_export_max_count = config.get("split_probe_export_max_count", args.split_probe_export_max_count)
+    args.use_ambiguous_split = config.get("use_ambiguous_split", args.use_ambiguous_split)
+    args.split_start_iter = config.get("split_start_iter", args.split_start_iter)
+    args.split_interval = config.get("split_interval", args.split_interval)
+    args.split_max_candidates = config.get("split_max_candidates", args.split_max_candidates)
+    args.split_scale_shrink = config.get("split_scale_shrink", args.split_scale_shrink)
+    args.split_offset_scale = config.get("split_offset_scale", args.split_offset_scale)
+    args.split_feature_blend = config.get("split_feature_blend", args.split_feature_blend)
+    args.split_opacity_scale = config.get("split_opacity_scale", args.split_opacity_scale)
+    args.split_prune_original = config.get("split_prune_original", args.split_prune_original)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)
