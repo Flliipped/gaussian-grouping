@@ -818,6 +818,26 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_uncertain_boundary_entropy": zero,
             "proto_uncertain_boundary_assign_conf": zero,
             "proto_uncertain_boundary_selected_ratio": zero,
+            "proto_candidate_ratio": zero,
+            "proto_candidate_count": zero,
+            "proto_candidate_score_mean": zero,
+            "proto_candidate_entropy_mean": zero,
+            "proto_candidate_margin_mean": zero,
+            "proto_candidate_assign_conf_mean": zero,
+            "proto_candidate_boundary_exposure_mean": zero,
+            "proto_candidate_top2_gap_mean": zero,
+            "proto_candidate_update_selected_ratio": zero,
+            "proto_candidate_update_weight_mean": zero,
+            "proto_candidate_in_update_ratio": zero,
+            "proto_candidate_update_count": zero,
+            "proto_non_candidate_update_count": zero,
+            "proto_candidate_neg_boundary_overlap": zero,
+            "proto_candidate_uncertain_boundary_overlap": zero,
+            "proto_candidate_boundary_proxy_overlap": zero,
+            "proto_candidate_push_active_ratio": zero,
+            "proto_candidate_push_weight_mean": zero,
+            "proto_candidate_push_loss_mean": zero,
+            "proto_non_candidate_push_loss_mean": zero,
             "proto_split_probe_active": zero,
             "proto_split_prefilter_candidate_count": zero,
             "proto_split_prefilter_candidate_ratio": zero,
@@ -1036,6 +1056,162 @@ def _safe_masked_mean(values, mask, zero):
     return values[mask].mean().to(dtype=zero.dtype).detach()
 
 
+def _build_proto_ambiguity_candidates(
+    unique_global_indices,
+    unique_entropy,
+    unique_assign_conf,
+    unique_assign_margin,
+    unique_top2_conf,
+    unique_top1_proto_idx,
+    unique_top2_proto_idx,
+    point_reliability,
+    boundary_exposure,
+    unique_scale,
+    zero,
+    enabled=False,
+    score_thresh=0.005,
+    boundary_thresh=0.2,
+    entropy_thresh=0.1,
+    margin_thresh=0.65,
+    second_conf_thresh=0.08,
+    top_ratio=0.0,
+    max_candidates=0,
+    eps=1e-8,
+):
+    with torch.no_grad():
+        global_indices = unique_global_indices.detach().reshape(-1).long()
+        device = global_indices.device
+        num_points = global_indices.numel()
+        empty_long = global_indices.new_empty((0,))
+        empty_score = zero.new_empty((0,))
+        empty_mask = torch.zeros((num_points,), device=device, dtype=torch.bool)
+        empty_values = zero.new_zeros((num_points,))
+        result = {
+            "candidate_mask": empty_mask,
+            "prefilter_mask": empty_mask.clone(),
+            "boundary_mask": empty_mask.clone(),
+            "score": empty_values,
+            "prefilter_count": zero,
+            "prefilter_ratio": zero,
+            "candidate_count": zero,
+            "candidate_ratio": zero,
+            "candidate_score_mean": zero,
+            "candidate_score_p90": zero,
+            "candidate_score_min": zero,
+            "selection_cutoff": zero,
+            "candidate_entropy_mean": zero,
+            "candidate_margin_mean": zero,
+            "candidate_boundary_exposure_mean": zero,
+            "candidate_reliability_mean": zero,
+            "candidate_top1_conf_mean": zero,
+            "candidate_top2_conf_mean": zero,
+            "boundary_top2_conf_mean": zero,
+            "boundary_score_mean": zero,
+            "candidate_global_indices": empty_long,
+            "candidate_top1_proto": empty_long.clone(),
+            "candidate_top2_proto": empty_long.clone(),
+            "candidate_scores": empty_score,
+            "candidate_scale_mean": zero,
+            "candidate_scale_ratio_mean": zero,
+        }
+        if not enabled or num_points == 0:
+            return result
+
+        top1_proto_idx = unique_top1_proto_idx.detach().reshape(-1).long()
+        top2_proto_idx = unique_top2_proto_idx.detach().reshape(-1).long()
+        entropy = unique_entropy.detach().reshape(-1).to(dtype=zero.dtype)
+        top1_conf = unique_assign_conf.detach().reshape(-1).to(dtype=zero.dtype)
+        margin = unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)
+        top2_conf = unique_top2_conf.detach().reshape(-1).to(dtype=zero.dtype)
+        reliability = point_reliability.detach().reshape(-1).to(dtype=zero.dtype)
+        exposure = boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
+        if entropy.numel() != num_points:
+            return result
+
+        candidate_score = (
+            entropy
+            * (1.0 - margin).clamp_min(0.0)
+            * exposure
+            * top2_conf.clamp_min(0.0)
+        )
+        boundary_mask = exposure >= float(boundary_thresh)
+        prefilter_mask = (
+            boundary_mask
+            & (candidate_score >= float(score_thresh))
+            & (entropy >= float(entropy_thresh))
+            & (margin <= float(margin_thresh))
+            & (top2_conf >= float(second_conf_thresh))
+        )
+        prefilter_count = prefilter_mask.to(dtype=zero.dtype).sum()
+        prefilter_ratio = prefilter_count / max(num_points, 1)
+
+        selected_mask = prefilter_mask
+        selection_cutoff = zero
+        candidate_count_int = int(prefilter_mask.to(dtype=torch.long).sum().item())
+        if candidate_count_int > 0:
+            cap = candidate_count_int
+            if float(top_ratio) > 0.0:
+                ratio_cap = int(max(1, round(num_points * float(top_ratio))))
+                cap = min(cap, ratio_cap)
+            if int(max_candidates) > 0:
+                cap = min(cap, int(max_candidates))
+            if cap < candidate_count_int:
+                masked_score = candidate_score.masked_fill(~prefilter_mask, -float("inf"))
+                selected_values, selected_indices = masked_score.topk(cap, largest=True)
+                selected_mask = torch.zeros_like(prefilter_mask)
+                selected_mask[selected_indices] = True
+                selection_cutoff = selected_values[-1].to(dtype=zero.dtype)
+            else:
+                selection_cutoff = candidate_score[prefilter_mask].min().to(dtype=zero.dtype)
+
+        candidate_count = selected_mask.to(dtype=zero.dtype).sum()
+        candidate_ratio = candidate_count / max(num_points, 1)
+        selected_scores = candidate_score[selected_mask]
+        if selected_scores.numel() > 0:
+            candidate_score_min = selected_scores.min().to(dtype=zero.dtype).detach()
+        else:
+            candidate_score_min = zero
+        _, _, candidate_score_p90 = _safe_quantiles(candidate_score, zero)
+
+        result.update({
+            "candidate_mask": selected_mask.detach(),
+            "prefilter_mask": prefilter_mask.detach(),
+            "boundary_mask": boundary_mask.detach(),
+            "score": candidate_score.detach(),
+            "prefilter_count": prefilter_count.detach(),
+            "prefilter_ratio": prefilter_ratio.detach(),
+            "candidate_count": candidate_count.detach(),
+            "candidate_ratio": candidate_ratio.detach(),
+            "candidate_score_mean": _safe_masked_mean(candidate_score, selected_mask, zero),
+            "candidate_score_p90": candidate_score_p90,
+            "candidate_score_min": candidate_score_min,
+            "selection_cutoff": selection_cutoff.detach(),
+            "candidate_entropy_mean": _safe_masked_mean(entropy, selected_mask, zero),
+            "candidate_margin_mean": _safe_masked_mean(margin, selected_mask, zero),
+            "candidate_boundary_exposure_mean": _safe_masked_mean(exposure, selected_mask, zero),
+            "candidate_reliability_mean": _safe_masked_mean(reliability, selected_mask, zero),
+            "candidate_top1_conf_mean": _safe_masked_mean(top1_conf, selected_mask, zero),
+            "candidate_top2_conf_mean": _safe_masked_mean(top2_conf, selected_mask, zero),
+            "boundary_top2_conf_mean": _safe_masked_mean(top2_conf, boundary_mask, zero),
+            "boundary_score_mean": _safe_masked_mean(candidate_score, boundary_mask, zero),
+            "candidate_global_indices": global_indices[selected_mask].detach(),
+            "candidate_top1_proto": top1_proto_idx[selected_mask].detach(),
+            "candidate_top2_proto": top2_proto_idx[selected_mask].detach(),
+            "candidate_scores": selected_scores.detach(),
+        })
+
+        if unique_scale is not None:
+            scale = unique_scale.detach().reshape(-1).to(dtype=zero.dtype)
+            if scale.numel() == num_points:
+                scale_mean = scale.mean().clamp_min(eps)
+                result.update({
+                    "candidate_scale_mean": _safe_masked_mean(scale, selected_mask, zero),
+                    "candidate_scale_ratio_mean": _safe_masked_mean(scale / scale_mean, selected_mask, zero),
+                })
+
+        return result
+
+
 def _prototype_split_candidate_diagnostics(
     unique_global_indices,
     unique_entropy,
@@ -1091,94 +1267,55 @@ def _prototype_split_candidate_diagnostics(
         if not split_probe_enabled:
             return diagnostics
 
-        global_indices = unique_global_indices.detach().reshape(-1).long()
-        top1_proto_idx = unique_top1_proto_idx.detach().reshape(-1).long()
-        top2_proto_idx = unique_top2_proto_idx.detach().reshape(-1).long()
-        entropy = unique_entropy.detach().reshape(-1).to(dtype=zero.dtype)
-        top1_conf = unique_assign_conf.detach().reshape(-1).to(dtype=zero.dtype)
-        margin = unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)
-        top2_conf = unique_top2_conf.detach().reshape(-1).to(dtype=zero.dtype)
-        reliability = point_reliability.detach().reshape(-1).to(dtype=zero.dtype)
-        exposure = boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
-        if entropy.numel() == 0:
-            return diagnostics
-
-        split_score = (
-            entropy
-            * (1.0 - margin).clamp_min(0.0)
-            * exposure
-            * top2_conf.clamp_min(0.0)
+        candidate_info = _build_proto_ambiguity_candidates(
+            unique_global_indices=unique_global_indices,
+            unique_entropy=unique_entropy,
+            unique_assign_conf=unique_assign_conf,
+            unique_assign_margin=unique_assign_margin,
+            unique_top2_conf=unique_top2_conf,
+            unique_top1_proto_idx=unique_top1_proto_idx,
+            unique_top2_proto_idx=unique_top2_proto_idx,
+            point_reliability=point_reliability,
+            boundary_exposure=boundary_exposure,
+            unique_scale=unique_scale,
+            zero=zero,
+            enabled=True,
+            score_thresh=score_thresh,
+            boundary_thresh=boundary_thresh,
+            entropy_thresh=entropy_thresh,
+            margin_thresh=margin_thresh,
+            second_conf_thresh=second_conf_thresh,
+            top_ratio=top_ratio,
+            max_candidates=max_candidates,
+            eps=eps,
         )
-        boundary_mask = exposure >= float(boundary_thresh)
-        candidate_mask = (
-            boundary_mask
-            & (split_score >= float(score_thresh))
-            & (entropy >= float(entropy_thresh))
-            & (margin <= float(margin_thresh))
-            & (top2_conf >= float(second_conf_thresh))
-        )
-        prefilter_count = candidate_mask.to(dtype=zero.dtype).sum()
-        prefilter_ratio = prefilter_count / entropy.numel()
-
-        selected_mask = candidate_mask
-        selection_cutoff = zero
-        candidate_count_int = int(candidate_mask.to(dtype=torch.long).sum().item())
-        if candidate_count_int > 0:
-            cap = candidate_count_int
-            if float(top_ratio) > 0.0:
-                ratio_cap = int(max(1, round(entropy.numel() * float(top_ratio))))
-                cap = min(cap, ratio_cap)
-            if int(max_candidates) > 0:
-                cap = min(cap, int(max_candidates))
-            if cap < candidate_count_int:
-                masked_score = split_score.masked_fill(~candidate_mask, -float("inf"))
-                selected_values, selected_indices = masked_score.topk(cap, largest=True)
-                selected_mask = torch.zeros_like(candidate_mask)
-                selected_mask[selected_indices] = True
-                selection_cutoff = selected_values[-1].to(dtype=zero.dtype)
-            else:
-                selection_cutoff = split_score[candidate_mask].min().to(dtype=zero.dtype)
-
-        candidate_count = selected_mask.to(dtype=zero.dtype).sum()
-        candidate_ratio = candidate_count / entropy.numel()
-
-        selected_scores = split_score[selected_mask]
-        if selected_scores.numel() > 0:
-            candidate_score_min = selected_scores.min().to(dtype=zero.dtype).detach()
-        else:
-            candidate_score_min = zero
-        _, _, split_score_p90 = _safe_quantiles(split_score, zero)
         diagnostics.update({
-            "proto_split_prefilter_candidate_count": prefilter_count.detach(),
-            "proto_split_prefilter_candidate_ratio": prefilter_ratio.detach(),
-            "proto_split_candidate_count": candidate_count.detach(),
-            "proto_split_candidate_ratio": candidate_ratio.detach(),
-            "proto_split_candidate_score_mean": _safe_masked_mean(split_score, selected_mask, zero),
-            "proto_split_candidate_score_p90": split_score_p90,
-            "proto_split_candidate_score_min": candidate_score_min,
-            "proto_split_selection_cutoff_score": selection_cutoff.detach(),
-            "proto_split_candidate_entropy_mean": _safe_masked_mean(entropy, selected_mask, zero),
-            "proto_split_candidate_margin_mean": _safe_masked_mean(margin, selected_mask, zero),
-            "proto_split_candidate_boundary_exposure_mean": _safe_masked_mean(exposure, selected_mask, zero),
-            "proto_split_candidate_reliability_mean": _safe_masked_mean(reliability, selected_mask, zero),
-            "proto_split_candidate_top1_conf_mean": _safe_masked_mean(top1_conf, selected_mask, zero),
-            "proto_split_candidate_top2_conf_mean": _safe_masked_mean(top2_conf, selected_mask, zero),
-            "proto_split_boundary_top2_conf_mean": _safe_masked_mean(top2_conf, boundary_mask, zero),
-            "proto_split_boundary_score_mean": _safe_masked_mean(split_score, boundary_mask, zero),
-            "proto_split_candidate_global_indices": global_indices[selected_mask].detach(),
-            "proto_split_candidate_top1_proto": top1_proto_idx[selected_mask].detach(),
-            "proto_split_candidate_top2_proto": top2_proto_idx[selected_mask].detach(),
-            "proto_split_candidate_scores": selected_scores.detach(),
+            "proto_split_prefilter_candidate_count": candidate_info["prefilter_count"],
+            "proto_split_prefilter_candidate_ratio": candidate_info["prefilter_ratio"],
+            "proto_split_candidate_count": candidate_info["candidate_count"],
+            "proto_split_candidate_ratio": candidate_info["candidate_ratio"],
+            "proto_split_candidate_score_mean": candidate_info["candidate_score_mean"],
+            "proto_split_candidate_score_p90": candidate_info["candidate_score_p90"],
+            "proto_split_candidate_score_min": candidate_info["candidate_score_min"],
+            "proto_split_selection_cutoff_score": candidate_info["selection_cutoff"],
+            "proto_split_candidate_entropy_mean": candidate_info["candidate_entropy_mean"],
+            "proto_split_candidate_margin_mean": candidate_info["candidate_margin_mean"],
+            "proto_split_candidate_boundary_exposure_mean": candidate_info["candidate_boundary_exposure_mean"],
+            "proto_split_candidate_reliability_mean": candidate_info["candidate_reliability_mean"],
+            "proto_split_candidate_top1_conf_mean": candidate_info["candidate_top1_conf_mean"],
+            "proto_split_candidate_top2_conf_mean": candidate_info["candidate_top2_conf_mean"],
+            "proto_split_boundary_top2_conf_mean": candidate_info["boundary_top2_conf_mean"],
+            "proto_split_boundary_score_mean": candidate_info["boundary_score_mean"],
+            "proto_split_candidate_global_indices": candidate_info["candidate_global_indices"],
+            "proto_split_candidate_top1_proto": candidate_info["candidate_top1_proto"],
+            "proto_split_candidate_top2_proto": candidate_info["candidate_top2_proto"],
+            "proto_split_candidate_scores": candidate_info["candidate_scores"],
         })
-
         if unique_scale is not None:
-            scale = unique_scale.detach().reshape(-1).to(dtype=zero.dtype)
-            if scale.numel() == entropy.numel():
-                scale_mean = scale.mean().clamp_min(eps)
-                diagnostics.update({
-                    "proto_split_candidate_scale_mean": _safe_masked_mean(scale, selected_mask, zero),
-                    "proto_split_candidate_scale_ratio_mean": _safe_masked_mean(scale / scale_mean, selected_mask, zero),
-                })
+            diagnostics.update({
+                "proto_split_candidate_scale_mean": candidate_info["candidate_scale_mean"],
+                "proto_split_candidate_scale_ratio_mean": candidate_info["candidate_scale_ratio_mean"],
+            })
 
         return diagnostics
 
@@ -1198,13 +1335,16 @@ def _feature_side_prototype_push_loss(
     push_conf_thresh=0.0,
     push_neg_boundary_weight=0.0,
     push_ignore_boundary_weight=0.3,
+    candidate_mask=None,
+    candidate_safe_push=False,
+    candidate_push_weight=0.0,
     zero=None,
     eps=1e-8,
 ):
     if zero is None:
         zero = unique_features.new_tensor(0.0)
     if unique_features.numel() == 0 or prototype_bank.num_prototypes < 2:
-        return zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero, zero, zero
 
     prototypes = F.normalize(prototype_bank.prototypes.detach(), dim=-1, eps=eps)
     proto_cosine = torch.matmul(unique_features, prototypes.t()).clamp(-1.0, 1.0)
@@ -1242,10 +1382,28 @@ def _feature_side_prototype_push_loss(
         push_mask = push_mask.detach().bool()
         if push_conf_thresh is not None and float(push_conf_thresh) > 0.0:
             push_mask = push_mask & (push_confidence.detach() >= float(push_conf_thresh))
+        if candidate_mask is None:
+            safe_candidate_mask = torch.zeros_like(push_mask)
+        else:
+            safe_candidate_mask = candidate_mask.detach().bool().reshape(-1)
+            if safe_candidate_mask.shape[0] != push_mask.shape[0]:
+                safe_candidate_mask = torch.zeros_like(push_mask)
+        if candidate_safe_push:
+            push_safety_weight = torch.where(
+                safe_candidate_mask,
+                unique_features.new_full(
+                    (unique_features.shape[0],),
+                    float(candidate_push_weight),
+                ),
+                unique_features.new_ones(unique_features.shape[0]),
+            )
+        else:
+            push_safety_weight = unique_features.new_ones(unique_features.shape[0])
         push_weight = (
             push_confidence.detach().clamp_min(0.0)
             * unique_assign_conf.detach().clamp_min(0.0)
             * boundary_weight
+            * push_safety_weight
             * push_mask.to(dtype=unique_features.dtype)
         )
 
@@ -1258,7 +1416,28 @@ def _feature_side_prototype_push_loss(
             push_penalty_mean = push_penalty.detach()[active_mask].mean().to(dtype=zero.dtype)
         else:
             push_penalty_mean = zero
-    return push_loss, push_active_ratio.detach(), push_weight_mean.detach(), push_penalty_mean.detach()
+        candidate_count = safe_candidate_mask.to(dtype=unique_features.dtype).sum().clamp_min(eps)
+        non_candidate_mask = ~safe_candidate_mask
+        candidate_push_active_ratio = (
+            (safe_candidate_mask & active_mask).to(dtype=unique_features.dtype).sum() / candidate_count
+        ).to(dtype=zero.dtype).detach()
+        candidate_push_weight_mean = _safe_masked_mean(push_weight, safe_candidate_mask, zero)
+        candidate_push_loss_mean = _safe_masked_mean(push_weight * push_penalty.detach(), safe_candidate_mask, zero)
+        non_candidate_push_loss_mean = _safe_masked_mean(
+            push_weight * push_penalty.detach(),
+            non_candidate_mask,
+            zero,
+        )
+    return (
+        push_loss,
+        push_active_ratio.detach(),
+        push_weight_mean.detach(),
+        push_penalty_mean.detach(),
+        candidate_push_active_ratio,
+        candidate_push_weight_mean,
+        candidate_push_loss_mean,
+        non_candidate_push_loss_mean,
+    )
 
 
 def _prototype_diagnostics(
@@ -1280,6 +1459,8 @@ def _prototype_diagnostics(
     ignore_boundary_exposure,
     boundary_exposure,
     unique_scale,
+    candidate_info,
+    candidate_update_weight,
     zero,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
@@ -1387,11 +1568,51 @@ def _prototype_diagnostics(
             * (1.0 - unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)).clamp_min(0.0)
             * boundary_exposure
         )
+        candidate_mask = candidate_info.get(
+            "candidate_mask",
+            torch.zeros_like(update_selected),
+        ).detach().bool().reshape(-1)
+        candidate_score = candidate_info.get(
+            "score",
+            torch.zeros_like(boundary_exposure),
+        ).detach().reshape(-1).to(dtype=zero.dtype)
+        if candidate_mask.numel() != update_selected.numel():
+            candidate_mask = torch.zeros_like(update_selected)
+        if candidate_score.numel() != update_selected.numel():
+            candidate_score = torch.zeros_like(boundary_exposure)
+
         ambiguous_mask = ambiguity_score >= float(ambiguity_thresh)
         exposure_boundary_mask = boundary_exposure >= float(ambiguity_boundary_thresh)
         exposure_interior_mask = ~exposure_boundary_mask
         boundary_count = exposure_boundary_mask.to(dtype=zero.dtype).sum().clamp_min(eps)
         interior_count = exposure_interior_mask.to(dtype=zero.dtype).sum().clamp_min(eps)
+        candidate_count = candidate_mask.to(dtype=zero.dtype).sum()
+        candidate_count_safe = candidate_count.clamp_min(eps)
+        selected_count_safe = update_selected.to(dtype=zero.dtype).sum().clamp_min(eps)
+        candidate_update_mask = candidate_mask & update_selected
+        non_candidate_update_mask = (~candidate_mask) & update_selected
+        candidate_update_count = candidate_update_mask.to(dtype=zero.dtype).sum()
+        non_candidate_update_count = non_candidate_update_mask.to(dtype=zero.dtype).sum()
+        candidate_update_weight = candidate_update_weight.detach().reshape(-1).to(dtype=zero.dtype)
+        if candidate_update_weight.numel() != update_selected.numel():
+            candidate_update_weight = torch.ones_like(boundary_exposure)
+        uncertain_boundary_mask = uncertain_boundary_mask.detach().bool().reshape(-1)
+        neg_boundary_mask = neg_boundary_mask.detach().bool().reshape(-1)
+        boundary_proxy_mask = exposure_boundary_mask | uncertain_boundary_mask
+        if candidate_mask.any():
+            candidate_neg_boundary_overlap = (
+                (candidate_mask & neg_boundary_mask).to(dtype=zero.dtype).sum() / candidate_count_safe
+            ).detach()
+            candidate_uncertain_boundary_overlap = (
+                (candidate_mask & uncertain_boundary_mask).to(dtype=zero.dtype).sum() / candidate_count_safe
+            ).detach()
+            candidate_boundary_proxy_overlap = (
+                (candidate_mask & boundary_proxy_mask).to(dtype=zero.dtype).sum() / candidate_count_safe
+            ).detach()
+        else:
+            candidate_neg_boundary_overlap = zero
+            candidate_uncertain_boundary_overlap = zero
+            candidate_boundary_proxy_overlap = zero
 
         diagnostics.update({
             "proto_usage_histogram": usage_histogram.detach(),
@@ -1448,6 +1669,31 @@ def _prototype_diagnostics(
             "proto_uncertain_boundary_entropy": uncertain_boundary_entropy,
             "proto_uncertain_boundary_assign_conf": uncertain_boundary_assign_conf,
             "proto_uncertain_boundary_selected_ratio": uncertain_boundary_selected_ratio,
+            "proto_candidate_ratio": candidate_info["candidate_ratio"],
+            "proto_candidate_count": candidate_info["candidate_count"],
+            "proto_candidate_score_mean": candidate_info["candidate_score_mean"],
+            "proto_candidate_entropy_mean": candidate_info["candidate_entropy_mean"],
+            "proto_candidate_margin_mean": candidate_info["candidate_margin_mean"],
+            "proto_candidate_assign_conf_mean": candidate_info["candidate_top1_conf_mean"],
+            "proto_candidate_boundary_exposure_mean": candidate_info["candidate_boundary_exposure_mean"],
+            "proto_candidate_top2_gap_mean": candidate_info["candidate_margin_mean"],
+            "proto_candidate_update_selected_ratio": (
+                candidate_update_count / candidate_count_safe
+            ).detach(),
+            "proto_candidate_update_weight_mean": _selected_weight_mean(
+                candidate_update_weight,
+                update_selected,
+                zero,
+                eps=eps,
+            ),
+            "proto_candidate_in_update_ratio": (
+                candidate_update_count / selected_count_safe
+            ).detach(),
+            "proto_candidate_update_count": candidate_update_count.detach(),
+            "proto_non_candidate_update_count": non_candidate_update_count.detach(),
+            "proto_candidate_neg_boundary_overlap": candidate_neg_boundary_overlap,
+            "proto_candidate_uncertain_boundary_overlap": candidate_uncertain_boundary_overlap,
+            "proto_candidate_boundary_proxy_overlap": candidate_boundary_proxy_overlap,
         })
         diagnostics.update(_prototype_split_candidate_diagnostics(
             unique_global_indices=unique_global_indices,
@@ -1513,6 +1759,10 @@ def loss_prototype_learning(
     boundary_safe_update=False,
     update_neg_boundary_weight=1.0,
     update_ignore_boundary_weight=1.0,
+    proto_candidate_safe_update=False,
+    proto_candidate_update_weight=0.1,
+    proto_candidate_safe_push=False,
+    proto_candidate_push_weight=0.0,
     lambda_push=0.0,
     push_mode="hinge",
     push_margin=0.1,
@@ -1657,6 +1907,34 @@ def loss_prototype_learning(
         ignore_weight=boundary_exposure_ignore_weight,
         eps=eps,
     )
+    unique_proto_idx = assigned_proto_idx[unique_indices]
+    candidate_enabled = (
+        bool(proto_candidate_safe_update)
+        or bool(proto_candidate_safe_push)
+        or bool(split_probe_enabled)
+    )
+    candidate_info = _build_proto_ambiguity_candidates(
+        unique_global_indices=unique_global_indices,
+        unique_entropy=unique_entropy,
+        unique_assign_conf=unique_assign_conf,
+        unique_assign_margin=unique_assign_margin,
+        unique_top2_conf=unique_top2_conf,
+        unique_top1_proto_idx=unique_proto_idx,
+        unique_top2_proto_idx=unique_top2_proto_idx,
+        point_reliability=point_reliability,
+        boundary_exposure=boundary_exposure,
+        unique_scale=unique_scale,
+        zero=zero,
+        enabled=candidate_enabled,
+        score_thresh=split_probe_score_thresh,
+        boundary_thresh=split_probe_boundary_thresh,
+        entropy_thresh=split_probe_entropy_thresh,
+        margin_thresh=split_probe_margin_thresh,
+        second_conf_thresh=split_probe_second_conf_thresh,
+        top_ratio=split_probe_top_ratio,
+        max_candidates=split_probe_max_candidates,
+        eps=eps,
+    )
 
     pull_confidence = (1.0 - unique_entropy) * point_reliability * pull_sem_gate * pull_mask
     confident_mask = (pull_confidence >= conf_thresh).to(unique_features.dtype)
@@ -1672,6 +1950,7 @@ def loss_prototype_learning(
     update_confident_mask = (update_confidence >= update_conf_thresh).to(unique_features.dtype)
 
     update_sample_weight = None
+    candidate_update_weight = unique_features.new_ones(unique_features.shape[0])
     with torch.no_grad():
         update_boundary_weight = unique_features.new_ones(unique_features.shape[0])
         if boundary_safe_update:
@@ -1686,6 +1965,22 @@ def loss_prototype_learning(
                 update_boundary_weight,
             )
             update_sample_weight = update_boundary_weight.detach()
+        if proto_candidate_safe_update:
+            candidate_mask = candidate_info["candidate_mask"].detach().bool()
+            if candidate_mask.shape[0] != candidate_update_weight.shape[0]:
+                candidate_mask = torch.zeros_like(candidate_update_weight, dtype=torch.bool)
+            candidate_update_weight = torch.where(
+                candidate_mask,
+                candidate_update_weight.new_full(
+                    candidate_update_weight.shape,
+                    float(proto_candidate_update_weight),
+                ),
+                candidate_update_weight,
+            )
+            if update_sample_weight is None:
+                update_sample_weight = candidate_update_weight.detach()
+            else:
+                update_sample_weight = (update_sample_weight * candidate_update_weight).detach()
         selected_update_mask = update_confident_mask.detach().bool()
         proto_update_boundary_weight_mean = _selected_weight_mean(
             update_boundary_weight,
@@ -1706,7 +2001,6 @@ def loss_prototype_learning(
             eps=eps,
         )
 
-    unique_proto_idx = assigned_proto_idx[unique_indices]
     pull_weight = pull_confidence * unique_assign_conf * confident_mask
     pull_mode_value = str(pull_mode).lower()
     if pull_mode_value in ("topk_soft", "soft_topk", "soft"):
@@ -1833,6 +2127,10 @@ def loss_prototype_learning(
     proto_push_active_ratio = zero
     proto_push_weight_mean = zero
     proto_push_penalty_mean = zero
+    proto_candidate_push_active_ratio = zero
+    proto_candidate_push_weight_mean = zero
+    proto_candidate_push_loss_mean = zero
+    proto_non_candidate_push_loss_mean = zero
     if lambda_push > 0.0:
         if bool(push_use_confident_mask):
             push_confidence = pull_confidence
@@ -1865,7 +2163,16 @@ def loss_prototype_learning(
                 * push_candidate_mask.to(unique_features.dtype)
             )
 
-        push_loss, proto_push_active_ratio, proto_push_weight_mean, proto_push_penalty_mean = _feature_side_prototype_push_loss(
+        (
+            push_loss,
+            proto_push_active_ratio,
+            proto_push_weight_mean,
+            proto_push_penalty_mean,
+            proto_candidate_push_active_ratio,
+            proto_candidate_push_weight_mean,
+            proto_candidate_push_loss_mean,
+            proto_non_candidate_push_loss_mean,
+        ) = _feature_side_prototype_push_loss(
             unique_features=unique_features,
             prototype_bank=prototype_bank,
             unique_proto_idx=unique_proto_idx,
@@ -1880,6 +2187,9 @@ def loss_prototype_learning(
             push_conf_thresh=push_conf_thresh,
             push_neg_boundary_weight=push_neg_boundary_weight,
             push_ignore_boundary_weight=push_ignore_boundary_weight,
+            candidate_mask=candidate_info["candidate_mask"],
+            candidate_safe_push=proto_candidate_safe_push,
+            candidate_push_weight=proto_candidate_push_weight,
             zero=zero,
             eps=eps,
         )
@@ -1915,6 +2225,8 @@ def loss_prototype_learning(
         ignore_boundary_exposure=ignore_boundary_exposure,
         boundary_exposure=boundary_exposure,
         unique_scale=unique_scale,
+        candidate_info=candidate_info,
+        candidate_update_weight=candidate_update_weight,
         zero=zero,
         ambiguity_thresh=ambiguity_thresh,
         ambiguity_boundary_thresh=ambiguity_boundary_thresh,
@@ -1954,6 +2266,10 @@ def loss_prototype_learning(
         "proto_push_active_ratio": proto_push_active_ratio,
         "proto_push_weight_mean": proto_push_weight_mean,
         "proto_push_penalty_mean": proto_push_penalty_mean,
+        "proto_candidate_push_active_ratio": proto_candidate_push_active_ratio,
+        "proto_candidate_push_weight_mean": proto_candidate_push_weight_mean,
+        "proto_candidate_push_loss_mean": proto_candidate_push_loss_mean,
+        "proto_non_candidate_push_loss_mean": proto_non_candidate_push_loss_mean,
         "proto_update_boundary_weight_mean": proto_update_boundary_weight_mean,
         "proto_update_neg_boundary_weight_mean": proto_update_neg_boundary_weight_mean,
         "proto_update_ignore_boundary_weight_mean": proto_update_ignore_boundary_weight_mean,

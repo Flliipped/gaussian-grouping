@@ -175,6 +175,12 @@ class OptimizationParams(ParamGroup):
         self.proto_boundary_safe_update = False
         self.proto_update_neg_boundary_weight = 1.0
         self.proto_update_ignore_boundary_weight = 1.0
+        self.proto_candidate_safe_update = False
+        self.proto_candidate_update_weight = 0.1
+        self.proto_candidate_safe_push = False
+        self.proto_candidate_push_weight = 0.0
+        self.proto_candidate_safe_pull = False
+        self.proto_candidate_pull_weight = 0.5
         self.proto_lambda_push = 0.0
         self.proto_push_mode = "hinge"
         self.proto_push_margin = 0.1

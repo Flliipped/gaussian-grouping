@@ -120,6 +120,26 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_uncertain_boundary_entropy",
         "proto_uncertain_boundary_assign_conf",
         "proto_uncertain_boundary_selected_ratio",
+        "proto_candidate_ratio",
+        "proto_candidate_count",
+        "proto_candidate_score_mean",
+        "proto_candidate_entropy_mean",
+        "proto_candidate_margin_mean",
+        "proto_candidate_assign_conf_mean",
+        "proto_candidate_boundary_exposure_mean",
+        "proto_candidate_top2_gap_mean",
+        "proto_candidate_update_selected_ratio",
+        "proto_candidate_update_weight_mean",
+        "proto_candidate_in_update_ratio",
+        "proto_candidate_update_count",
+        "proto_non_candidate_update_count",
+        "proto_candidate_neg_boundary_overlap",
+        "proto_candidate_uncertain_boundary_overlap",
+        "proto_candidate_boundary_proxy_overlap",
+        "proto_candidate_push_active_ratio",
+        "proto_candidate_push_weight_mean",
+        "proto_candidate_push_loss_mean",
+        "proto_non_candidate_push_loss_mean",
         "proto_split_probe_active",
         "proto_split_prefilter_candidate_count",
         "proto_split_prefilter_candidate_ratio",
@@ -596,6 +616,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 boundary_safe_update=opt.proto_boundary_safe_update,
                 update_neg_boundary_weight=opt.proto_update_neg_boundary_weight,
                 update_ignore_boundary_weight=opt.proto_update_ignore_boundary_weight,
+                proto_candidate_safe_update=opt.proto_candidate_safe_update,
+                proto_candidate_update_weight=opt.proto_candidate_update_weight,
+                proto_candidate_safe_push=opt.proto_candidate_safe_push,
+                proto_candidate_push_weight=opt.proto_candidate_push_weight,
                 lambda_push=opt.proto_lambda_push,
                 push_mode=opt.proto_push_mode,
                 push_margin=opt.proto_push_margin,
@@ -746,6 +770,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"update_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_update_selected_ratio'):.6f}, "
                         + f"neg_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_neg_boundary_selected_ratio'):.6f}, "
                         + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}, "
+                        + f"candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_candidate_ratio'):.6f}, "
+                        + f"candidate_score={_proto_diag_scalar(proto_diag, 'proto_candidate_score_mean'):.6f}, "
+                        + f"candidate_update_weight={_proto_diag_scalar(proto_diag, 'proto_candidate_update_weight_mean'):.6f}, "
+                        + f"candidate_in_update={_proto_diag_scalar(proto_diag, 'proto_candidate_in_update_ratio'):.6f}, "
+                        + f"candidate_push_weight={_proto_diag_scalar(proto_diag, 'proto_candidate_push_weight_mean'):.6f}, "
                         + f"split_prefilter_ratio={_proto_diag_scalar(proto_diag, 'proto_split_prefilter_candidate_ratio'):.6f}, "
                         + f"split_candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_split_candidate_ratio'):.6f}, "
                         + f"split_candidate_score={_proto_diag_scalar(proto_diag, 'proto_split_candidate_score_mean'):.6f}, "
@@ -1091,6 +1120,12 @@ if __name__ == "__main__":
     args.proto_boundary_safe_update = config.get("proto_boundary_safe_update", args.proto_boundary_safe_update)
     args.proto_update_neg_boundary_weight = config.get("proto_update_neg_boundary_weight", args.proto_update_neg_boundary_weight)
     args.proto_update_ignore_boundary_weight = config.get("proto_update_ignore_boundary_weight", args.proto_update_ignore_boundary_weight)
+    args.proto_candidate_safe_update = config.get("proto_candidate_safe_update", args.proto_candidate_safe_update)
+    args.proto_candidate_update_weight = config.get("proto_candidate_update_weight", args.proto_candidate_update_weight)
+    args.proto_candidate_safe_push = config.get("proto_candidate_safe_push", args.proto_candidate_safe_push)
+    args.proto_candidate_push_weight = config.get("proto_candidate_push_weight", args.proto_candidate_push_weight)
+    args.proto_candidate_safe_pull = config.get("proto_candidate_safe_pull", args.proto_candidate_safe_pull)
+    args.proto_candidate_pull_weight = config.get("proto_candidate_pull_weight", args.proto_candidate_pull_weight)
     args.proto_lambda_push = config.get("proto_lambda_push", args.proto_lambda_push)
     args.proto_push_mode = config.get("proto_push_mode", args.proto_push_mode)
     args.proto_push_margin = config.get("proto_push_margin", args.proto_push_margin)
