@@ -73,7 +73,18 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean(1).mean(1).mean(1)
 
 
-def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, sample_size=800):
+def loss_cls_3d(
+    features,
+    predictions,
+    k=5,
+    lambda_val=2.0,
+    max_points=200000,
+    sample_size=800,
+    graph_data=None,
+    graph_weight_power=1.0,
+    graph_symmetric=True,
+    eps=1e-10,
+):
     """
     Compute the neighborhood consistency loss for a 3D point cloud using Top-k neighbors
     and the KL divergence.
@@ -87,6 +98,32 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     
     :return: Computed loss value.
     """
+    if graph_data is not None and graph_data.get("valid", False):
+        feature_indices = graph_data["feature_indices"]
+        selected_predictions = predictions[feature_indices]
+        sample_preds = selected_predictions[graph_data["sample_indices"]]
+        neighbor_preds = selected_predictions[graph_data["neighbor_indices"]]
+
+        sample_probs = sample_preds.unsqueeze(1).clamp_min(eps)
+        neighbor_probs = neighbor_preds.clamp_min(eps)
+        pair_weight = (
+            graph_data["positive_mask"]
+            * graph_data["reliability"].clamp_min(0.0).pow(max(float(graph_weight_power), 0.0))
+            * graph_data["semantic_pos_factor"]
+        )
+
+        kl_forward = sample_probs * (torch.log(sample_probs) - torch.log(neighbor_probs.detach()))
+        pair_loss = kl_forward.sum(dim=-1)
+        if graph_symmetric:
+            kl_backward = neighbor_probs * (
+                torch.log(neighbor_probs) - torch.log(sample_probs.detach())
+            )
+            pair_loss = 0.5 * (pair_loss + kl_backward.sum(dim=-1))
+
+        loss = (pair_weight * pair_loss).sum() / (pair_weight.sum() + eps)
+        normalized_loss = loss / predictions.size(1)
+        return lambda_val * normalized_loss
+
     # Conditionally downsample if points exceed max_points
     if features.size(0) > max_points:
         indices = torch.randperm(features.size(0))[:max_points]
@@ -107,7 +144,7 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     neighbor_preds = predictions[neighbor_indices_tensor]
 
     # Compute KL divergence
-    kl = sample_preds.unsqueeze(1) * (torch.log(sample_preds.unsqueeze(1) + 1e-10) - torch.log(neighbor_preds + 1e-10))
+    kl = sample_preds.unsqueeze(1) * (torch.log(sample_preds.unsqueeze(1) + eps) - torch.log(neighbor_preds + eps))
     loss = kl.sum(dim=-1).mean()
 
     # Normalize loss into [0, 1]

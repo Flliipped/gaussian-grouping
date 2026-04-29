@@ -94,6 +94,10 @@ class OptimizationParams(ParamGroup):
         self.reg3d_lambda_val = 2
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
+        self.reg3d_use_graph_reliability = False
+        self.reg3d_graph_start_iter = 12_000
+        self.reg3d_graph_weight_power = 1.0
+        self.reg3d_graph_symmetric = True
         
         self.graph_start_iter = 17_000
         self.graph_interval = 10

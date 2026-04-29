@@ -364,15 +364,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
 
+        reg3d_due = iteration % opt.reg3d_interval == 0
         loss_obj_3d = None
-        if iteration % opt.reg3d_interval == 0:
-            # regularize at certain intervals
-            logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
-            prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
-            loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
-        else:
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj          
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj
 
         loss_graph_raw = torch.tensor(0.0, device=image.device)
         loss_graph = torch.tensor(0.0, device=image.device)
@@ -434,6 +428,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         proto_diag = {}
         sugar_active = iteration >= opt.sugar_start_iter and iteration % opt.sugar_interval == 0
         graph_active = iteration >= opt.graph_start_iter and iteration % opt.graph_interval == 0
+        reg3d_graph_active = (
+            opt.reg3d_use_graph_reliability
+            and reg3d_due
+            and iteration >= opt.reg3d_graph_start_iter
+        )
         split_due = (
             opt.use_ambiguous_split
             and iteration >= max(opt.split_start_iter, opt.densify_until_iter)
@@ -453,6 +452,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             and (iteration % opt.proto_interval == 0 or split_due)
         )
         graph_context_active = graph_active or proto_active
+        graph_context_active = graph_context_active or reg3d_graph_active
         graph_data = None
 
         if sugar_active:
@@ -519,6 +519,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sem_valid_point_ratio = graph_data.get("sem_valid_point_ratio", sem_valid_point_ratio)
             sem_pair_valid_ratio = graph_data.get("sem_pair_valid_ratio", sem_pair_valid_ratio)
             sem_high_conf_same_ratio = graph_data.get("sem_high_conf_same_ratio", sem_high_conf_same_ratio)
+
+        if reg3d_due:
+            logits3d = classifier(gaussians._objects_dc.permute(2, 0, 1))
+            prob_obj3d = torch.softmax(logits3d, dim=0).squeeze().permute(1, 0)
+            loss_obj_3d = loss_cls_3d(
+                gaussians._xyz.squeeze().detach(),
+                prob_obj3d,
+                opt.reg3d_k,
+                opt.reg3d_lambda_val,
+                opt.reg3d_max_points,
+                opt.reg3d_sample_size,
+                graph_data=graph_data if reg3d_graph_active else None,
+                graph_weight_power=opt.reg3d_graph_weight_power,
+                graph_symmetric=opt.reg3d_graph_symmetric,
+            )
+            loss = loss + loss_obj_3d
 
         if graph_active and graph_data is not None and graph_data.get("valid", False):
             warmup_iters = max(1, opt.graph_warmup_iters)
@@ -997,6 +1013,10 @@ if __name__ == "__main__":
     args.reg3d_lambda_val = config.get("reg3d_lambda_val", 2)
     args.reg3d_max_points = config.get("reg3d_max_points", 300000)
     args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
+    args.reg3d_use_graph_reliability = config.get("reg3d_use_graph_reliability", args.reg3d_use_graph_reliability)
+    args.reg3d_graph_start_iter = config.get("reg3d_graph_start_iter", config.get("graph_start_iter", args.reg3d_graph_start_iter))
+    args.reg3d_graph_weight_power = config.get("reg3d_graph_weight_power", args.reg3d_graph_weight_power)
+    args.reg3d_graph_symmetric = config.get("reg3d_graph_symmetric", args.reg3d_graph_symmetric)
 
     args.graph_start_iter = config.get("graph_start_iter", config.get("geo_start_iter", args.graph_start_iter))
     args.graph_interval = config.get("graph_interval", config.get("geo_interval", args.graph_interval))
