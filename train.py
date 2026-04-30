@@ -135,6 +135,17 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_split_candidate_top2_conf_mean",
         "proto_split_boundary_top2_conf_mean",
         "proto_split_boundary_score_mean",
+        "proto_m3_local_loss",
+        "proto_m3_assoc_loss",
+        "proto_m3_anchor_sep_loss",
+        "proto_m3_active_candidate_count",
+        "proto_m3_active_candidate_ratio",
+        "proto_m3_candidate_count",
+        "proto_m3_candidate_ratio",
+        "proto_m3_anchor_side_a_weight_mean",
+        "proto_m3_anchor_side_b_weight_mean",
+        "proto_m3_target_entropy_mean",
+        "proto_m3_response_entropy_mean",
     ]
     for key in scalar_keys:
         if key in proto_diag:
@@ -498,6 +509,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 split_probe_entropy_thresh=opt.split_probe_entropy_thresh,
                 split_probe_margin_thresh=opt.split_probe_margin_thresh,
                 split_probe_second_conf_thresh=opt.split_probe_second_conf_thresh,
+                use_m3_local_anchor=opt.use_m3_local_anchor,
+                m3_local_weight_lambda=opt.m3_local_weight_lambda,
+                m3_local_lambda_assoc=opt.m3_local_lambda_assoc,
+                m3_local_lambda_sep=opt.m3_local_lambda_sep,
+                m3_local_tau=opt.m3_local_tau,
+                m3_local_sep_margin=opt.m3_local_sep_margin,
+                m3_local_neighbor_conf_thresh=opt.m3_local_neighbor_conf_thresh,
+                m3_local_neighbor_entropy_thresh=opt.m3_local_neighbor_entropy_thresh,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -628,7 +647,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}, "
                         + f"split_candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_split_candidate_ratio'):.6f}, "
                         + f"split_candidate_score={_proto_diag_scalar(proto_diag, 'proto_split_candidate_score_mean'):.6f}, "
-                        + f"split_candidate_top2={_proto_diag_scalar(proto_diag, 'proto_split_candidate_top2_conf_mean'):.6f}"
+                        + f"split_candidate_top2={_proto_diag_scalar(proto_diag, 'proto_split_candidate_top2_conf_mean'):.6f}, "
+                        + f"m3_local={_proto_diag_scalar(proto_diag, 'proto_m3_local_loss'):.6f}, "
+                        + f"m3_assoc={_proto_diag_scalar(proto_diag, 'proto_m3_assoc_loss'):.6f}, "
+                        + f"m3_sep={_proto_diag_scalar(proto_diag, 'proto_m3_anchor_sep_loss'):.6f}, "
+                        + f"m3_active_ratio={_proto_diag_scalar(proto_diag, 'proto_m3_active_candidate_ratio'):.6f}, "
+                        + f"m3_candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_m3_candidate_ratio'):.6f}"
                     )
 
 
@@ -953,6 +977,14 @@ if __name__ == "__main__":
     args.split_probe_entropy_thresh = config.get("split_probe_entropy_thresh", args.split_probe_entropy_thresh)
     args.split_probe_margin_thresh = config.get("split_probe_margin_thresh", args.split_probe_margin_thresh)
     args.split_probe_second_conf_thresh = config.get("split_probe_second_conf_thresh", args.split_probe_second_conf_thresh)
+    args.use_m3_local_anchor = config.get("use_m3_local_anchor", args.use_m3_local_anchor)
+    args.m3_local_weight_lambda = config.get("m3_local_weight_lambda", args.m3_local_weight_lambda)
+    args.m3_local_lambda_assoc = config.get("m3_local_lambda_assoc", args.m3_local_lambda_assoc)
+    args.m3_local_lambda_sep = config.get("m3_local_lambda_sep", args.m3_local_lambda_sep)
+    args.m3_local_tau = config.get("m3_local_tau", args.m3_local_tau)
+    args.m3_local_sep_margin = config.get("m3_local_sep_margin", args.m3_local_sep_margin)
+    args.m3_local_neighbor_conf_thresh = config.get("m3_local_neighbor_conf_thresh", args.m3_local_neighbor_conf_thresh)
+    args.m3_local_neighbor_entropy_thresh = config.get("m3_local_neighbor_entropy_thresh", args.m3_local_neighbor_entropy_thresh)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)

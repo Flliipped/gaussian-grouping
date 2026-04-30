@@ -193,6 +193,14 @@ class OptimizationParams(ParamGroup):
         self.split_probe_entropy_thresh = 0.1
         self.split_probe_margin_thresh = 0.65
         self.split_probe_second_conf_thresh = 0.08
+        self.use_m3_local_anchor = False
+        self.m3_local_weight_lambda = 0.0
+        self.m3_local_lambda_assoc = 1.0
+        self.m3_local_lambda_sep = 0.1
+        self.m3_local_tau = 0.2
+        self.m3_local_sep_margin = 0.2
+        self.m3_local_neighbor_conf_thresh = 0.72
+        self.m3_local_neighbor_entropy_thresh = 0.35
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter
