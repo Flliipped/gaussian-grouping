@@ -9,7 +9,7 @@
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
-from math import exp, log
+from math import ceil, exp, log
 from scipy.spatial import cKDTree
 from utils.general_utils import build_rotation
 from utils.multiview_utils import collect_multiview_labels, compute_point_label_consensus
@@ -1021,6 +1021,8 @@ def _build_proto_ambiguity_candidates(
     entropy_thresh=0.1,
     margin_thresh=0.65,
     second_conf_thresh=0.08,
+    top_ratio=0.0,
+    max_candidates=0,
     eps=1e-8,
 ):
     with torch.no_grad():
@@ -1078,6 +1080,20 @@ def _build_proto_ambiguity_candidates(
             & (margin <= float(margin_thresh))
             & (top2_conf >= float(second_conf_thresh))
         )
+        if candidate_mask.any():
+            candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).reshape(-1)
+            keep_count = int(candidate_indices.numel())
+            if float(top_ratio) > 0.0:
+                ratio_count = int(ceil(num_points * float(top_ratio)))
+                keep_count = min(keep_count, max(ratio_count, 1))
+            if int(max_candidates) > 0:
+                keep_count = min(keep_count, int(max_candidates))
+            if keep_count < int(candidate_indices.numel()):
+                local_scores = candidate_score[candidate_indices]
+                _, keep_order = torch.topk(local_scores, k=max(keep_count, 1), largest=True)
+                filtered_mask = torch.zeros_like(candidate_mask)
+                filtered_mask[candidate_indices[keep_order]] = True
+                candidate_mask = filtered_mask
         candidate_count = candidate_mask.to(dtype=zero.dtype).sum()
         candidate_ratio = candidate_count / max(num_points, 1)
         _, _, candidate_score_p90 = _safe_quantiles(candidate_score, zero)
@@ -1127,6 +1143,8 @@ def _prototype_split_candidate_diagnostics(
     entropy_thresh=0.1,
     margin_thresh=0.65,
     second_conf_thresh=0.08,
+    top_ratio=0.0,
+    max_candidates=0,
     eps=1e-8,
 ):
     with torch.no_grad():
@@ -1165,6 +1183,8 @@ def _prototype_split_candidate_diagnostics(
             entropy_thresh=entropy_thresh,
             margin_thresh=margin_thresh,
             second_conf_thresh=second_conf_thresh,
+            top_ratio=top_ratio,
+            max_candidates=max_candidates,
             eps=eps,
         )
         diagnostics.update({
@@ -1500,6 +1520,8 @@ def _prototype_diagnostics(
     split_probe_entropy_thresh=0.1,
     split_probe_margin_thresh=0.65,
     split_probe_second_conf_thresh=0.08,
+    split_probe_top_ratio=0.0,
+    split_probe_max_candidates=0,
     use_m3_local_anchor=False,
     m3_local_weight_lambda=0.0,
     m3_local_lambda_assoc=1.0,
@@ -1681,6 +1703,8 @@ def _prototype_diagnostics(
             entropy_thresh=split_probe_entropy_thresh,
             margin_thresh=split_probe_margin_thresh,
             second_conf_thresh=split_probe_second_conf_thresh,
+            top_ratio=split_probe_top_ratio,
+            max_candidates=split_probe_max_candidates,
             eps=eps,
         ))
         return diagnostics
@@ -1745,6 +1769,8 @@ def loss_prototype_learning(
     split_probe_entropy_thresh=0.1,
     split_probe_margin_thresh=0.65,
     split_probe_second_conf_thresh=0.08,
+    split_probe_top_ratio=0.0,
+    split_probe_max_candidates=0,
     use_m3_local_anchor=False,
     m3_local_weight_lambda=0.0,
     m3_local_lambda_assoc=1.0,
@@ -1889,6 +1915,8 @@ def loss_prototype_learning(
         entropy_thresh=split_probe_entropy_thresh,
         margin_thresh=split_probe_margin_thresh,
         second_conf_thresh=split_probe_second_conf_thresh,
+        top_ratio=split_probe_top_ratio,
+        max_candidates=split_probe_max_candidates,
         eps=eps,
     )
 
@@ -2199,6 +2227,8 @@ def loss_prototype_learning(
         split_probe_entropy_thresh=split_probe_entropy_thresh,
         split_probe_margin_thresh=split_probe_margin_thresh,
         split_probe_second_conf_thresh=split_probe_second_conf_thresh,
+        split_probe_top_ratio=split_probe_top_ratio,
+        split_probe_max_candidates=split_probe_max_candidates,
         eps=eps,
     )
 

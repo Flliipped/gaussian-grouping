@@ -509,6 +509,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 split_probe_entropy_thresh=opt.split_probe_entropy_thresh,
                 split_probe_margin_thresh=opt.split_probe_margin_thresh,
                 split_probe_second_conf_thresh=opt.split_probe_second_conf_thresh,
+                split_probe_top_ratio=opt.split_probe_top_ratio,
+                split_probe_max_candidates=opt.split_probe_max_candidates,
                 use_m3_local_anchor=opt.use_m3_local_anchor,
                 m3_local_weight_lambda=opt.m3_local_weight_lambda,
                 m3_local_lambda_assoc=opt.m3_local_lambda_assoc,
@@ -977,6 +979,8 @@ if __name__ == "__main__":
     args.split_probe_entropy_thresh = config.get("split_probe_entropy_thresh", args.split_probe_entropy_thresh)
     args.split_probe_margin_thresh = config.get("split_probe_margin_thresh", args.split_probe_margin_thresh)
     args.split_probe_second_conf_thresh = config.get("split_probe_second_conf_thresh", args.split_probe_second_conf_thresh)
+    args.split_probe_top_ratio = config.get("split_probe_top_ratio", args.split_probe_top_ratio)
+    args.split_probe_max_candidates = config.get("split_probe_max_candidates", args.split_probe_max_candidates)
     args.use_m3_local_anchor = config.get("use_m3_local_anchor", args.use_m3_local_anchor)
     args.m3_local_weight_lambda = config.get("m3_local_weight_lambda", args.m3_local_weight_lambda)
     args.m3_local_lambda_assoc = config.get("m3_local_lambda_assoc", args.m3_local_lambda_assoc)

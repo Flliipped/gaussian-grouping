@@ -83,15 +83,17 @@
     "split_probe_entropy_thresh": 0.10,
     "split_probe_margin_thresh": 0.65,
     "split_probe_second_conf_thresh": 0.08,
+    "split_probe_top_ratio": 0.05,
+    "split_probe_max_candidates": 400,
 
     "use_m3_local_anchor": true,
-    "m3_local_weight_lambda": 0.005,
+    "m3_local_weight_lambda": 0.003,
     "m3_local_lambda_assoc": 1.0,
-    "m3_local_lambda_sep": 0.1,
+    "m3_local_lambda_sep": 0.0,
     "m3_local_tau": 0.2,
     "m3_local_sep_margin": 0.2,
-    "m3_local_neighbor_conf_thresh": 0.72,
-    "m3_local_neighbor_entropy_thresh": 0.35,
+    "m3_local_neighbor_conf_thresh": 0.65,
+    "m3_local_neighbor_entropy_thresh": 0.45,
 
     "use_ambiguous_split": false
 }

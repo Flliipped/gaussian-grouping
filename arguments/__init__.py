@@ -193,6 +193,8 @@ class OptimizationParams(ParamGroup):
         self.split_probe_entropy_thresh = 0.1
         self.split_probe_margin_thresh = 0.65
         self.split_probe_second_conf_thresh = 0.08
+        self.split_probe_top_ratio = 0.0
+        self.split_probe_max_candidates = 0
         self.use_m3_local_anchor = False
         self.m3_local_weight_lambda = 0.0
         self.m3_local_lambda_assoc = 1.0
