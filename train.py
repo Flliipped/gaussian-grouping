@@ -135,6 +135,20 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_split_candidate_top2_conf_mean",
         "proto_split_boundary_top2_conf_mean",
         "proto_split_boundary_score_mean",
+        "loss_mv_candidate",
+        "mv_candidate_count",
+        "mv_candidate_valid_ratio",
+        "mv_candidate_conf_mean",
+        "mv_candidate_entropy_mean",
+        "mv_candidate_target_entropy",
+        "mv_candidate_kl",
+        "mv_candidate_top1_score_mean",
+        "mv_candidate_top2_score_mean",
+        "mv_candidate_boundary_ratio",
+        "candidate_top1_mv_agreement",
+        "candidate_top2_mv_agreement",
+        "mv_proto_label_hist_valid_proto_ratio",
+        "mv_candidate_target_top2_flip_ratio",
     ]
     for key in scalar_keys:
         if key in proto_diag:
@@ -498,6 +512,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 split_probe_entropy_thresh=opt.split_probe_entropy_thresh,
                 split_probe_margin_thresh=opt.split_probe_margin_thresh,
                 split_probe_second_conf_thresh=opt.split_probe_second_conf_thresh,
+                use_mv_candidate_reassoc=(
+                    opt.use_mv_candidate_reassoc
+                    and iteration >= opt.mv_candidate_start_iter
+                    and iteration % opt.mv_candidate_interval == 0
+                ),
+                mv_candidate_weight=opt.mv_candidate_weight,
+                mv_candidate_min_views=opt.mv_candidate_min_views,
+                mv_candidate_conf_thresh=opt.mv_candidate_conf_thresh,
+                mv_candidate_tau=opt.mv_candidate_tau,
+                mv_candidate_boundary_tau=opt.mv_candidate_boundary_tau,
+                mv_candidate_max_points=opt.mv_candidate_max_points,
             )
             loss_proto_raw = proto_outputs["loss"]
             loss_proto = proto_coeff * loss_proto_raw
@@ -526,7 +551,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_diag = {
                 key: value.detach() if torch.is_tensor(value) else value
                 for key, value in proto_outputs.items()
-                if key.startswith("proto_")
+                if (
+                    key.startswith("proto_")
+                    or key.startswith("mv_candidate")
+                    or key in (
+                        "loss_mv_candidate",
+                        "candidate_top1_mv_agreement",
+                        "candidate_top2_mv_agreement",
+                    )
+                )
             }
             loss = loss + loss_proto
 
@@ -628,7 +661,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"uncertain_boundary_selected_ratio={_proto_diag_scalar(proto_diag, 'proto_uncertain_boundary_selected_ratio'):.6f}, "
                         + f"split_candidate_ratio={_proto_diag_scalar(proto_diag, 'proto_split_candidate_ratio'):.6f}, "
                         + f"split_candidate_score={_proto_diag_scalar(proto_diag, 'proto_split_candidate_score_mean'):.6f}, "
-                        + f"split_candidate_top2={_proto_diag_scalar(proto_diag, 'proto_split_candidate_top2_conf_mean'):.6f}"
+                        + f"split_candidate_top2={_proto_diag_scalar(proto_diag, 'proto_split_candidate_top2_conf_mean'):.6f}, "
+                        + f"mv_loss={_proto_diag_scalar(proto_diag, 'loss_mv_candidate'):.6f}, "
+                        + f"mv_count={_proto_diag_scalar(proto_diag, 'mv_candidate_count'):.0f}, "
+                        + f"mv_valid={_proto_diag_scalar(proto_diag, 'mv_candidate_valid_ratio'):.6f}, "
+                        + f"mv_flip={_proto_diag_scalar(proto_diag, 'mv_candidate_target_top2_flip_ratio'):.6f}"
                     )
 
 
@@ -953,6 +990,15 @@ if __name__ == "__main__":
     args.split_probe_entropy_thresh = config.get("split_probe_entropy_thresh", args.split_probe_entropy_thresh)
     args.split_probe_margin_thresh = config.get("split_probe_margin_thresh", args.split_probe_margin_thresh)
     args.split_probe_second_conf_thresh = config.get("split_probe_second_conf_thresh", args.split_probe_second_conf_thresh)
+    args.use_mv_candidate_reassoc = config.get("use_mv_candidate_reassoc", args.use_mv_candidate_reassoc)
+    args.mv_candidate_weight = config.get("mv_candidate_weight", args.mv_candidate_weight)
+    args.mv_candidate_start_iter = config.get("mv_candidate_start_iter", args.mv_candidate_start_iter)
+    args.mv_candidate_interval = config.get("mv_candidate_interval", args.mv_candidate_interval)
+    args.mv_candidate_min_views = config.get("mv_candidate_min_views", args.mv_candidate_min_views)
+    args.mv_candidate_conf_thresh = config.get("mv_candidate_conf_thresh", args.mv_candidate_conf_thresh)
+    args.mv_candidate_tau = config.get("mv_candidate_tau", args.mv_candidate_tau)
+    args.mv_candidate_boundary_tau = config.get("mv_candidate_boundary_tau", args.mv_candidate_boundary_tau)
+    args.mv_candidate_max_points = config.get("mv_candidate_max_points", args.mv_candidate_max_points)
     args.sugar_start_iter = config.get("sugar_start_iter", args.densify_until_iter)
     args.sugar_interval = config.get("sugar_interval", 10)
     args.sugar_warmup_iters = config.get("sugar_warmup_iters", 2000)

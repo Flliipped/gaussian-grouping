@@ -193,6 +193,15 @@ class OptimizationParams(ParamGroup):
         self.split_probe_entropy_thresh = 0.1
         self.split_probe_margin_thresh = 0.65
         self.split_probe_second_conf_thresh = 0.08
+        self.use_mv_candidate_reassoc = False
+        self.mv_candidate_weight = 0.0
+        self.mv_candidate_start_iter = 22_000
+        self.mv_candidate_interval = 10
+        self.mv_candidate_min_views = 3
+        self.mv_candidate_conf_thresh = 0.6
+        self.mv_candidate_tau = 0.1
+        self.mv_candidate_boundary_tau = 0.2
+        self.mv_candidate_max_points = 512
 
         # Legacy aliases kept so older configs can still be parsed if needed.
         self.geo_start_iter = self.graph_start_iter
