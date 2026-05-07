@@ -118,6 +118,11 @@ class OptimizationParams(ParamGroup):
         self.graph_prop_tau = 0.2
         self.graph_prop_reliability_thresh = 0.65
         self.graph_prop_stopgrad_target = True
+        self.graph_gate_mode = "fixed"
+        self.graph_adaptive_pos_topk = 3
+        self.graph_adaptive_neg_topk = 2
+        self.graph_adaptive_pos_min = 0.45
+        self.graph_adaptive_neg_max = 0.55
         self.graph_pos_reliability_thresh = 0.60
         self.graph_neg_reliability_thresh = 0.30
         self.graph_use_multiview_semantics = False
@@ -224,6 +229,11 @@ class OptimizationParams(ParamGroup):
         self.geo_prop_tau = self.graph_prop_tau
         self.geo_prop_reliability_thresh = self.graph_prop_reliability_thresh
         self.geo_prop_stopgrad_target = self.graph_prop_stopgrad_target
+        self.geo_gate_mode = self.graph_gate_mode
+        self.geo_adaptive_pos_topk = self.graph_adaptive_pos_topk
+        self.geo_adaptive_neg_topk = self.graph_adaptive_neg_topk
+        self.geo_adaptive_pos_min = self.graph_adaptive_pos_min
+        self.geo_adaptive_neg_max = self.graph_adaptive_neg_max
         self.geo_use_multiview_semantics = self.graph_use_multiview_semantics
         self.geo_support_views = self.graph_support_views
         self.geo_sem_pos_ratio = self.graph_sem_pos_ratio

@@ -381,6 +381,25 @@ def _graph_zero_outputs(zero):
     )
 
 
+def _masked_topk_edge_mask(scores, candidate_mask, topk, largest=True):
+    if topk is None or int(topk) <= 0 or scores.numel() == 0:
+        return torch.zeros_like(scores)
+
+    candidate_mask = candidate_mask.detach() > 0
+    if not candidate_mask.any():
+        return torch.zeros_like(scores)
+
+    effective_topk = min(int(topk), scores.shape[1])
+    fill_value = -1e6 if largest else 1e6
+    masked_scores = scores.masked_fill(~candidate_mask, fill_value)
+    _, topk_idx = masked_scores.topk(effective_topk, dim=1, largest=largest)
+    selected_valid = candidate_mask.gather(1, topk_idx)
+
+    edge_mask = torch.zeros_like(scores)
+    edge_mask.scatter_(1, topk_idx, selected_valid.to(dtype=scores.dtype))
+    return edge_mask
+
+
 def compute_graph_reliability(
     xyz,
     point_ids=None,
@@ -409,6 +428,11 @@ def compute_graph_reliability(
     alpha_normal=2.0,
     alpha_residual=2.0,
     alpha_mv=1.0,
+    gate_mode="fixed",
+    adaptive_pos_topk=3,
+    adaptive_neg_topk=2,
+    adaptive_pos_min=0.45,
+    adaptive_neg_max=0.55,
     pos_reliability_thresh=0.60,
     neg_reliability_thresh=0.30,
     eps=1e-8,
@@ -582,10 +606,33 @@ def compute_graph_reliability(
     reliability_high_mask = (reliability >= pos_reliability_thresh).to(pair_dtype)
     reliability_low_mask = (reliability <= neg_reliability_thresh).to(pair_dtype)
 
-    positive_mask = reliability_high_mask * geometry_positive_support
-
     spatial_close_mask = (spatial_ratio <= 1.0).to(pair_dtype)
-    negative_mask = spatial_close_mask * (reliability_low_mask * geometry_break_mask)
+    gate_mode_value = str(gate_mode).lower()
+    if gate_mode_value in ("adaptive_topk", "topk", "adaptive"):
+        pos_candidate_mask = (
+            geometry_positive_support
+            * (reliability >= float(adaptive_pos_min)).to(pair_dtype)
+        )
+        neg_candidate_mask = (
+            spatial_close_mask
+            * geometry_break_mask
+            * (reliability <= float(adaptive_neg_max)).to(pair_dtype)
+        )
+        positive_mask = _masked_topk_edge_mask(
+            reliability,
+            pos_candidate_mask,
+            adaptive_pos_topk,
+            largest=True,
+        )
+        negative_mask = _masked_topk_edge_mask(
+            reliability,
+            neg_candidate_mask,
+            adaptive_neg_topk,
+            largest=False,
+        )
+    else:
+        positive_mask = reliability_high_mask * geometry_positive_support
+        negative_mask = spatial_close_mask * (reliability_low_mask * geometry_break_mask)
     negative_mask = torch.clamp(negative_mask * (1.0 - positive_mask), min=0.0, max=1.0)
     ignore_mask = torch.clamp(1.0 - torch.clamp(positive_mask + negative_mask, max=1.0), min=0.0, max=1.0)
 

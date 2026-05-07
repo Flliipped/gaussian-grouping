@@ -410,6 +410,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 alpha_normal=opt.graph_alpha_normal,
                 alpha_residual=opt.graph_alpha_residual,
                 alpha_mv=opt.graph_alpha_mv,
+                gate_mode=opt.graph_gate_mode,
+                adaptive_pos_topk=opt.graph_adaptive_pos_topk,
+                adaptive_neg_topk=opt.graph_adaptive_neg_topk,
+                adaptive_pos_min=opt.graph_adaptive_pos_min,
+                adaptive_neg_max=opt.graph_adaptive_neg_max,
                 pos_reliability_thresh=opt.graph_pos_reliability_thresh,
                 neg_reliability_thresh=opt.graph_neg_reliability_thresh,
             )
@@ -887,6 +892,11 @@ if __name__ == "__main__":
     args.graph_prop_tau = config.get("graph_prop_tau", config.get("geo_prop_tau", args.graph_prop_tau))
     args.graph_prop_reliability_thresh = config.get("graph_prop_reliability_thresh", config.get("geo_prop_reliability_thresh", args.graph_prop_reliability_thresh))
     args.graph_prop_stopgrad_target = config.get("graph_prop_stopgrad_target", config.get("geo_prop_stopgrad_target", args.graph_prop_stopgrad_target))
+    args.graph_gate_mode = config.get("graph_gate_mode", config.get("geo_gate_mode", args.graph_gate_mode))
+    args.graph_adaptive_pos_topk = config.get("graph_adaptive_pos_topk", config.get("geo_adaptive_pos_topk", args.graph_adaptive_pos_topk))
+    args.graph_adaptive_neg_topk = config.get("graph_adaptive_neg_topk", config.get("geo_adaptive_neg_topk", args.graph_adaptive_neg_topk))
+    args.graph_adaptive_pos_min = config.get("graph_adaptive_pos_min", config.get("geo_adaptive_pos_min", args.graph_adaptive_pos_min))
+    args.graph_adaptive_neg_max = config.get("graph_adaptive_neg_max", config.get("geo_adaptive_neg_max", args.graph_adaptive_neg_max))
     args.graph_use_multiview_semantics = config.get("graph_use_multiview_semantics", config.get("geo_use_multiview_semantics", args.graph_use_multiview_semantics))
     args.graph_support_views = config.get("graph_support_views", config.get("geo_support_views", args.graph_support_views))
     args.graph_sem_pos_ratio = config.get("graph_sem_pos_ratio", config.get("geo_sem_pos_ratio", args.graph_sem_pos_ratio))
