@@ -113,6 +113,11 @@ class OptimizationParams(ParamGroup):
         self.graph_normal_neg_tau = 0.4
         self.graph_neg_margin = 0.8
         self.graph_hard_neg_k = 2
+        self.graph_use_propagation = False
+        self.graph_prop_lambda = 0.0
+        self.graph_prop_tau = 0.2
+        self.graph_prop_reliability_thresh = 0.65
+        self.graph_prop_stopgrad_target = True
         self.graph_pos_reliability_thresh = 0.60
         self.graph_neg_reliability_thresh = 0.30
         self.graph_use_multiview_semantics = False
@@ -214,6 +219,11 @@ class OptimizationParams(ParamGroup):
         self.geo_normal_neg_tau = self.graph_normal_neg_tau
         self.geo_neg_margin = self.graph_neg_margin
         self.geo_hard_neg_k = self.graph_hard_neg_k
+        self.geo_use_propagation = self.graph_use_propagation
+        self.geo_prop_lambda = self.graph_prop_lambda
+        self.geo_prop_tau = self.graph_prop_tau
+        self.geo_prop_reliability_thresh = self.graph_prop_reliability_thresh
+        self.geo_prop_stopgrad_target = self.graph_prop_stopgrad_target
         self.geo_use_multiview_semantics = self.graph_use_multiview_semantics
         self.geo_support_views = self.graph_support_views
         self.geo_sem_pos_ratio = self.graph_sem_pos_ratio

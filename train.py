@@ -429,6 +429,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 lambda_neg=opt.graph_lambda_neg,
                 neg_margin=opt.graph_neg_margin,
                 hard_neg_k=opt.graph_hard_neg_k,
+                use_propagation=opt.graph_use_propagation,
+                prop_lambda=opt.graph_prop_lambda,
+                prop_tau=opt.graph_prop_tau,
+                prop_reliability_thresh=opt.graph_prop_reliability_thresh,
+                prop_stopgrad_target=opt.graph_prop_stopgrad_target,
                 normal_weight_lambda=opt.graph_normal_weight_lambda,
             )
             loss_graph = graph_coeff * loss_graph_raw
@@ -877,6 +882,11 @@ if __name__ == "__main__":
     args.graph_normal_neg_tau = config.get("graph_normal_neg_tau", config.get("geo_normal_neg_tau", args.graph_normal_neg_tau))
     args.graph_neg_margin = config.get("graph_neg_margin", config.get("geo_neg_margin", args.graph_neg_margin))
     args.graph_hard_neg_k = config.get("graph_hard_neg_k", config.get("geo_hard_neg_k", args.graph_hard_neg_k))
+    args.graph_use_propagation = config.get("graph_use_propagation", config.get("geo_use_propagation", args.graph_use_propagation))
+    args.graph_prop_lambda = config.get("graph_prop_lambda", config.get("geo_prop_lambda", args.graph_prop_lambda))
+    args.graph_prop_tau = config.get("graph_prop_tau", config.get("geo_prop_tau", args.graph_prop_tau))
+    args.graph_prop_reliability_thresh = config.get("graph_prop_reliability_thresh", config.get("geo_prop_reliability_thresh", args.graph_prop_reliability_thresh))
+    args.graph_prop_stopgrad_target = config.get("graph_prop_stopgrad_target", config.get("geo_prop_stopgrad_target", args.graph_prop_stopgrad_target))
     args.graph_use_multiview_semantics = config.get("graph_use_multiview_semantics", config.get("geo_use_multiview_semantics", args.graph_use_multiview_semantics))
     args.graph_support_views = config.get("graph_support_views", config.get("geo_support_views", args.graph_support_views))
     args.graph_sem_pos_ratio = config.get("graph_sem_pos_ratio", config.get("geo_sem_pos_ratio", args.graph_sem_pos_ratio))

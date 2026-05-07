@@ -638,6 +638,11 @@ def loss_graph_contrastive(
     lambda_neg=1.0,
     neg_margin=0.2,
     hard_neg_k=2,
+    use_propagation=False,
+    prop_lambda=0.0,
+    prop_tau=0.2,
+    prop_reliability_thresh=0.65,
+    prop_stopgrad_target=True,
     normal_weight_lambda=5.0,
     eps=1e-8,
 ):
@@ -692,7 +697,26 @@ def loss_graph_contrastive(
     neg_pair_weight = active_hard_neg_mask * (1.0 - reliability)
     neg_loss = (neg_pair_weight * (neg_term ** 2)).sum() / (neg_pair_weight.sum() + eps)
 
-    loss = lambda_pos * pos_loss + lambda_neg * neg_loss
+    prop_loss = zero
+    if bool(use_propagation) or float(prop_lambda) > 0.0:
+        prop_support_mask = (
+            positive_mask
+            * (reliability >= float(prop_reliability_thresh)).to(reliability.dtype)
+        )
+        prop_anchor_mask = prop_support_mask.sum(dim=1) > 0
+        if prop_anchor_mask.any():
+            prop_logits = (reliability / max(float(prop_tau), eps)).masked_fill(prop_support_mask <= 0, -1e6)
+            prop_weights = torch.softmax(prop_logits[prop_anchor_mask], dim=-1)
+            prop_neighbors = neighbor_features[prop_anchor_mask]
+            prop_target = (prop_weights.unsqueeze(-1) * prop_neighbors).sum(dim=1)
+            prop_target = F.normalize(prop_target, dim=-1, eps=eps)
+            if bool(prop_stopgrad_target):
+                prop_target = prop_target.detach()
+            prop_source = sample_features[prop_anchor_mask]
+            prop_cosine = (prop_source * prop_target).sum(dim=-1).clamp(-1.0, 1.0)
+            prop_loss = (1.0 - prop_cosine).mean()
+
+    loss = lambda_pos * pos_loss + lambda_neg * neg_loss + float(prop_lambda) * prop_loss
 
     pos_count = positive_mask.sum()
     neg_count = negative_mask.sum()
