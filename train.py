@@ -403,6 +403,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sem_same_boost=opt.graph_sem_same_boost,
                 sem_neg_boost=opt.graph_sem_neg_boost,
                 sem_conflict_penalty=opt.graph_sem_conflict_penalty,
+                mv_mode=opt.graph_mv_mode,
+                mv_conflict_weight=opt.graph_mv_conflict_weight,
+                mv_conflict_conf_thresh=opt.graph_mv_conflict_conf_thresh,
                 alpha_dist=opt.graph_alpha_dist,
                 alpha_normal=opt.graph_alpha_normal,
                 alpha_residual=opt.graph_alpha_residual,
@@ -884,6 +887,9 @@ if __name__ == "__main__":
     args.graph_sem_same_boost = config.get("graph_sem_same_boost", config.get("geo_sem_same_boost", args.graph_sem_same_boost))
     args.graph_sem_neg_boost = config.get("graph_sem_neg_boost", config.get("geo_sem_neg_boost", args.graph_sem_neg_boost))
     args.graph_sem_conflict_penalty = config.get("graph_sem_conflict_penalty", config.get("geo_sem_conflict_penalty", args.graph_sem_conflict_penalty))
+    args.graph_mv_mode = config.get("graph_mv_mode", config.get("geo_mv_mode", args.graph_mv_mode))
+    args.graph_mv_conflict_weight = config.get("graph_mv_conflict_weight", config.get("geo_mv_conflict_weight", args.graph_mv_conflict_weight))
+    args.graph_mv_conflict_conf_thresh = config.get("graph_mv_conflict_conf_thresh", config.get("geo_mv_conflict_conf_thresh", args.graph_mv_conflict_conf_thresh))
     args.graph_alpha_dist = config.get("graph_alpha_dist", args.graph_alpha_dist)
     args.graph_alpha_normal = config.get("graph_alpha_normal", args.graph_alpha_normal)
     args.graph_alpha_residual = config.get("graph_alpha_residual", args.graph_alpha_residual)

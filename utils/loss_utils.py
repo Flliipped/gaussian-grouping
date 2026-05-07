@@ -402,6 +402,9 @@ def compute_graph_reliability(
     sem_same_boost=1.0,
     sem_neg_boost=1.0,
     sem_conflict_penalty=0.75,
+    mv_mode="positive_boost",
+    mv_conflict_weight=0.3,
+    mv_conflict_conf_thresh=0.7,
     alpha_dist=2.0,
     alpha_normal=2.0,
     alpha_residual=2.0,
@@ -538,7 +541,23 @@ def compute_graph_reliability(
 
             sem_high_conf_same_mask = sem_same_mask * (sem_pair_conf >= sem_conf_tau).to(pair_dtype)
             sem_high_conf_same_ratio = sem_high_conf_same_mask.sum() / (sem_high_conf_same_mask.numel() + eps)
-            semantic_pos_factor = 1.0 + sem_pos_ratio * sem_same_boost * sem_high_conf_same_mask * sem_pair_conf
+            mv_mode_value = str(mv_mode).lower()
+            if mv_mode_value in ("conflict_suppress", "suppress_conflict", "safety_gate", "safe"):
+                # Multi-view pseudo labels are noisy as attraction cues. In this
+                # mode they only suppress high-confidence conflicts on geometry
+                # positive edges; they never create hard negatives.
+                conflict_conf_thresh = float(mv_conflict_conf_thresh)
+                sem_high_conf_diff_mask = sem_diff_mask * (sem_pair_conf >= conflict_conf_thresh).to(pair_dtype)
+                conflict_weight = min(max(float(mv_conflict_weight), 0.0), 1.0)
+                semantic_pos_factor = torch.where(
+                    sem_high_conf_diff_mask > 0,
+                    torch.full_like(semantic_pos_factor, conflict_weight),
+                    torch.ones_like(semantic_pos_factor),
+                )
+            elif mv_mode_value in ("none", "off", "geometry_only"):
+                semantic_pos_factor = torch.ones_like(semantic_pos_factor)
+            else:
+                semantic_pos_factor = 1.0 + sem_pos_ratio * sem_same_boost * sem_high_conf_same_mask * sem_pair_conf
 
     # Geometry determines whether propagation is trustworthy. Multi-view
     # semantics are kept as a conservative reweighting signal instead of

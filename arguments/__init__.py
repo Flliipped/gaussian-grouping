@@ -125,6 +125,9 @@ class OptimizationParams(ParamGroup):
         self.graph_sem_same_boost = 1.0
         self.graph_sem_neg_boost = 1.0
         self.graph_sem_conflict_penalty = 0.75
+        self.graph_mv_mode = "positive_boost"
+        self.graph_mv_conflict_weight = 0.3
+        self.graph_mv_conflict_conf_thresh = 0.7
         self.graph_alpha_dist = 2.0
         self.graph_alpha_normal = 2.0
         self.graph_alpha_residual = 2.0
@@ -221,6 +224,9 @@ class OptimizationParams(ParamGroup):
         self.geo_sem_same_boost = self.graph_sem_same_boost
         self.geo_sem_neg_boost = self.graph_sem_neg_boost
         self.geo_sem_conflict_penalty = self.graph_sem_conflict_penalty
+        self.geo_mv_mode = self.graph_mv_mode
+        self.geo_mv_conflict_weight = self.graph_mv_conflict_weight
+        self.geo_mv_conflict_conf_thresh = self.graph_mv_conflict_conf_thresh
 
         self.sugar_start_iter = 15_000
         self.sugar_interval = 10
