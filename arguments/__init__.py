@@ -182,6 +182,12 @@ class OptimizationParams(ParamGroup):
         self.proto_push_assign_conf_thresh = -1.0
         self.proto_push_neg_boundary_weight = 0.0
         self.proto_push_ignore_boundary_weight = 0.3
+        self.use_proto_semantic_assoc = False
+        self.proto_lambda_semantic_assoc = 0.0
+        self.proto_sem_assoc_conf_thresh = 0.70
+        self.proto_sem_assoc_entropy_thresh = 0.35
+        self.proto_sem_assoc_anchor_assign_conf_thresh = 0.75
+        self.proto_sem_assoc_anchor_reliability_thresh = 0.50
         self.proto_boundary_exposure_ignore_weight = 0.3
         self.proto_ambiguity_thresh = 0.05
         self.proto_ambiguity_boundary_thresh = 0.2

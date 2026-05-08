@@ -99,6 +99,14 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_push_active_ratio",
         "proto_push_weight_mean",
         "proto_push_penalty_mean",
+        "proto_sem_assoc_loss",
+        "proto_sem_assoc_active_ratio",
+        "proto_sem_assoc_anchor_ratio",
+        "proto_sem_assoc_anchor_count",
+        "proto_sem_assoc_proto_valid_ratio",
+        "proto_sem_assoc_target_conf_mean",
+        "proto_sem_assoc_target_entropy_mean",
+        "proto_sem_assoc_evidence_mean",
         "proto_boundary_exposure_mean",
         "proto_boundary_exposure_std",
         "proto_boundary_exposure_p90",
@@ -435,11 +443,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             proto_warmup_iters = max(1, opt.proto_warmup_iters)
             proto_progress = min(max((iteration - opt.proto_start_iter) / proto_warmup_iters, 0.0), 1.0)
             proto_coeff = image.new_tensor(opt.proto_weight_lambda * proto_progress)
+            proto_semantic_probs = None
+            if opt.use_proto_semantic_assoc and opt.proto_lambda_semantic_assoc > 0.0:
+                with torch.no_grad():
+                    proto_semantic_logits = classifier(gaussians._objects_dc.permute(2, 0, 1))
+                    proto_semantic_probs = torch.softmax(
+                        proto_semantic_logits,
+                        dim=0,
+                    ).squeeze().permute(1, 0).detach()
             proto_outputs = loss_prototype_learning(
                 features=gaussians._objects_dc.squeeze(1),
                 prototype_bank=prototype_bank,
                 graph_data=graph_data,
                 gaussian_scales=gaussians.get_scaling.detach(),
+                semantic_probs=proto_semantic_probs,
                 lambda_val=1.0,
                 lambda_pull=opt.proto_lambda_pull,
                 lambda_sep=opt.proto_lambda_sep,
@@ -485,6 +502,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 push_assign_conf_thresh=opt.proto_push_assign_conf_thresh,
                 push_neg_boundary_weight=opt.proto_push_neg_boundary_weight,
                 push_ignore_boundary_weight=opt.proto_push_ignore_boundary_weight,
+                use_semantic_assoc=opt.use_proto_semantic_assoc,
+                lambda_semantic_assoc=opt.proto_lambda_semantic_assoc,
+                sem_assoc_conf_thresh=opt.proto_sem_assoc_conf_thresh,
+                sem_assoc_entropy_thresh=opt.proto_sem_assoc_entropy_thresh,
+                sem_assoc_anchor_assign_conf_thresh=opt.proto_sem_assoc_anchor_assign_conf_thresh,
+                sem_assoc_anchor_reliability_thresh=opt.proto_sem_assoc_anchor_reliability_thresh,
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
@@ -620,6 +643,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"pair_cos_max={_proto_diag_scalar(proto_diag, 'proto_pair_cosine_max'):.6f}, "
                         + f"push_active={_proto_diag_scalar(proto_diag, 'proto_push_active_ratio'):.6f}, "
                         + f"push_weight_mean={_proto_diag_scalar(proto_diag, 'proto_push_weight_mean'):.6f}, "
+                        + f"sem_assoc_loss={_proto_diag_scalar(proto_diag, 'proto_sem_assoc_loss'):.6f}, "
+                        + f"sem_assoc_active={_proto_diag_scalar(proto_diag, 'proto_sem_assoc_active_ratio'):.6f}, "
+                        + f"sem_assoc_anchor={_proto_diag_scalar(proto_diag, 'proto_sem_assoc_anchor_ratio'):.6f}, "
+                        + f"sem_assoc_valid_proto={_proto_diag_scalar(proto_diag, 'proto_sem_assoc_proto_valid_ratio'):.6f}, "
                         + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
@@ -942,6 +969,12 @@ if __name__ == "__main__":
     args.proto_push_assign_conf_thresh = config.get("proto_push_assign_conf_thresh", args.proto_push_assign_conf_thresh)
     args.proto_push_neg_boundary_weight = config.get("proto_push_neg_boundary_weight", args.proto_push_neg_boundary_weight)
     args.proto_push_ignore_boundary_weight = config.get("proto_push_ignore_boundary_weight", args.proto_push_ignore_boundary_weight)
+    args.use_proto_semantic_assoc = config.get("use_proto_semantic_assoc", args.use_proto_semantic_assoc)
+    args.proto_lambda_semantic_assoc = config.get("proto_lambda_semantic_assoc", args.proto_lambda_semantic_assoc)
+    args.proto_sem_assoc_conf_thresh = config.get("proto_sem_assoc_conf_thresh", args.proto_sem_assoc_conf_thresh)
+    args.proto_sem_assoc_entropy_thresh = config.get("proto_sem_assoc_entropy_thresh", args.proto_sem_assoc_entropy_thresh)
+    args.proto_sem_assoc_anchor_assign_conf_thresh = config.get("proto_sem_assoc_anchor_assign_conf_thresh", args.proto_sem_assoc_anchor_assign_conf_thresh)
+    args.proto_sem_assoc_anchor_reliability_thresh = config.get("proto_sem_assoc_anchor_reliability_thresh", args.proto_sem_assoc_anchor_reliability_thresh)
     args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
     args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
     args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)

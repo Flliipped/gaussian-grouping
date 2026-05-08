@@ -760,6 +760,14 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_push_active_ratio": zero,
             "proto_push_weight_mean": zero,
             "proto_push_penalty_mean": zero,
+            "proto_sem_assoc_loss": zero,
+            "proto_sem_assoc_active_ratio": zero,
+            "proto_sem_assoc_anchor_ratio": zero,
+            "proto_sem_assoc_anchor_count": zero,
+            "proto_sem_assoc_proto_valid_ratio": zero,
+            "proto_sem_assoc_target_conf_mean": zero,
+            "proto_sem_assoc_target_entropy_mean": zero,
+            "proto_sem_assoc_evidence_mean": zero,
             "proto_boundary_exposure_mean": zero,
             "proto_boundary_exposure_std": zero,
             "proto_boundary_exposure_p90": zero,
@@ -1165,6 +1173,138 @@ def _feature_side_prototype_push_loss(
     return push_loss, push_active_ratio.detach(), push_weight_mean.detach(), push_penalty_mean.detach()
 
 
+def _prototype_semantic_association_loss(
+    unique_probs,
+    unique_semantic_probs,
+    unique_assign_conf,
+    point_reliability,
+    unique_proto_idx,
+    num_prototypes,
+    use_semantic_assoc=False,
+    sem_conf_thresh=0.70,
+    sem_entropy_thresh=0.35,
+    anchor_assign_conf_thresh=0.75,
+    anchor_reliability_thresh=0.50,
+    zero=None,
+    eps=1e-8,
+):
+    if zero is None:
+        zero = unique_probs.new_tensor(0.0)
+
+    diagnostics = {
+        "proto_sem_assoc_loss": zero,
+        "proto_sem_assoc_active_ratio": zero,
+        "proto_sem_assoc_anchor_ratio": zero,
+        "proto_sem_assoc_anchor_count": zero,
+        "proto_sem_assoc_proto_valid_ratio": zero,
+        "proto_sem_assoc_target_conf_mean": zero,
+        "proto_sem_assoc_target_entropy_mean": zero,
+        "proto_sem_assoc_evidence_mean": zero,
+    }
+    if (
+        not bool(use_semantic_assoc)
+        or unique_semantic_probs is None
+        or unique_probs.numel() == 0
+        or num_prototypes <= 0
+    ):
+        return zero, diagnostics
+
+    if unique_semantic_probs.ndim != 2 or unique_semantic_probs.shape[0] != unique_probs.shape[0]:
+        return zero, diagnostics
+
+    num_classes = unique_semantic_probs.shape[-1]
+    if num_classes < 2:
+        return zero, diagnostics
+
+    target_semantic_probs = unique_semantic_probs.detach().to(
+        device=unique_probs.device,
+        dtype=unique_probs.dtype,
+    )
+    target_semantic_probs = target_semantic_probs.clamp_min(eps)
+    target_semantic_probs = target_semantic_probs / target_semantic_probs.sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(eps)
+
+    sem_entropy = -(
+        target_semantic_probs * torch.log(target_semantic_probs.clamp_min(eps))
+    ).sum(dim=-1)
+    sem_entropy = sem_entropy / max(log(max(num_classes, 2)), eps)
+    sem_conf = target_semantic_probs.max(dim=-1).values
+
+    with torch.no_grad():
+        anchor_mask = (
+            (sem_conf >= float(sem_conf_thresh))
+            & (sem_entropy <= float(sem_entropy_thresh))
+            & (unique_assign_conf.detach() >= float(anchor_assign_conf_thresh))
+            & (point_reliability.detach() >= float(anchor_reliability_thresh))
+        )
+        anchor_weight = (
+            sem_conf.detach().clamp_min(0.0)
+            * unique_assign_conf.detach().clamp_min(0.0)
+            * point_reliability.detach().clamp_min(0.0)
+            * anchor_mask.to(dtype=unique_probs.dtype)
+        )
+
+        proto_label_hist = unique_probs.new_zeros((num_prototypes, num_classes))
+        if anchor_mask.any():
+            anchor_proto_idx = unique_proto_idx.detach().long()[anchor_mask]
+            anchor_values = (
+                target_semantic_probs[anchor_mask]
+                * anchor_weight[anchor_mask].unsqueeze(-1)
+            )
+            proto_label_hist.index_add_(0, anchor_proto_idx, anchor_values)
+
+        proto_label_sum = proto_label_hist.sum(dim=-1, keepdim=True)
+        valid_proto_mask = proto_label_sum.squeeze(-1) > eps
+        proto_label_dist = proto_label_hist / proto_label_sum.clamp_min(eps)
+        proto_label_dist = proto_label_dist.detach()
+
+        semantic_target_mask = (
+            (sem_conf >= float(sem_conf_thresh))
+            & (sem_entropy <= float(sem_entropy_thresh))
+            & (point_reliability.detach() >= float(anchor_reliability_thresh))
+        )
+        proto_evidence = torch.matmul(
+            unique_probs.detach(),
+            valid_proto_mask.to(dtype=unique_probs.dtype),
+        ).clamp(0.0, 1.0)
+        semantic_weight = (
+            sem_conf.detach().clamp_min(0.0)
+            * point_reliability.detach().clamp_min(0.0)
+            * proto_evidence
+            * semantic_target_mask.to(dtype=unique_probs.dtype)
+        )
+
+        active_mask = semantic_weight > 0
+        anchor_count = anchor_mask.to(dtype=zero.dtype).sum()
+        diagnostics.update({
+            "proto_sem_assoc_active_ratio": active_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_sem_assoc_anchor_ratio": anchor_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_sem_assoc_anchor_count": anchor_count.detach(),
+            "proto_sem_assoc_proto_valid_ratio": valid_proto_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_sem_assoc_target_conf_mean": _safe_masked_mean(sem_conf, active_mask, zero),
+            "proto_sem_assoc_target_entropy_mean": _safe_masked_mean(sem_entropy, active_mask, zero),
+            "proto_sem_assoc_evidence_mean": _safe_masked_mean(proto_evidence, active_mask, zero),
+        })
+
+    proto_semantic_pred = torch.matmul(unique_probs, proto_label_dist)
+    proto_semantic_pred = proto_semantic_pred / proto_semantic_pred.sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(eps)
+    kl_loss = (
+        target_semantic_probs
+        * (
+            torch.log(target_semantic_probs.clamp_min(eps))
+            - torch.log(proto_semantic_pred.clamp_min(eps))
+        )
+    ).sum(dim=-1)
+    semantic_assoc_loss = (semantic_weight * kl_loss).sum() / (semantic_weight.sum() + eps)
+    diagnostics["proto_sem_assoc_loss"] = semantic_assoc_loss.detach()
+    return semantic_assoc_loss, diagnostics
+
+
 def _prototype_diagnostics(
     prototype_bank,
     graph_data,
@@ -1374,6 +1514,7 @@ def loss_prototype_learning(
     prototype_bank,
     graph_data,
     gaussian_scales=None,
+    semantic_probs=None,
     lambda_val=1.0,
     lambda_pull=1.0,
     lambda_sep=0.1,
@@ -1419,6 +1560,12 @@ def loss_prototype_learning(
     push_assign_conf_thresh=-1.0,
     push_neg_boundary_weight=0.0,
     push_ignore_boundary_weight=0.3,
+    use_semantic_assoc=False,
+    lambda_semantic_assoc=0.0,
+    sem_assoc_conf_thresh=0.70,
+    sem_assoc_entropy_thresh=0.35,
+    sem_assoc_anchor_assign_conf_thresh=0.75,
+    sem_assoc_anchor_reliability_thresh=0.50,
     boundary_exposure_ignore_weight=0.3,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
@@ -1503,6 +1650,17 @@ def loss_prototype_learning(
     unique_assign_conf = assign_conf[unique_indices]
     unique_assign_margin = assign_margin[unique_indices]
     unique_top2_conf = top2_conf[unique_indices]
+    unique_semantic_probs = None
+    if (
+        semantic_probs is not None
+        and semantic_probs.ndim == 2
+        and semantic_probs.shape[0] == features.shape[0]
+    ):
+        selected_semantic_probs = semantic_probs.to(
+            device=selected_features.device,
+            dtype=selected_features.dtype,
+        )[feature_indices]
+        unique_semantic_probs = selected_semantic_probs[unique_indices]
     unique_scale = None
     if gaussian_scales is not None:
         selected_scales = gaussian_scales[feature_indices]
@@ -1773,11 +1931,31 @@ def loss_prototype_learning(
             eps=eps,
         )
 
+    semantic_assoc_loss, semantic_assoc_diagnostics = _prototype_semantic_association_loss(
+        unique_probs=unique_probs,
+        unique_semantic_probs=unique_semantic_probs,
+        unique_assign_conf=unique_assign_conf,
+        point_reliability=point_reliability,
+        unique_proto_idx=unique_proto_idx,
+        num_prototypes=prototype_bank.num_prototypes,
+        use_semantic_assoc=(
+            bool(use_semantic_assoc)
+            and float(lambda_semantic_assoc) > 0.0
+        ),
+        sem_conf_thresh=sem_assoc_conf_thresh,
+        sem_entropy_thresh=sem_assoc_entropy_thresh,
+        anchor_assign_conf_thresh=sem_assoc_anchor_assign_conf_thresh,
+        anchor_reliability_thresh=sem_assoc_anchor_reliability_thresh,
+        zero=zero,
+        eps=eps,
+    )
+
     total_loss = (
         lambda_pull * pull_loss
         + lambda_sep * sep_loss
         + lambda_cons * cons_scene_scale * cons_loss
         + lambda_push * push_loss
+        + lambda_semantic_assoc * semantic_assoc_loss
     )
     usage = torch.bincount(
         unique_proto_idx,
@@ -1835,6 +2013,7 @@ def loss_prototype_learning(
         "active_proto_ratio": active_proto_ratio,
         "usage_max": usage.max(),
         **proto_diagnostics,
+        **semantic_assoc_diagnostics,
         "proto_push_loss": push_loss,
         "proto_push_active_ratio": proto_push_active_ratio,
         "proto_push_weight_mean": proto_push_weight_mean,
