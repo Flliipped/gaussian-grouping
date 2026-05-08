@@ -413,6 +413,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gate_mode=opt.graph_gate_mode,
                 adaptive_pos_topk=opt.graph_adaptive_pos_topk,
                 adaptive_neg_topk=opt.graph_adaptive_neg_topk,
+                adaptive_pos_ratio=opt.graph_adaptive_pos_ratio,
+                adaptive_neg_ratio=opt.graph_adaptive_neg_ratio,
                 adaptive_pos_min=opt.graph_adaptive_pos_min,
                 adaptive_neg_max=opt.graph_adaptive_neg_max,
                 pos_reliability_thresh=opt.graph_pos_reliability_thresh,
@@ -895,6 +897,8 @@ if __name__ == "__main__":
     args.graph_gate_mode = config.get("graph_gate_mode", config.get("geo_gate_mode", args.graph_gate_mode))
     args.graph_adaptive_pos_topk = config.get("graph_adaptive_pos_topk", config.get("geo_adaptive_pos_topk", args.graph_adaptive_pos_topk))
     args.graph_adaptive_neg_topk = config.get("graph_adaptive_neg_topk", config.get("geo_adaptive_neg_topk", args.graph_adaptive_neg_topk))
+    args.graph_adaptive_pos_ratio = config.get("graph_adaptive_pos_ratio", config.get("geo_adaptive_pos_ratio", args.graph_adaptive_pos_ratio))
+    args.graph_adaptive_neg_ratio = config.get("graph_adaptive_neg_ratio", config.get("geo_adaptive_neg_ratio", args.graph_adaptive_neg_ratio))
     args.graph_adaptive_pos_min = config.get("graph_adaptive_pos_min", config.get("geo_adaptive_pos_min", args.graph_adaptive_pos_min))
     args.graph_adaptive_neg_max = config.get("graph_adaptive_neg_max", config.get("geo_adaptive_neg_max", args.graph_adaptive_neg_max))
     args.graph_use_multiview_semantics = config.get("graph_use_multiview_semantics", config.get("geo_use_multiview_semantics", args.graph_use_multiview_semantics))

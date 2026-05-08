@@ -121,6 +121,8 @@ class OptimizationParams(ParamGroup):
         self.graph_gate_mode = "fixed"
         self.graph_adaptive_pos_topk = 3
         self.graph_adaptive_neg_topk = 2
+        self.graph_adaptive_pos_ratio = 0.30
+        self.graph_adaptive_neg_ratio = 0.25
         self.graph_adaptive_pos_min = 0.45
         self.graph_adaptive_neg_max = 0.55
         self.graph_pos_reliability_thresh = 0.60
@@ -232,6 +234,8 @@ class OptimizationParams(ParamGroup):
         self.geo_gate_mode = self.graph_gate_mode
         self.geo_adaptive_pos_topk = self.graph_adaptive_pos_topk
         self.geo_adaptive_neg_topk = self.graph_adaptive_neg_topk
+        self.geo_adaptive_pos_ratio = self.graph_adaptive_pos_ratio
+        self.geo_adaptive_neg_ratio = self.graph_adaptive_neg_ratio
         self.geo_adaptive_pos_min = self.graph_adaptive_pos_min
         self.geo_adaptive_neg_max = self.graph_adaptive_neg_max
         self.geo_use_multiview_semantics = self.graph_use_multiview_semantics

@@ -400,6 +400,20 @@ def _masked_topk_edge_mask(scores, candidate_mask, topk, largest=True):
     return edge_mask
 
 
+def _row_top_ratio_threshold(scores, ratio, largest=True):
+    if scores.numel() == 0:
+        return scores.new_empty((scores.shape[0], 1))
+
+    ratio = min(max(float(ratio), 0.0), 1.0)
+    if ratio <= 0.0:
+        fill_value = float("inf") if largest else float("-inf")
+        return scores.new_full((scores.shape[0], 1), fill_value)
+
+    effective_k = min(max(int(torch.ceil(scores.new_tensor(ratio * scores.shape[1])).item()), 1), scores.shape[1])
+    top_values = scores.detach().topk(effective_k, dim=1, largest=largest).values
+    return top_values[:, -1:].detach()
+
+
 def compute_graph_reliability(
     xyz,
     point_ids=None,
@@ -431,6 +445,8 @@ def compute_graph_reliability(
     gate_mode="fixed",
     adaptive_pos_topk=3,
     adaptive_neg_topk=2,
+    adaptive_pos_ratio=0.30,
+    adaptive_neg_ratio=0.25,
     adaptive_pos_min=0.45,
     adaptive_neg_max=0.55,
     pos_reliability_thresh=0.60,
@@ -616,6 +632,40 @@ def compute_graph_reliability(
         neg_candidate_mask = (
             spatial_close_mask
             * geometry_break_mask
+            * (reliability <= float(adaptive_neg_max)).to(pair_dtype)
+        )
+        positive_mask = _masked_topk_edge_mask(
+            reliability,
+            pos_candidate_mask,
+            adaptive_pos_topk,
+            largest=True,
+        )
+        negative_mask = _masked_topk_edge_mask(
+            reliability,
+            neg_candidate_mask,
+            adaptive_neg_topk,
+            largest=False,
+        )
+    elif gate_mode_value in ("adaptive_quantile", "quantile", "adaptive_ratio", "ratio"):
+        pos_row_thresh = _row_top_ratio_threshold(
+            reliability,
+            adaptive_pos_ratio,
+            largest=True,
+        )
+        neg_row_thresh = _row_top_ratio_threshold(
+            reliability,
+            adaptive_neg_ratio,
+            largest=False,
+        )
+        pos_candidate_mask = (
+            geometry_positive_support
+            * (reliability >= pos_row_thresh).to(pair_dtype)
+            * (reliability >= float(adaptive_pos_min)).to(pair_dtype)
+        )
+        neg_candidate_mask = (
+            spatial_close_mask
+            * geometry_break_mask
+            * (reliability <= neg_row_thresh).to(pair_dtype)
             * (reliability <= float(adaptive_neg_max)).to(pair_dtype)
         )
         positive_mask = _masked_topk_edge_mask(
