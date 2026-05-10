@@ -182,6 +182,14 @@ class OptimizationParams(ParamGroup):
         self.proto_push_assign_conf_thresh = -1.0
         self.proto_push_neg_boundary_weight = 0.0
         self.proto_push_ignore_boundary_weight = 0.3
+        self.use_proto_boundary_soft = False
+        self.proto_boundary_soft_strength = 1.0
+        self.proto_boundary_soft_update_weight = 0.3
+        self.proto_boundary_soft_score_thresh = 0.005
+        self.proto_boundary_soft_boundary_thresh = 0.2
+        self.proto_boundary_soft_entropy_thresh = 0.1
+        self.proto_boundary_soft_margin_thresh = 0.65
+        self.proto_boundary_soft_second_conf_thresh = 0.08
         self.use_proto_transport = False
         self.proto_lambda_transport = 0.0
         self.proto_transport_update = False

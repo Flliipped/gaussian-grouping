@@ -767,6 +767,17 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_transport_target_entropy": zero,
             "proto_transport_kl": zero,
             "proto_transport_update_blend": zero,
+            "proto_boundary_soft_active": zero,
+            "proto_boundary_soft_candidate_count": zero,
+            "proto_boundary_soft_candidate_ratio": zero,
+            "proto_boundary_soft_score_mean": zero,
+            "proto_boundary_soft_entropy_mean": zero,
+            "proto_boundary_soft_margin_mean": zero,
+            "proto_boundary_soft_boundary_exposure_mean": zero,
+            "proto_boundary_soft_top2_conf_mean": zero,
+            "proto_boundary_soft_pull_hard_mean": zero,
+            "proto_boundary_soft_pull_soft_mean": zero,
+            "proto_boundary_soft_update_weight_mean": zero,
             "proto_boundary_exposure_mean": zero,
             "proto_boundary_exposure_std": zero,
             "proto_boundary_exposure_p90": zero,
@@ -1172,6 +1183,65 @@ def _feature_side_prototype_push_loss(
     return push_loss, push_active_ratio.detach(), push_weight_mean.detach(), push_penalty_mean.detach()
 
 
+def _build_proto_boundary_soft_candidates(
+    unique_entropy,
+    unique_assign_margin,
+    unique_top2_conf,
+    boundary_exposure,
+    zero,
+    enabled=False,
+    score_thresh=0.005,
+    boundary_thresh=0.2,
+    entropy_thresh=0.1,
+    margin_thresh=0.65,
+    second_conf_thresh=0.08,
+):
+    with torch.no_grad():
+        diagnostics = {
+            "proto_boundary_soft_active": zero.new_tensor(float(bool(enabled))),
+            "proto_boundary_soft_candidate_count": zero,
+            "proto_boundary_soft_candidate_ratio": zero,
+            "proto_boundary_soft_score_mean": zero,
+            "proto_boundary_soft_entropy_mean": zero,
+            "proto_boundary_soft_margin_mean": zero,
+            "proto_boundary_soft_boundary_exposure_mean": zero,
+            "proto_boundary_soft_top2_conf_mean": zero,
+        }
+        entropy = unique_entropy.detach().reshape(-1).to(dtype=zero.dtype)
+        margin = unique_assign_margin.detach().reshape(-1).to(dtype=zero.dtype)
+        top2_conf = unique_top2_conf.detach().reshape(-1).to(dtype=zero.dtype)
+        exposure = boundary_exposure.detach().reshape(-1).to(dtype=zero.dtype)
+        candidate_mask = torch.zeros_like(entropy, dtype=torch.bool)
+        score = torch.zeros_like(entropy)
+        if not bool(enabled) or entropy.numel() == 0:
+            return candidate_mask, score, diagnostics
+
+        score = (
+            entropy
+            * (1.0 - margin).clamp_min(0.0)
+            * exposure
+            * top2_conf.clamp_min(0.0)
+        )
+        candidate_mask = (
+            (exposure >= float(boundary_thresh))
+            & (score >= float(score_thresh))
+            & (entropy >= float(entropy_thresh))
+            & (margin <= float(margin_thresh))
+            & (top2_conf >= float(second_conf_thresh))
+        )
+        candidate_count = candidate_mask.to(dtype=zero.dtype).sum()
+        diagnostics.update({
+            "proto_boundary_soft_candidate_count": candidate_count.detach(),
+            "proto_boundary_soft_candidate_ratio": (candidate_count / entropy.numel()).detach(),
+            "proto_boundary_soft_score_mean": _safe_masked_mean(score, candidate_mask, zero),
+            "proto_boundary_soft_entropy_mean": _safe_masked_mean(entropy, candidate_mask, zero),
+            "proto_boundary_soft_margin_mean": _safe_masked_mean(margin, candidate_mask, zero),
+            "proto_boundary_soft_boundary_exposure_mean": _safe_masked_mean(exposure, candidate_mask, zero),
+            "proto_boundary_soft_top2_conf_mean": _safe_masked_mean(top2_conf, candidate_mask, zero),
+        })
+        return candidate_mask.detach(), score.detach(), diagnostics
+
+
 def _sinkhorn_balanced_target(scores, num_iters=3, temperature=0.10, eps=1e-8):
     with torch.no_grad():
         num_points, num_prototypes = scores.shape
@@ -1547,6 +1617,14 @@ def loss_prototype_learning(
     push_assign_conf_thresh=-1.0,
     push_neg_boundary_weight=0.0,
     push_ignore_boundary_weight=0.3,
+    use_boundary_soft=False,
+    boundary_soft_strength=1.0,
+    boundary_soft_update_weight=1.0,
+    boundary_soft_score_thresh=0.005,
+    boundary_soft_boundary_thresh=0.2,
+    boundary_soft_entropy_thresh=0.1,
+    boundary_soft_margin_thresh=0.65,
+    boundary_soft_second_conf_thresh=0.08,
     use_transport=False,
     lambda_transport=0.0,
     transport_update=False,
@@ -1628,9 +1706,11 @@ def loss_prototype_learning(
     if topk.values.shape[-1] > 1:
         assign_margin = topk.values[:, 0] - topk.values[:, 1]
         top2_conf = topk.values[:, 1]
+        second_proto_idx = topk.indices[:, 1]
     else:
         assign_margin = topk.values[:, 0]
         top2_conf = torch.zeros_like(assign_conf)
+        second_proto_idx = topk.indices[:, 0]
     assigned_proto_idx = topk.indices[:, 0]
 
     unique_indices = graph_data["proto_unique_indices"]
@@ -1640,6 +1720,7 @@ def loss_prototype_learning(
     unique_assign_conf = assign_conf[unique_indices]
     unique_assign_margin = assign_margin[unique_indices]
     unique_top2_conf = top2_conf[unique_indices]
+    unique_second_proto_idx = second_proto_idx[unique_indices]
     unique_scale = None
     if gaussian_scales is not None:
         selected_scales = gaussian_scales[feature_indices]
@@ -1683,6 +1764,19 @@ def loss_prototype_learning(
         ignore_weight=boundary_exposure_ignore_weight,
         eps=eps,
     )
+    boundary_soft_mask, boundary_soft_score, boundary_soft_diagnostics = _build_proto_boundary_soft_candidates(
+        unique_entropy=unique_entropy,
+        unique_assign_margin=unique_assign_margin,
+        unique_top2_conf=unique_top2_conf,
+        boundary_exposure=boundary_exposure,
+        zero=zero,
+        enabled=use_boundary_soft,
+        score_thresh=boundary_soft_score_thresh,
+        boundary_thresh=boundary_soft_boundary_thresh,
+        entropy_thresh=boundary_soft_entropy_thresh,
+        margin_thresh=boundary_soft_margin_thresh,
+        second_conf_thresh=boundary_soft_second_conf_thresh,
+    )
 
     pull_confidence = (1.0 - unique_entropy) * point_reliability * pull_sem_gate * pull_mask
     confident_mask = (pull_confidence >= conf_thresh).to(unique_features.dtype)
@@ -1711,6 +1805,18 @@ def loss_prototype_learning(
                 update_boundary_weight.new_full(update_boundary_weight.shape, float(update_neg_boundary_weight)),
                 update_boundary_weight,
             )
+        if bool(use_boundary_soft) and float(boundary_soft_update_weight) < 1.0:
+            boundary_soft_weight = update_boundary_weight.new_ones(update_boundary_weight.shape)
+            boundary_soft_weight = torch.where(
+                boundary_soft_mask.detach().bool(),
+                boundary_soft_weight.new_full(
+                    boundary_soft_weight.shape,
+                    max(float(boundary_soft_update_weight), 0.0),
+                ),
+                boundary_soft_weight,
+            )
+            update_boundary_weight = update_boundary_weight * boundary_soft_weight
+        if boundary_safe_update or (bool(use_boundary_soft) and float(boundary_soft_update_weight) < 1.0):
             update_sample_weight = update_boundary_weight.detach()
         selected_update_mask = update_confident_mask.detach().bool()
         proto_update_boundary_weight_mean = _selected_weight_mean(
@@ -1728,6 +1834,12 @@ def loss_prototype_learning(
         proto_update_ignore_boundary_weight_mean = _selected_weight_mean(
             update_boundary_weight,
             selected_update_mask & ignore_boundary_mask,
+            zero,
+            eps=eps,
+        )
+        proto_boundary_soft_update_weight_mean = _selected_weight_mean(
+            update_boundary_weight,
+            selected_update_mask & boundary_soft_mask.detach().bool(),
             zero,
             eps=eps,
         )
@@ -1755,6 +1867,45 @@ def loss_prototype_learning(
     else:
         unique_assigned_proto = prototype_bank.prototypes[unique_proto_idx]
         pull_distance = 1.0 - (unique_features * unique_assigned_proto).sum(dim=-1).clamp(-1.0, 1.0)
+    if bool(use_boundary_soft):
+        boundary_soft_strength_value = min(max(float(boundary_soft_strength), 0.0), 1.0)
+        top2_sum = (unique_assign_conf + unique_top2_conf).clamp_min(eps)
+        top1_weight = (unique_assign_conf / top2_sum).detach()
+        top2_weight = (unique_top2_conf / top2_sum).detach()
+        top1_proto = prototype_bank.prototypes[unique_proto_idx]
+        top2_proto = prototype_bank.prototypes[unique_second_proto_idx]
+        top1_distance = 1.0 - (unique_features * top1_proto).sum(dim=-1).clamp(-1.0, 1.0)
+        top2_distance = 1.0 - (unique_features * top2_proto).sum(dim=-1).clamp(-1.0, 1.0)
+        boundary_soft_distance = top1_weight * top1_distance + top2_weight * top2_distance
+        blended_boundary_distance = (
+            (1.0 - boundary_soft_strength_value) * pull_distance
+            + boundary_soft_strength_value * boundary_soft_distance
+        )
+        boundary_soft_bool = boundary_soft_mask.detach().bool()
+        boundary_soft_diagnostics.update({
+            "proto_boundary_soft_pull_hard_mean": _safe_masked_mean(
+                pull_distance,
+                boundary_soft_bool,
+                zero,
+            ),
+            "proto_boundary_soft_pull_soft_mean": _safe_masked_mean(
+                boundary_soft_distance,
+                boundary_soft_bool,
+                zero,
+            ),
+            "proto_boundary_soft_update_weight_mean": proto_boundary_soft_update_weight_mean,
+        })
+        pull_distance = torch.where(
+            boundary_soft_bool,
+            blended_boundary_distance,
+            pull_distance,
+        )
+    else:
+        boundary_soft_diagnostics.update({
+            "proto_boundary_soft_pull_hard_mean": zero,
+            "proto_boundary_soft_pull_soft_mean": zero,
+            "proto_boundary_soft_update_weight_mean": zero,
+        })
     pull_loss = (pull_weight * pull_distance).sum() / (pull_weight.sum() + eps)
 
     prototype_cosine = torch.matmul(prototype_bank.prototypes, prototype_bank.prototypes.t())
@@ -2007,6 +2158,7 @@ def loss_prototype_learning(
         "active_proto_ratio": active_proto_ratio,
         "usage_max": usage.max(),
         **proto_diagnostics,
+        **boundary_soft_diagnostics,
         **transport_diagnostics,
         "proto_push_loss": push_loss,
         "proto_push_active_ratio": proto_push_active_ratio,

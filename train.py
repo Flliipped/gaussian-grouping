@@ -106,6 +106,17 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_transport_target_entropy",
         "proto_transport_kl",
         "proto_transport_update_blend",
+        "proto_boundary_soft_active",
+        "proto_boundary_soft_candidate_count",
+        "proto_boundary_soft_candidate_ratio",
+        "proto_boundary_soft_score_mean",
+        "proto_boundary_soft_entropy_mean",
+        "proto_boundary_soft_margin_mean",
+        "proto_boundary_soft_boundary_exposure_mean",
+        "proto_boundary_soft_top2_conf_mean",
+        "proto_boundary_soft_pull_hard_mean",
+        "proto_boundary_soft_pull_soft_mean",
+        "proto_boundary_soft_update_weight_mean",
         "proto_boundary_exposure_mean",
         "proto_boundary_exposure_std",
         "proto_boundary_exposure_p90",
@@ -492,6 +503,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 push_assign_conf_thresh=opt.proto_push_assign_conf_thresh,
                 push_neg_boundary_weight=opt.proto_push_neg_boundary_weight,
                 push_ignore_boundary_weight=opt.proto_push_ignore_boundary_weight,
+                use_boundary_soft=opt.use_proto_boundary_soft,
+                boundary_soft_strength=opt.proto_boundary_soft_strength,
+                boundary_soft_update_weight=opt.proto_boundary_soft_update_weight,
+                boundary_soft_score_thresh=opt.proto_boundary_soft_score_thresh,
+                boundary_soft_boundary_thresh=opt.proto_boundary_soft_boundary_thresh,
+                boundary_soft_entropy_thresh=opt.proto_boundary_soft_entropy_thresh,
+                boundary_soft_margin_thresh=opt.proto_boundary_soft_margin_thresh,
+                boundary_soft_second_conf_thresh=opt.proto_boundary_soft_second_conf_thresh,
                 use_transport=opt.use_proto_transport,
                 lambda_transport=opt.proto_lambda_transport,
                 transport_update=opt.proto_transport_update,
@@ -641,6 +660,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"transport_usage_entropy={_proto_diag_scalar(proto_diag, 'proto_transport_usage_entropy'):.6f}, "
                         + f"transport_usage_max={_proto_diag_scalar(proto_diag, 'proto_transport_usage_max'):.6f}, "
                         + f"transport_update_blend={_proto_diag_scalar(proto_diag, 'proto_transport_update_blend'):.6f}, "
+                        + f"boundary_soft_ratio={_proto_diag_scalar(proto_diag, 'proto_boundary_soft_candidate_ratio'):.6f}, "
+                        + f"boundary_soft_score={_proto_diag_scalar(proto_diag, 'proto_boundary_soft_score_mean'):.6f}, "
+                        + f"boundary_soft_pull_soft={_proto_diag_scalar(proto_diag, 'proto_boundary_soft_pull_soft_mean'):.6f}, "
                         + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
@@ -963,6 +985,14 @@ if __name__ == "__main__":
     args.proto_push_assign_conf_thresh = config.get("proto_push_assign_conf_thresh", args.proto_push_assign_conf_thresh)
     args.proto_push_neg_boundary_weight = config.get("proto_push_neg_boundary_weight", args.proto_push_neg_boundary_weight)
     args.proto_push_ignore_boundary_weight = config.get("proto_push_ignore_boundary_weight", args.proto_push_ignore_boundary_weight)
+    args.use_proto_boundary_soft = config.get("use_proto_boundary_soft", args.use_proto_boundary_soft)
+    args.proto_boundary_soft_strength = config.get("proto_boundary_soft_strength", args.proto_boundary_soft_strength)
+    args.proto_boundary_soft_update_weight = config.get("proto_boundary_soft_update_weight", args.proto_boundary_soft_update_weight)
+    args.proto_boundary_soft_score_thresh = config.get("proto_boundary_soft_score_thresh", args.proto_boundary_soft_score_thresh)
+    args.proto_boundary_soft_boundary_thresh = config.get("proto_boundary_soft_boundary_thresh", args.proto_boundary_soft_boundary_thresh)
+    args.proto_boundary_soft_entropy_thresh = config.get("proto_boundary_soft_entropy_thresh", args.proto_boundary_soft_entropy_thresh)
+    args.proto_boundary_soft_margin_thresh = config.get("proto_boundary_soft_margin_thresh", args.proto_boundary_soft_margin_thresh)
+    args.proto_boundary_soft_second_conf_thresh = config.get("proto_boundary_soft_second_conf_thresh", args.proto_boundary_soft_second_conf_thresh)
     args.use_proto_transport = config.get("use_proto_transport", args.use_proto_transport)
     args.proto_lambda_transport = config.get("proto_lambda_transport", args.proto_lambda_transport)
     args.proto_transport_update = config.get("proto_transport_update", args.proto_transport_update)
