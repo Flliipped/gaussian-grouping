@@ -195,6 +195,14 @@ class OptimizationParams(ParamGroup):
         self.proto_transport_capacity_uniform_mix = 0.25
         self.proto_transport_capacity_min = 0.03
         self.proto_transport_capacity_ema_blend = 0.5
+        self.use_proto_small_preserve = False
+        self.proto_lambda_small_preserve = 0.0
+        self.proto_small_scale_quantile = 0.35
+        self.proto_small_large_scale_ratio = 1.5
+        self.proto_small_conf_thresh = 0.45
+        self.proto_small_entropy_thresh = 0.65
+        self.proto_small_sep_margin = 0.35
+        self.proto_small_compact_weight = 0.20
         self.proto_boundary_exposure_ignore_weight = 0.3
         self.proto_ambiguity_thresh = 0.05
         self.proto_ambiguity_boundary_thresh = 0.2

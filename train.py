@@ -110,6 +110,16 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_transport_capacity_max",
         "proto_transport_capacity_min",
         "proto_transport_capacity_uniform_l1",
+        "proto_small_preserve_loss",
+        "proto_small_preserve_sep_loss",
+        "proto_small_preserve_compact_loss",
+        "proto_small_candidate_ratio",
+        "proto_small_sep_edge_ratio",
+        "proto_small_compact_edge_ratio",
+        "proto_small_scale_thresh",
+        "proto_small_scale_ratio_mean",
+        "proto_small_sep_cos_mean",
+        "proto_small_compact_cos_mean",
         "proto_boundary_exposure_mean",
         "proto_boundary_exposure_std",
         "proto_boundary_exposure_p90",
@@ -509,6 +519,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 transport_capacity_uniform_mix=opt.proto_transport_capacity_uniform_mix,
                 transport_capacity_min=opt.proto_transport_capacity_min,
                 transport_capacity_ema_blend=opt.proto_transport_capacity_ema_blend,
+                use_small_preserve=opt.use_proto_small_preserve,
+                lambda_small_preserve=opt.proto_lambda_small_preserve,
+                small_scale_quantile=opt.proto_small_scale_quantile,
+                small_large_scale_ratio=opt.proto_small_large_scale_ratio,
+                small_conf_thresh=opt.proto_small_conf_thresh,
+                small_entropy_thresh=opt.proto_small_entropy_thresh,
+                small_sep_margin=opt.proto_small_sep_margin,
+                small_compact_weight=opt.proto_small_compact_weight,
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
@@ -651,6 +669,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"transport_update_blend={_proto_diag_scalar(proto_diag, 'proto_transport_update_blend'):.6f}, "
                         + f"transport_capacity_l1={_proto_diag_scalar(proto_diag, 'proto_transport_capacity_uniform_l1'):.6f}, "
                         + f"transport_capacity_max={_proto_diag_scalar(proto_diag, 'proto_transport_capacity_max'):.6f}, "
+                        + f"small_preserve={_proto_diag_scalar(proto_diag, 'proto_small_preserve_loss'):.6f}, "
+                        + f"small_candidate={_proto_diag_scalar(proto_diag, 'proto_small_candidate_ratio'):.6f}, "
+                        + f"small_sep_edge={_proto_diag_scalar(proto_diag, 'proto_small_sep_edge_ratio'):.6f}, "
                         + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
@@ -986,6 +1007,14 @@ if __name__ == "__main__":
     args.proto_transport_capacity_uniform_mix = config.get("proto_transport_capacity_uniform_mix", args.proto_transport_capacity_uniform_mix)
     args.proto_transport_capacity_min = config.get("proto_transport_capacity_min", args.proto_transport_capacity_min)
     args.proto_transport_capacity_ema_blend = config.get("proto_transport_capacity_ema_blend", args.proto_transport_capacity_ema_blend)
+    args.use_proto_small_preserve = config.get("use_proto_small_preserve", args.use_proto_small_preserve)
+    args.proto_lambda_small_preserve = config.get("proto_lambda_small_preserve", args.proto_lambda_small_preserve)
+    args.proto_small_scale_quantile = config.get("proto_small_scale_quantile", args.proto_small_scale_quantile)
+    args.proto_small_large_scale_ratio = config.get("proto_small_large_scale_ratio", args.proto_small_large_scale_ratio)
+    args.proto_small_conf_thresh = config.get("proto_small_conf_thresh", args.proto_small_conf_thresh)
+    args.proto_small_entropy_thresh = config.get("proto_small_entropy_thresh", args.proto_small_entropy_thresh)
+    args.proto_small_sep_margin = config.get("proto_small_sep_margin", args.proto_small_sep_margin)
+    args.proto_small_compact_weight = config.get("proto_small_compact_weight", args.proto_small_compact_weight)
     args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
     args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
     args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)

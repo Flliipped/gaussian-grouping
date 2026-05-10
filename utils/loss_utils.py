@@ -771,6 +771,16 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_transport_capacity_max": zero,
             "proto_transport_capacity_min": zero,
             "proto_transport_capacity_uniform_l1": zero,
+            "proto_small_preserve_loss": zero,
+            "proto_small_preserve_sep_loss": zero,
+            "proto_small_preserve_compact_loss": zero,
+            "proto_small_candidate_ratio": zero,
+            "proto_small_sep_edge_ratio": zero,
+            "proto_small_compact_edge_ratio": zero,
+            "proto_small_scale_thresh": zero,
+            "proto_small_scale_ratio_mean": zero,
+            "proto_small_sep_cos_mean": zero,
+            "proto_small_compact_cos_mean": zero,
             "proto_boundary_exposure_mean": zero,
             "proto_boundary_exposure_std": zero,
             "proto_boundary_exposure_p90": zero,
@@ -1408,6 +1418,155 @@ def _prototype_transport_assignment_loss(
     return transport_loss, transport_probs.detach(), diagnostics
 
 
+def _small_object_preservation_loss(
+    selected_features,
+    selected_scale,
+    assignment_probs,
+    assigned_proto_idx,
+    assign_conf,
+    entropy,
+    graph_data,
+    use_small_preserve=False,
+    scale_quantile=0.35,
+    large_scale_ratio=1.5,
+    conf_thresh=0.45,
+    entropy_thresh=0.65,
+    sep_margin=0.35,
+    compact_weight=0.20,
+    zero=None,
+    eps=1e-8,
+):
+    if zero is None:
+        zero = selected_features.new_tensor(0.0)
+
+    diagnostics = {
+        "proto_small_preserve_loss": zero,
+        "proto_small_preserve_sep_loss": zero,
+        "proto_small_preserve_compact_loss": zero,
+        "proto_small_candidate_ratio": zero,
+        "proto_small_sep_edge_ratio": zero,
+        "proto_small_compact_edge_ratio": zero,
+        "proto_small_scale_thresh": zero,
+        "proto_small_scale_ratio_mean": zero,
+        "proto_small_sep_cos_mean": zero,
+        "proto_small_compact_cos_mean": zero,
+    }
+    if (
+        not bool(use_small_preserve)
+        or selected_scale is None
+        or graph_data is None
+        or not graph_data.get("valid", False)
+        or selected_features.numel() == 0
+    ):
+        return zero, diagnostics
+
+    scale = selected_scale.reshape(-1).to(device=selected_features.device, dtype=selected_features.dtype)
+    if scale.shape[0] != selected_features.shape[0]:
+        return zero, diagnostics
+
+    sample_indices = graph_data["sample_indices"].detach()
+    neighbor_indices = graph_data["neighbor_indices"].detach()
+    if sample_indices.numel() == 0 or neighbor_indices.numel() == 0:
+        return zero, diagnostics
+
+    normalized_features = F.normalize(selected_features, dim=-1, eps=eps)
+    sample_features = normalized_features[sample_indices]
+    neighbor_features = normalized_features[neighbor_indices]
+    cosine_sim = (sample_features.unsqueeze(1) * neighbor_features).sum(dim=-1).clamp(-1.0, 1.0)
+
+    with torch.no_grad():
+        finite_scale = torch.isfinite(scale) & (scale > 0)
+        valid_scale_values = scale[finite_scale]
+        if valid_scale_values.numel() == 0:
+            return zero, diagnostics
+
+        quantile_value = min(max(float(scale_quantile), 0.01), 0.95)
+        scale_thresh = torch.quantile(valid_scale_values, quantile_value)
+        scale_median = torch.quantile(valid_scale_values, 0.5).clamp_min(eps)
+
+        small_mask = (
+            finite_scale
+            & (scale <= scale_thresh)
+            & (assign_conf.detach().reshape(-1) >= float(conf_thresh))
+            & (entropy.detach().reshape(-1) <= float(entropy_thresh))
+        )
+
+        sample_small = small_mask[sample_indices]
+        neighbor_small = small_mask[neighbor_indices]
+        sample_scale = scale[sample_indices].clamp_min(eps)
+        neighbor_scale = scale[neighbor_indices].clamp_min(eps)
+        sample_large_for_neighbor = sample_scale.unsqueeze(-1) >= neighbor_scale * float(large_scale_ratio)
+        neighbor_large_for_sample = neighbor_scale >= sample_scale.unsqueeze(-1) * float(large_scale_ratio)
+
+        positive_mask = graph_data["positive_mask"].detach() > 0
+        negative_mask = graph_data["negative_mask"].detach() > 0
+        ignore_mask = graph_data["ignore_mask"].detach() > 0
+        boundary_like_mask = negative_mask | ignore_mask
+        spatial_weight = torch.exp(-graph_data["spatial_ratio"].detach().clamp_min(0.0))
+        reliability = graph_data["reliability"].detach().clamp(0.0, 1.0)
+
+        sep_mask = boundary_like_mask & (
+            (sample_small.unsqueeze(-1) & neighbor_large_for_sample)
+            | (neighbor_small & sample_large_for_neighbor)
+        )
+        sep_weight = (
+            sep_mask.to(dtype=selected_features.dtype)
+            * spatial_weight
+            * (1.0 - reliability).clamp_min(0.0)
+        )
+
+        sample_proto = assigned_proto_idx.detach()[sample_indices]
+        neighbor_proto = assigned_proto_idx.detach()[neighbor_indices]
+        same_proto = sample_proto.unsqueeze(-1) == neighbor_proto
+        sample_conf = assign_conf.detach()[sample_indices]
+        neighbor_conf = assign_conf.detach()[neighbor_indices]
+        confident_pair = (
+            (sample_conf.unsqueeze(-1) >= float(conf_thresh))
+            & (neighbor_conf >= float(conf_thresh))
+        )
+        compact_mask = (
+            positive_mask
+            & sample_small.unsqueeze(-1)
+            & neighbor_small
+            & same_proto
+            & confident_pair
+        )
+        compact_weight_tensor = (
+            compact_mask.to(dtype=selected_features.dtype)
+            * spatial_weight
+            * reliability
+        )
+
+    sep_penalty = torch.clamp(cosine_sim - float(sep_margin), min=0.0) ** 2
+    sep_loss = (sep_weight * sep_penalty).sum() / (sep_weight.sum() + eps)
+    compact_penalty = 1.0 - cosine_sim
+    compact_loss = (compact_weight_tensor * compact_penalty).sum() / (
+        compact_weight_tensor.sum() + eps
+    )
+    total_loss = sep_loss + max(float(compact_weight), 0.0) * compact_loss
+
+    with torch.no_grad():
+        candidate_ratio = small_mask.to(dtype=zero.dtype).mean()
+        candidate_scale = scale[small_mask]
+        if candidate_scale.numel() > 0:
+            scale_ratio_mean = (candidate_scale / scale_median).mean().to(dtype=zero.dtype).detach()
+        else:
+            scale_ratio_mean = zero
+        diagnostics.update({
+            "proto_small_preserve_loss": total_loss.detach(),
+            "proto_small_preserve_sep_loss": sep_loss.detach(),
+            "proto_small_preserve_compact_loss": compact_loss.detach(),
+            "proto_small_candidate_ratio": candidate_ratio.detach(),
+            "proto_small_sep_edge_ratio": sep_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_small_compact_edge_ratio": compact_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_small_scale_thresh": scale_thresh.to(dtype=zero.dtype).detach(),
+            "proto_small_scale_ratio_mean": scale_ratio_mean,
+            "proto_small_sep_cos_mean": _safe_masked_mean(cosine_sim, sep_mask, zero),
+            "proto_small_compact_cos_mean": _safe_masked_mean(cosine_sim, compact_mask, zero),
+        })
+    return total_loss, diagnostics
+
+
 def _prototype_diagnostics(
     prototype_bank,
     graph_data,
@@ -1675,6 +1834,14 @@ def loss_prototype_learning(
     transport_capacity_uniform_mix=0.25,
     transport_capacity_min=0.03,
     transport_capacity_ema_blend=0.5,
+    use_small_preserve=False,
+    lambda_small_preserve=0.0,
+    small_scale_quantile=0.35,
+    small_large_scale_ratio=1.5,
+    small_conf_thresh=0.45,
+    small_entropy_thresh=0.65,
+    small_sep_margin=0.35,
+    small_compact_weight=0.20,
     boundary_exposure_ignore_weight=0.3,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
@@ -1759,13 +1926,15 @@ def loss_prototype_learning(
     unique_assign_conf = assign_conf[unique_indices]
     unique_assign_margin = assign_margin[unique_indices]
     unique_top2_conf = top2_conf[unique_indices]
+    selected_scale = None
     unique_scale = None
     if gaussian_scales is not None:
         selected_scales = gaussian_scales[feature_indices]
         if selected_scales.ndim > 1:
-            unique_scale = selected_scales[unique_indices].mean(dim=-1)
+            selected_scale = selected_scales.mean(dim=-1)
         else:
-            unique_scale = selected_scales[unique_indices]
+            selected_scale = selected_scales
+        unique_scale = selected_scale[unique_indices]
     point_reliability = graph_data["point_reliability"].to(unique_features.dtype)
     point_sem_confidence = graph_data["point_sem_confidence"].to(unique_features.dtype)
     point_sem_valid = graph_data["point_sem_valid"]
@@ -2067,12 +2236,35 @@ def loss_prototype_learning(
         transport_update_blend_value if bool(transport_update) and bool(use_transport) else 0.0
     )
 
+    small_preserve_loss, small_preserve_diagnostics = _small_object_preservation_loss(
+        selected_features=selected_features,
+        selected_scale=selected_scale,
+        assignment_probs=assignment_probs,
+        assigned_proto_idx=assigned_proto_idx,
+        assign_conf=assign_conf,
+        entropy=entropy,
+        graph_data=graph_data,
+        use_small_preserve=(
+            bool(use_small_preserve)
+            and float(lambda_small_preserve) > 0.0
+        ),
+        scale_quantile=small_scale_quantile,
+        large_scale_ratio=small_large_scale_ratio,
+        conf_thresh=small_conf_thresh,
+        entropy_thresh=small_entropy_thresh,
+        sep_margin=small_sep_margin,
+        compact_weight=small_compact_weight,
+        zero=zero,
+        eps=eps,
+    )
+
     total_loss = (
         lambda_pull * pull_loss
         + lambda_sep * sep_loss
         + lambda_cons * cons_scene_scale * cons_loss
         + lambda_push * push_loss
         + lambda_transport * transport_loss
+        + lambda_small_preserve * small_preserve_loss
     )
     usage = torch.bincount(
         unique_proto_idx,
@@ -2131,6 +2323,7 @@ def loss_prototype_learning(
         "usage_max": usage.max(),
         **proto_diagnostics,
         **transport_diagnostics,
+        **small_preserve_diagnostics,
         "proto_push_loss": push_loss,
         "proto_push_active_ratio": proto_push_active_ratio,
         "proto_push_weight_mean": proto_push_weight_mean,
