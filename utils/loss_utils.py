@@ -494,8 +494,10 @@ def compute_graph_reliability(
     semantic_pos_factor = torch.ones_like(spatial_ratio)
     semantic_neg_factor = torch.ones_like(spatial_ratio)
     sem_pair_valid = torch.zeros_like(spatial_ratio, dtype=torch.bool)
+    point_sem_label = torch.full((unique_point_ids.shape[0],), -1, device=xyz.device, dtype=torch.long)
     point_sem_confidence = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=pair_dtype)
     point_sem_valid = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=torch.bool)
+    point_valid_view_count = torch.zeros((unique_point_ids.shape[0],), device=xyz.device, dtype=pair_dtype)
 
     if support_cameras is not None and len(support_cameras) > 0:
         unique_global_point_ids = unique_point_ids if point_ids is None else point_ids[unique_point_ids]
@@ -601,8 +603,11 @@ def compute_graph_reliability(
         "avg_sem_valid_views": avg_sem_valid_views,
         "avg_sem_confidence": avg_sem_confidence,
         "point_reliability": point_reliability,
+        "point_sem_label": point_sem_label,
         "point_sem_confidence": point_sem_confidence,
         "point_sem_valid": point_sem_valid,
+        "point_valid_view_count": point_valid_view_count,
+        "sem_num_classes": int(sem_num_classes) if sem_num_classes is not None else 0,
         "sem_valid_point_ratio": sem_valid_point_ratio,
         "sem_pair_valid_ratio": sem_pair_valid_ratio,
         "sem_high_conf_same_ratio": sem_high_conf_same_ratio,
@@ -781,6 +786,18 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_small_scale_ratio_mean": zero,
             "proto_small_sep_cos_mean": zero,
             "proto_small_compact_cos_mean": zero,
+            "proto_evidence_loss": zero,
+            "proto_evidence_active_ratio": zero,
+            "proto_evidence_anchor_ratio": zero,
+            "proto_evidence_query_ratio": zero,
+            "proto_evidence_target_conf_mean": zero,
+            "proto_evidence_target_entropy": zero,
+            "proto_evidence_mv_conf_mean": zero,
+            "proto_evidence_valid_views_mean": zero,
+            "proto_evidence_table_purity": zero,
+            "proto_evidence_table_active_proto_ratio": zero,
+            "proto_evidence_update_blend": zero,
+            "proto_evidence_update_ratio": zero,
             "proto_boundary_exposure_mean": zero,
             "proto_boundary_exposure_std": zero,
             "proto_boundary_exposure_p90": zero,
@@ -1567,6 +1584,194 @@ def _small_object_preservation_loss(
     return total_loss, diagnostics
 
 
+def _prototype_evidence_anchor_loss(
+    unique_probs,
+    unique_proto_idx,
+    unique_entropy,
+    unique_assign_conf,
+    point_reliability,
+    boundary_exposure,
+    graph_data,
+    use_evidence_anchor=False,
+    min_views=2,
+    mv_conf_thresh=0.55,
+    reliability_thresh=0.50,
+    entropy_thresh=0.55,
+    assign_conf_thresh=0.55,
+    boundary_thresh=0.75,
+    target_temp=0.25,
+    target_conf_thresh=0.30,
+    max_points=2048,
+    zero=None,
+    eps=1e-8,
+):
+    if zero is None:
+        zero = unique_probs.new_tensor(0.0)
+
+    diagnostics = {
+        "proto_evidence_loss": zero,
+        "proto_evidence_active_ratio": zero,
+        "proto_evidence_anchor_ratio": zero,
+        "proto_evidence_query_ratio": zero,
+        "proto_evidence_target_conf_mean": zero,
+        "proto_evidence_target_entropy": zero,
+        "proto_evidence_mv_conf_mean": zero,
+        "proto_evidence_valid_views_mean": zero,
+        "proto_evidence_table_purity": zero,
+        "proto_evidence_table_active_proto_ratio": zero,
+        "proto_evidence_update_ratio": zero,
+    }
+    evidence_probs = unique_probs.detach()
+    evidence_update_mask = unique_probs.new_zeros((unique_probs.shape[0],), dtype=torch.bool)
+    if (
+        not bool(use_evidence_anchor)
+        or graph_data is None
+        or unique_probs.numel() == 0
+        or "point_sem_label" not in graph_data
+    ):
+        return zero, evidence_probs, evidence_update_mask, diagnostics
+
+    labels = graph_data["point_sem_label"].detach().reshape(-1).to(device=unique_probs.device)
+    sem_valid = graph_data["point_sem_valid"].detach().reshape(-1).to(device=unique_probs.device).bool()
+    mv_conf = graph_data["point_sem_confidence"].detach().reshape(-1).to(
+        device=unique_probs.device,
+        dtype=unique_probs.dtype,
+    )
+    valid_views = graph_data["point_valid_view_count"].detach().reshape(-1).to(
+        device=unique_probs.device,
+        dtype=unique_probs.dtype,
+    )
+    if labels.shape[0] != unique_probs.shape[0]:
+        return zero, evidence_probs, evidence_update_mask, diagnostics
+
+    with torch.no_grad():
+        labels = labels.long()
+        valid_label = labels >= 0
+        num_labels = int(graph_data.get("sem_num_classes", 0) or 0)
+        if valid_label.any():
+            num_labels = max(num_labels, int(labels[valid_label].max().item()) + 1)
+        num_labels = max(num_labels, 1)
+        clamped_labels = labels.clamp(min=0, max=num_labels - 1)
+
+        common_mask = (
+            sem_valid
+            & valid_label
+            & (valid_views >= float(min_views))
+            & (mv_conf >= float(mv_conf_thresh))
+            & (point_reliability.detach().reshape(-1) >= float(reliability_thresh))
+            & (unique_entropy.detach().reshape(-1) <= float(entropy_thresh))
+            & (unique_assign_conf.detach().reshape(-1) >= float(assign_conf_thresh))
+        )
+        if boundary_exposure is not None:
+            common_mask = common_mask & (
+                boundary_exposure.detach().reshape(-1) <= float(boundary_thresh)
+            )
+        anchor_mask = common_mask
+        anchor_count = int(anchor_mask.sum().item())
+        diagnostics["proto_evidence_anchor_ratio"] = anchor_mask.to(dtype=zero.dtype).mean().detach()
+        if anchor_count == 0:
+            return zero, evidence_probs, evidence_update_mask, diagnostics
+
+        anchor_weight = (
+            point_reliability.detach().reshape(-1).clamp_min(0.0)
+            * (1.0 - unique_entropy.detach().reshape(-1)).clamp_min(0.0)
+            * unique_assign_conf.detach().reshape(-1).clamp_min(0.0)
+            * mv_conf.clamp_min(0.0)
+            * anchor_mask.to(dtype=unique_probs.dtype)
+        )
+
+        if int(max_points) > 0 and anchor_count > int(max_points):
+            _, top_indices = torch.topk(anchor_weight, k=int(max_points), largest=True)
+            limited_mask = torch.zeros_like(anchor_mask)
+            limited_mask[top_indices] = True
+            anchor_mask = anchor_mask & limited_mask
+            anchor_weight = anchor_weight * anchor_mask.to(dtype=unique_probs.dtype)
+
+        num_prototypes = unique_probs.shape[-1]
+        proto_label_mass = unique_probs.detach().new_zeros((num_prototypes, num_labels))
+        anchor_labels = clamped_labels[anchor_mask]
+        weighted_proto = unique_probs.detach()[anchor_mask] * anchor_weight[anchor_mask].unsqueeze(-1)
+        proto_label_mass.scatter_add_(
+            1,
+            anchor_labels.unsqueeze(0).expand(num_prototypes, -1),
+            weighted_proto.t(),
+        )
+
+        proto_mass = proto_label_mass.sum(dim=1)
+        active_proto_mask = proto_mass > eps
+        label_mass = proto_label_mass.sum(dim=0)
+        active_label_mask = label_mass > eps
+        if not active_proto_mask.any() or not active_label_mask.any():
+            return zero, evidence_probs, evidence_update_mask, diagnostics
+
+        proto_label_prob = proto_label_mass / proto_mass.unsqueeze(-1).clamp_min(eps)
+        proto_label_purity = proto_label_prob.max(dim=1).values
+        diagnostics["proto_evidence_table_purity"] = _safe_masked_mean(
+            proto_label_purity,
+            active_proto_mask,
+            zero,
+        )
+        diagnostics["proto_evidence_table_active_proto_ratio"] = active_proto_mask.to(dtype=zero.dtype).mean().detach()
+
+        label_to_proto = proto_label_mass.t()
+        label_to_proto = label_to_proto / label_to_proto.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        query_mask = common_mask & active_label_mask[clamped_labels]
+        query_count = int(query_mask.sum().item())
+        diagnostics["proto_evidence_query_ratio"] = query_mask.to(dtype=zero.dtype).mean().detach()
+        if query_count == 0:
+            return zero, evidence_probs, evidence_update_mask, diagnostics
+
+        label_targets = label_to_proto[clamped_labels[query_mask]]
+        temp = max(float(target_temp), eps)
+        if abs(temp - 1.0) > eps:
+            label_targets = torch.softmax(torch.log(label_targets.clamp_min(eps)) / temp, dim=-1)
+        target_conf = label_targets.max(dim=-1).values
+        target_entropy = -(
+            label_targets * torch.log(label_targets.clamp_min(eps))
+        ).sum(dim=-1)
+        target_entropy = target_entropy / max(log(max(label_targets.shape[-1], 2)), eps)
+
+        target_keep = target_conf >= float(target_conf_thresh)
+        if not target_keep.any():
+            return zero, evidence_probs, evidence_update_mask, diagnostics
+
+        query_indices = query_mask.nonzero(as_tuple=False).squeeze(-1)[target_keep]
+        kept_targets = label_targets[target_keep]
+        evidence_probs = unique_probs.detach().clone()
+        evidence_probs[query_indices] = kept_targets
+        evidence_update_mask = torch.zeros_like(query_mask)
+        evidence_update_mask[query_indices] = True
+
+        diagnostics.update({
+            "proto_evidence_active_ratio": evidence_update_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_evidence_target_conf_mean": target_conf[target_keep].mean().to(dtype=zero.dtype).detach(),
+            "proto_evidence_target_entropy": target_entropy[target_keep].mean().to(dtype=zero.dtype).detach(),
+            "proto_evidence_mv_conf_mean": mv_conf[query_indices].mean().to(dtype=zero.dtype).detach(),
+            "proto_evidence_valid_views_mean": valid_views[query_indices].mean().to(dtype=zero.dtype).detach(),
+            "proto_evidence_update_ratio": evidence_update_mask.to(dtype=zero.dtype).mean().detach(),
+        })
+
+        evidence_weight = (
+            mv_conf[query_indices].clamp_min(0.0)
+            * point_reliability.detach().reshape(-1)[query_indices].clamp_min(0.0)
+            * target_conf[target_keep].clamp_min(0.0)
+            * (1.0 - unique_entropy.detach().reshape(-1)[query_indices]).clamp_min(0.0)
+        )
+
+    selected_probs = unique_probs[query_indices]
+    kl_per_point = (
+        kept_targets
+        * (
+            torch.log(kept_targets.clamp_min(eps))
+            - torch.log(selected_probs.clamp_min(eps))
+        )
+    ).sum(dim=-1)
+    evidence_loss = (evidence_weight * kl_per_point).sum() / (evidence_weight.sum() + eps)
+    diagnostics["proto_evidence_loss"] = evidence_loss.detach()
+    return evidence_loss, evidence_probs.detach(), evidence_update_mask.detach(), diagnostics
+
+
 def _prototype_diagnostics(
     prototype_bank,
     graph_data,
@@ -1842,6 +2047,18 @@ def loss_prototype_learning(
     small_entropy_thresh=0.65,
     small_sep_margin=0.35,
     small_compact_weight=0.20,
+    use_evidence_anchor=False,
+    lambda_evidence=0.0,
+    evidence_update_blend=0.0,
+    evidence_min_views=2,
+    evidence_mv_conf_thresh=0.55,
+    evidence_reliability_thresh=0.50,
+    evidence_entropy_thresh=0.55,
+    evidence_assign_conf_thresh=0.55,
+    evidence_boundary_thresh=0.75,
+    evidence_target_temp=0.25,
+    evidence_target_conf_thresh=0.30,
+    evidence_max_points=2048,
     boundary_exposure_ignore_weight=0.3,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
@@ -2236,6 +2453,55 @@ def loss_prototype_learning(
         transport_update_blend_value if bool(transport_update) and bool(use_transport) else 0.0
     )
 
+    evidence_loss, evidence_probs, evidence_update_mask, evidence_diagnostics = _prototype_evidence_anchor_loss(
+        unique_probs=unique_probs,
+        unique_proto_idx=unique_proto_idx,
+        unique_entropy=unique_entropy,
+        unique_assign_conf=unique_assign_conf,
+        point_reliability=point_reliability,
+        boundary_exposure=boundary_exposure,
+        graph_data=graph_data,
+        use_evidence_anchor=(
+            bool(use_evidence_anchor)
+            and float(lambda_evidence) > 0.0
+        ),
+        min_views=evidence_min_views,
+        mv_conf_thresh=evidence_mv_conf_thresh,
+        reliability_thresh=evidence_reliability_thresh,
+        entropy_thresh=evidence_entropy_thresh,
+        assign_conf_thresh=evidence_assign_conf_thresh,
+        boundary_thresh=evidence_boundary_thresh,
+        target_temp=evidence_target_temp,
+        target_conf_thresh=evidence_target_conf_thresh,
+        max_points=evidence_max_points,
+        zero=zero,
+        eps=eps,
+    )
+    evidence_update_blend_value = min(max(float(evidence_update_blend), 0.0), 1.0)
+    if (
+        bool(use_evidence_anchor)
+        and evidence_update_blend_value > 0.0
+        and evidence_probs is not None
+        and evidence_update_mask is not None
+        and evidence_update_mask.any()
+    ):
+        blended_evidence_probs = (
+            (1.0 - evidence_update_blend_value) * update_probs_for_ema.detach()
+            + evidence_update_blend_value * evidence_probs.detach()
+        )
+        blended_evidence_probs = blended_evidence_probs / blended_evidence_probs.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(eps)
+        update_probs_for_ema = torch.where(
+            evidence_update_mask.detach().unsqueeze(-1),
+            blended_evidence_probs,
+            update_probs_for_ema,
+        )
+    evidence_diagnostics["proto_evidence_update_blend"] = zero.new_tensor(
+        evidence_update_blend_value if bool(use_evidence_anchor) else 0.0
+    )
+
     small_preserve_loss, small_preserve_diagnostics = _small_object_preservation_loss(
         selected_features=selected_features,
         selected_scale=selected_scale,
@@ -2265,6 +2531,7 @@ def loss_prototype_learning(
         + lambda_push * push_loss
         + lambda_transport * transport_loss
         + lambda_small_preserve * small_preserve_loss
+        + lambda_evidence * evidence_loss
     )
     usage = torch.bincount(
         unique_proto_idx,
@@ -2324,6 +2591,7 @@ def loss_prototype_learning(
         **proto_diagnostics,
         **transport_diagnostics,
         **small_preserve_diagnostics,
+        **evidence_diagnostics,
         "proto_push_loss": push_loss,
         "proto_push_active_ratio": proto_push_active_ratio,
         "proto_push_weight_mean": proto_push_weight_mean,

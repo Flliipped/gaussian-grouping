@@ -120,6 +120,18 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_small_scale_ratio_mean",
         "proto_small_sep_cos_mean",
         "proto_small_compact_cos_mean",
+        "proto_evidence_loss",
+        "proto_evidence_active_ratio",
+        "proto_evidence_anchor_ratio",
+        "proto_evidence_query_ratio",
+        "proto_evidence_target_conf_mean",
+        "proto_evidence_target_entropy",
+        "proto_evidence_mv_conf_mean",
+        "proto_evidence_valid_views_mean",
+        "proto_evidence_table_purity",
+        "proto_evidence_table_active_proto_ratio",
+        "proto_evidence_update_blend",
+        "proto_evidence_update_ratio",
         "proto_boundary_exposure_mean",
         "proto_boundary_exposure_std",
         "proto_boundary_exposure_p90",
@@ -527,6 +539,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 small_entropy_thresh=opt.proto_small_entropy_thresh,
                 small_sep_margin=opt.proto_small_sep_margin,
                 small_compact_weight=opt.proto_small_compact_weight,
+                use_evidence_anchor=(
+                    opt.use_proto_evidence_anchor
+                    and iteration >= opt.proto_evidence_start_iter
+                    and iteration % opt.proto_evidence_interval == 0
+                ),
+                lambda_evidence=opt.proto_lambda_evidence,
+                evidence_update_blend=opt.proto_evidence_update_blend,
+                evidence_min_views=opt.proto_evidence_min_views,
+                evidence_mv_conf_thresh=opt.proto_evidence_mv_conf_thresh,
+                evidence_reliability_thresh=opt.proto_evidence_reliability_thresh,
+                evidence_entropy_thresh=opt.proto_evidence_entropy_thresh,
+                evidence_assign_conf_thresh=opt.proto_evidence_assign_conf_thresh,
+                evidence_boundary_thresh=opt.proto_evidence_boundary_thresh,
+                evidence_target_temp=opt.proto_evidence_target_temp,
+                evidence_target_conf_thresh=opt.proto_evidence_target_conf_thresh,
+                evidence_max_points=opt.proto_evidence_max_points,
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
@@ -672,6 +700,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"small_preserve={_proto_diag_scalar(proto_diag, 'proto_small_preserve_loss'):.6f}, "
                         + f"small_candidate={_proto_diag_scalar(proto_diag, 'proto_small_candidate_ratio'):.6f}, "
                         + f"small_sep_edge={_proto_diag_scalar(proto_diag, 'proto_small_sep_edge_ratio'):.6f}, "
+                        + f"evidence={_proto_diag_scalar(proto_diag, 'proto_evidence_loss'):.6f}, "
+                        + f"evidence_active={_proto_diag_scalar(proto_diag, 'proto_evidence_active_ratio'):.6f}, "
+                        + f"evidence_purity={_proto_diag_scalar(proto_diag, 'proto_evidence_table_purity'):.6f}, "
                         + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
@@ -1015,6 +1046,20 @@ if __name__ == "__main__":
     args.proto_small_entropy_thresh = config.get("proto_small_entropy_thresh", args.proto_small_entropy_thresh)
     args.proto_small_sep_margin = config.get("proto_small_sep_margin", args.proto_small_sep_margin)
     args.proto_small_compact_weight = config.get("proto_small_compact_weight", args.proto_small_compact_weight)
+    args.use_proto_evidence_anchor = config.get("use_proto_evidence_anchor", args.use_proto_evidence_anchor)
+    args.proto_lambda_evidence = config.get("proto_lambda_evidence", args.proto_lambda_evidence)
+    args.proto_evidence_start_iter = config.get("proto_evidence_start_iter", args.proto_evidence_start_iter)
+    args.proto_evidence_interval = config.get("proto_evidence_interval", args.proto_evidence_interval)
+    args.proto_evidence_update_blend = config.get("proto_evidence_update_blend", args.proto_evidence_update_blend)
+    args.proto_evidence_min_views = config.get("proto_evidence_min_views", args.proto_evidence_min_views)
+    args.proto_evidence_mv_conf_thresh = config.get("proto_evidence_mv_conf_thresh", args.proto_evidence_mv_conf_thresh)
+    args.proto_evidence_reliability_thresh = config.get("proto_evidence_reliability_thresh", args.proto_evidence_reliability_thresh)
+    args.proto_evidence_entropy_thresh = config.get("proto_evidence_entropy_thresh", args.proto_evidence_entropy_thresh)
+    args.proto_evidence_assign_conf_thresh = config.get("proto_evidence_assign_conf_thresh", args.proto_evidence_assign_conf_thresh)
+    args.proto_evidence_boundary_thresh = config.get("proto_evidence_boundary_thresh", args.proto_evidence_boundary_thresh)
+    args.proto_evidence_target_temp = config.get("proto_evidence_target_temp", args.proto_evidence_target_temp)
+    args.proto_evidence_target_conf_thresh = config.get("proto_evidence_target_conf_thresh", args.proto_evidence_target_conf_thresh)
+    args.proto_evidence_max_points = config.get("proto_evidence_max_points", args.proto_evidence_max_points)
     args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
     args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
     args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)
