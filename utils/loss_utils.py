@@ -517,7 +517,6 @@ def compute_graph_reliability(
                 min_views=sem_min_views,
                 conf_tau=sem_conf_tau,
             )
-
             neighbor_local_flat = neighbor_local.reshape(-1)
             sample_labels = point_sem_label[sample_local]
             sample_valid = point_sem_valid[sample_local]
@@ -798,6 +797,9 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_evidence_table_active_proto_ratio": zero,
             "proto_evidence_update_blend": zero,
             "proto_evidence_update_ratio": zero,
+            "proto_evidence_boundary_weight_mean": zero,
+            "proto_evidence_boundary_exposure_mean": zero,
+            "proto_evidence_high_boundary_ratio": zero,
             "proto_boundary_exposure_mean": zero,
             "proto_boundary_exposure_std": zero,
             "proto_boundary_exposure_p90": zero,
@@ -1602,6 +1604,10 @@ def _prototype_evidence_anchor_loss(
     target_temp=0.25,
     target_conf_thresh=0.30,
     max_points=2048,
+    boundary_guard=False,
+    boundary_weight_min=0.35,
+    boundary_weight_gamma=1.0,
+    boundary_high_thresh=0.50,
     zero=None,
     eps=1e-8,
 ):
@@ -1620,6 +1626,9 @@ def _prototype_evidence_anchor_loss(
         "proto_evidence_table_purity": zero,
         "proto_evidence_table_active_proto_ratio": zero,
         "proto_evidence_update_ratio": zero,
+        "proto_evidence_boundary_weight_mean": zero,
+        "proto_evidence_boundary_exposure_mean": zero,
+        "proto_evidence_high_boundary_ratio": zero,
     }
     evidence_probs = unique_probs.detach()
     evidence_update_mask = unique_probs.new_zeros((unique_probs.shape[0],), dtype=torch.bool)
@@ -1689,8 +1698,8 @@ def _prototype_evidence_anchor_loss(
 
         num_prototypes = unique_probs.shape[-1]
         proto_label_mass = unique_probs.detach().new_zeros((num_prototypes, num_labels))
-        anchor_labels = clamped_labels[anchor_mask]
         weighted_proto = unique_probs.detach()[anchor_mask] * anchor_weight[anchor_mask].unsqueeze(-1)
+        anchor_labels = clamped_labels[anchor_mask]
         proto_label_mass.scatter_add_(
             1,
             anchor_labels.unsqueeze(0).expand(num_prototypes, -1),
@@ -1738,8 +1747,26 @@ def _prototype_evidence_anchor_loss(
 
         query_indices = query_mask.nonzero(as_tuple=False).squeeze(-1)[target_keep]
         kept_targets = label_targets[target_keep]
+        boundary_weight = torch.ones_like(target_conf[target_keep])
+        query_boundary_exposure = None
+        if boundary_exposure is not None:
+            query_boundary_exposure = boundary_exposure.detach().reshape(-1)[query_indices].to(
+                device=unique_probs.device,
+                dtype=unique_probs.dtype,
+            ).clamp(0.0, 1.0)
+            if bool(boundary_guard):
+                min_weight = min(max(float(boundary_weight_min), 0.0), 1.0)
+                gamma = max(float(boundary_weight_gamma), 0.0)
+                boundary_weight = min_weight + (1.0 - min_weight) * (
+                    1.0 - query_boundary_exposure
+                ).clamp_min(0.0).pow(gamma)
         evidence_probs = unique_probs.detach().clone()
-        evidence_probs[query_indices] = kept_targets
+        guarded_targets = (
+            boundary_weight.unsqueeze(-1) * kept_targets
+            + (1.0 - boundary_weight).unsqueeze(-1) * unique_probs.detach()[query_indices]
+        )
+        guarded_targets = guarded_targets / guarded_targets.sum(dim=-1, keepdim=True).clamp_min(eps)
+        evidence_probs[query_indices] = guarded_targets
         evidence_update_mask = torch.zeros_like(query_mask)
         evidence_update_mask[query_indices] = True
 
@@ -1750,13 +1777,22 @@ def _prototype_evidence_anchor_loss(
             "proto_evidence_mv_conf_mean": mv_conf[query_indices].mean().to(dtype=zero.dtype).detach(),
             "proto_evidence_valid_views_mean": valid_views[query_indices].mean().to(dtype=zero.dtype).detach(),
             "proto_evidence_update_ratio": evidence_update_mask.to(dtype=zero.dtype).mean().detach(),
+            "proto_evidence_boundary_weight_mean": boundary_weight.mean().to(dtype=zero.dtype).detach(),
         })
+        if query_boundary_exposure is not None:
+            diagnostics.update({
+                "proto_evidence_boundary_exposure_mean": query_boundary_exposure.mean().to(dtype=zero.dtype).detach(),
+                "proto_evidence_high_boundary_ratio": (
+                    query_boundary_exposure >= float(boundary_high_thresh)
+                ).to(dtype=zero.dtype).mean().detach(),
+            })
 
         evidence_weight = (
             mv_conf[query_indices].clamp_min(0.0)
             * point_reliability.detach().reshape(-1)[query_indices].clamp_min(0.0)
             * target_conf[target_keep].clamp_min(0.0)
             * (1.0 - unique_entropy.detach().reshape(-1)[query_indices]).clamp_min(0.0)
+            * boundary_weight.clamp_min(0.0)
         )
 
     selected_probs = unique_probs[query_indices]
@@ -2059,6 +2095,10 @@ def loss_prototype_learning(
     evidence_target_temp=0.25,
     evidence_target_conf_thresh=0.30,
     evidence_max_points=2048,
+    evidence_boundary_guard=False,
+    evidence_boundary_weight_min=0.35,
+    evidence_boundary_weight_gamma=1.0,
+    evidence_boundary_high_thresh=0.50,
     boundary_exposure_ignore_weight=0.3,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
@@ -2474,6 +2514,10 @@ def loss_prototype_learning(
         target_temp=evidence_target_temp,
         target_conf_thresh=evidence_target_conf_thresh,
         max_points=evidence_max_points,
+        boundary_guard=evidence_boundary_guard,
+        boundary_weight_min=evidence_boundary_weight_min,
+        boundary_weight_gamma=evidence_boundary_weight_gamma,
+        boundary_high_thresh=evidence_boundary_high_thresh,
         zero=zero,
         eps=eps,
     )

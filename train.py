@@ -132,6 +132,9 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_evidence_table_active_proto_ratio",
         "proto_evidence_update_blend",
         "proto_evidence_update_ratio",
+        "proto_evidence_boundary_weight_mean",
+        "proto_evidence_boundary_exposure_mean",
+        "proto_evidence_high_boundary_ratio",
         "proto_boundary_exposure_mean",
         "proto_boundary_exposure_std",
         "proto_boundary_exposure_p90",
@@ -555,6 +558,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 evidence_target_temp=opt.proto_evidence_target_temp,
                 evidence_target_conf_thresh=opt.proto_evidence_target_conf_thresh,
                 evidence_max_points=opt.proto_evidence_max_points,
+                evidence_boundary_guard=opt.proto_evidence_boundary_guard,
+                evidence_boundary_weight_min=opt.proto_evidence_boundary_weight_min,
+                evidence_boundary_weight_gamma=opt.proto_evidence_boundary_weight_gamma,
+                evidence_boundary_high_thresh=opt.proto_evidence_boundary_high_thresh,
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
@@ -703,6 +710,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"evidence={_proto_diag_scalar(proto_diag, 'proto_evidence_loss'):.6f}, "
                         + f"evidence_active={_proto_diag_scalar(proto_diag, 'proto_evidence_active_ratio'):.6f}, "
                         + f"evidence_purity={_proto_diag_scalar(proto_diag, 'proto_evidence_table_purity'):.6f}, "
+                        + f"evidence_boundary_w={_proto_diag_scalar(proto_diag, 'proto_evidence_boundary_weight_mean'):.6f}, "
                         + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
@@ -1060,6 +1068,10 @@ if __name__ == "__main__":
     args.proto_evidence_target_temp = config.get("proto_evidence_target_temp", args.proto_evidence_target_temp)
     args.proto_evidence_target_conf_thresh = config.get("proto_evidence_target_conf_thresh", args.proto_evidence_target_conf_thresh)
     args.proto_evidence_max_points = config.get("proto_evidence_max_points", args.proto_evidence_max_points)
+    args.proto_evidence_boundary_guard = config.get("proto_evidence_boundary_guard", args.proto_evidence_boundary_guard)
+    args.proto_evidence_boundary_weight_min = config.get("proto_evidence_boundary_weight_min", args.proto_evidence_boundary_weight_min)
+    args.proto_evidence_boundary_weight_gamma = config.get("proto_evidence_boundary_weight_gamma", args.proto_evidence_boundary_weight_gamma)
+    args.proto_evidence_boundary_high_thresh = config.get("proto_evidence_boundary_high_thresh", args.proto_evidence_boundary_high_thresh)
     args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
     args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
     args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)
