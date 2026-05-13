@@ -135,6 +135,12 @@ def _add_proto_diag_wandb_logs(log_data, proto_diag, iteration):
         "proto_evidence_boundary_weight_mean",
         "proto_evidence_boundary_exposure_mean",
         "proto_evidence_high_boundary_ratio",
+        "proto_evidence_memory_purity",
+        "proto_evidence_memory_active_proto_ratio",
+        "proto_evidence_memory_active_label_count",
+        "proto_evidence_memory_blend",
+        "proto_evidence_memory_update",
+        "proto_evidence_memory_target_agreement",
         "proto_boundary_exposure_mean",
         "proto_boundary_exposure_std",
         "proto_boundary_exposure_p90",
@@ -562,6 +568,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 evidence_boundary_weight_min=opt.proto_evidence_boundary_weight_min,
                 evidence_boundary_weight_gamma=opt.proto_evidence_boundary_weight_gamma,
                 evidence_boundary_high_thresh=opt.proto_evidence_boundary_high_thresh,
+                evidence_use_memory=opt.proto_evidence_use_memory,
+                evidence_memory_momentum=opt.proto_evidence_memory_momentum,
+                evidence_memory_blend=opt.proto_evidence_memory_blend,
+                evidence_memory_min_purity=opt.proto_evidence_memory_min_purity,
+                evidence_memory_min_active_proto_ratio=opt.proto_evidence_memory_min_active_proto_ratio,
                 boundary_exposure_ignore_weight=opt.proto_boundary_exposure_ignore_weight,
                 ambiguity_thresh=opt.proto_ambiguity_thresh,
                 ambiguity_boundary_thresh=opt.proto_ambiguity_boundary_thresh,
@@ -711,6 +722,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         + f"evidence_active={_proto_diag_scalar(proto_diag, 'proto_evidence_active_ratio'):.6f}, "
                         + f"evidence_purity={_proto_diag_scalar(proto_diag, 'proto_evidence_table_purity'):.6f}, "
                         + f"evidence_boundary_w={_proto_diag_scalar(proto_diag, 'proto_evidence_boundary_weight_mean'):.6f}, "
+                        + f"evidence_mem_purity={_proto_diag_scalar(proto_diag, 'proto_evidence_memory_purity'):.6f}, "
+                        + f"evidence_mem_blend={_proto_diag_scalar(proto_diag, 'proto_evidence_memory_blend'):.6f}, "
                         + f"update_boundary_weight_mean={_proto_diag_scalar(proto_diag, 'proto_update_boundary_weight_mean'):.6f}, "
                         + f"assign_conf_p50={_proto_diag_scalar(proto_diag, 'proto_assign_conf_p50'):.6f}, "
                         + f"margin_p50={_proto_diag_scalar(proto_diag, 'proto_margin_p50'):.6f}, "
@@ -1072,6 +1085,11 @@ if __name__ == "__main__":
     args.proto_evidence_boundary_weight_min = config.get("proto_evidence_boundary_weight_min", args.proto_evidence_boundary_weight_min)
     args.proto_evidence_boundary_weight_gamma = config.get("proto_evidence_boundary_weight_gamma", args.proto_evidence_boundary_weight_gamma)
     args.proto_evidence_boundary_high_thresh = config.get("proto_evidence_boundary_high_thresh", args.proto_evidence_boundary_high_thresh)
+    args.proto_evidence_use_memory = config.get("proto_evidence_use_memory", args.proto_evidence_use_memory)
+    args.proto_evidence_memory_momentum = config.get("proto_evidence_memory_momentum", args.proto_evidence_memory_momentum)
+    args.proto_evidence_memory_blend = config.get("proto_evidence_memory_blend", args.proto_evidence_memory_blend)
+    args.proto_evidence_memory_min_purity = config.get("proto_evidence_memory_min_purity", args.proto_evidence_memory_min_purity)
+    args.proto_evidence_memory_min_active_proto_ratio = config.get("proto_evidence_memory_min_active_proto_ratio", args.proto_evidence_memory_min_active_proto_ratio)
     args.proto_boundary_exposure_ignore_weight = config.get("proto_boundary_exposure_ignore_weight", args.proto_boundary_exposure_ignore_weight)
     args.proto_ambiguity_thresh = config.get("proto_ambiguity_thresh", args.proto_ambiguity_thresh)
     args.proto_ambiguity_boundary_thresh = config.get("proto_ambiguity_boundary_thresh", args.proto_ambiguity_boundary_thresh)
