@@ -32,8 +32,6 @@ class ScenePrototypeBank(nn.Module):
         self.register_buffer("prototypes", prototypes)
         self.register_buffer("usage_ema", usage)
         self.register_buffer("initialized", torch.tensor(False, device=device))
-        self.register_buffer("evidence_label_memory", torch.zeros((self.num_prototypes, 0), dtype=torch.float32, device=device))
-        self.register_buffer("evidence_memory_initialized", torch.tensor(False, device=device))
 
     def _normalize(self, x):
         return F.normalize(x, dim=-1, eps=self.eps)
@@ -159,40 +157,3 @@ class ScenePrototypeBank(nn.Module):
         else:
             usage_target = hard_probs.mean(dim=0)
         self.usage_ema.mul_(self.momentum).add_((1.0 - self.momentum) * usage_target)
-
-    @torch.no_grad()
-    def get_evidence_memory(self, num_labels):
-        num_labels = int(max(num_labels, 0))
-        if num_labels <= 0:
-            return None
-        if self.evidence_label_memory.shape != (self.num_prototypes, num_labels):
-            memory = self.prototypes.new_zeros((self.num_prototypes, num_labels))
-            if self.evidence_label_memory.numel() > 0:
-                copy_labels = min(num_labels, self.evidence_label_memory.shape[1])
-                memory[:, :copy_labels] = self.evidence_label_memory[:, :copy_labels]
-            self.evidence_label_memory = memory
-            self.evidence_memory_initialized.fill_(False)
-        return self.evidence_label_memory
-
-    @torch.no_grad()
-    def update_evidence_memory(self, proto_label_mass, momentum=0.95):
-        if proto_label_mass.numel() == 0:
-            return
-        proto_label_mass = proto_label_mass.detach().to(
-            device=self.prototypes.device,
-            dtype=self.prototypes.dtype,
-        )
-        if proto_label_mass.shape[0] != self.num_prototypes:
-            return
-        memory = self.get_evidence_memory(proto_label_mass.shape[1])
-        if memory is None:
-            return
-        mass = proto_label_mass.clamp_min(0.0)
-        if mass.sum() <= self.eps:
-            return
-        if not bool(self.evidence_memory_initialized.item()):
-            memory.copy_(mass)
-            self.evidence_memory_initialized.fill_(True)
-            return
-        momentum = min(max(float(momentum), 0.0), 1.0)
-        memory.mul_(momentum).add_((1.0 - momentum) * mass)

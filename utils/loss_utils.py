@@ -800,12 +800,6 @@ def _prototype_zero_diagnostics(zero, num_prototypes=0):
             "proto_evidence_boundary_weight_mean": zero,
             "proto_evidence_boundary_exposure_mean": zero,
             "proto_evidence_high_boundary_ratio": zero,
-            "proto_evidence_memory_purity": zero,
-            "proto_evidence_memory_active_proto_ratio": zero,
-            "proto_evidence_memory_active_label_count": zero,
-            "proto_evidence_memory_blend": zero,
-            "proto_evidence_memory_update": zero,
-            "proto_evidence_memory_target_agreement": zero,
             "proto_boundary_exposure_mean": zero,
             "proto_boundary_exposure_std": zero,
             "proto_boundary_exposure_p90": zero,
@@ -1593,7 +1587,6 @@ def _small_object_preservation_loss(
 
 
 def _prototype_evidence_anchor_loss(
-    prototype_bank,
     unique_probs,
     unique_proto_idx,
     unique_entropy,
@@ -1615,11 +1608,6 @@ def _prototype_evidence_anchor_loss(
     boundary_weight_min=0.35,
     boundary_weight_gamma=1.0,
     boundary_high_thresh=0.50,
-    use_memory=False,
-    memory_momentum=0.95,
-    memory_blend=0.35,
-    memory_min_purity=0.65,
-    memory_min_active_proto_ratio=0.25,
     zero=None,
     eps=1e-8,
 ):
@@ -1641,12 +1629,6 @@ def _prototype_evidence_anchor_loss(
         "proto_evidence_boundary_weight_mean": zero,
         "proto_evidence_boundary_exposure_mean": zero,
         "proto_evidence_high_boundary_ratio": zero,
-        "proto_evidence_memory_purity": zero,
-        "proto_evidence_memory_active_proto_ratio": zero,
-        "proto_evidence_memory_active_label_count": zero,
-        "proto_evidence_memory_blend": zero,
-        "proto_evidence_memory_update": zero,
-        "proto_evidence_memory_target_agreement": zero,
     }
     evidence_probs = unique_probs.detach()
     evidence_update_mask = unique_probs.new_zeros((unique_probs.shape[0],), dtype=torch.bool)
@@ -1733,85 +1715,17 @@ def _prototype_evidence_anchor_loss(
 
         proto_label_prob = proto_label_mass / proto_mass.unsqueeze(-1).clamp_min(eps)
         proto_label_purity = proto_label_prob.max(dim=1).values
-        batch_purity = _safe_masked_mean(
-            proto_label_purity,
-            active_proto_mask,
-            zero,
-        )
-        batch_active_proto_ratio = active_proto_mask.to(dtype=zero.dtype).mean().detach()
         diagnostics["proto_evidence_table_purity"] = _safe_masked_mean(
             proto_label_purity,
             active_proto_mask,
             zero,
         )
-        diagnostics["proto_evidence_table_active_proto_ratio"] = batch_active_proto_ratio
+        diagnostics["proto_evidence_table_active_proto_ratio"] = active_proto_mask.to(dtype=zero.dtype).mean().detach()
 
-        target_proto_label_mass = proto_label_mass
-        memory_used = False
-        if bool(use_memory) and prototype_bank is not None and hasattr(prototype_bank, "get_evidence_memory"):
-            memory = prototype_bank.get_evidence_memory(num_labels)
-            if memory is not None and bool(getattr(prototype_bank, "evidence_memory_initialized").item()):
-                memory = memory.detach().to(device=unique_probs.device, dtype=unique_probs.dtype).clamp_min(0.0)
-                memory_proto_mass = memory.sum(dim=1)
-                memory_active_proto_mask = memory_proto_mass > eps
-                memory_label_mass = memory.sum(dim=0)
-                memory_active_label_mask = memory_label_mass > eps
-                if memory_active_proto_mask.any() and memory_active_label_mask.any():
-                    memory_proto_label_prob = memory / memory_proto_mass.unsqueeze(-1).clamp_min(eps)
-                    memory_proto_purity = memory_proto_label_prob.max(dim=1).values
-                    memory_purity = _safe_masked_mean(memory_proto_purity, memory_active_proto_mask, zero)
-                    memory_active_proto_ratio = memory_active_proto_mask.to(dtype=zero.dtype).mean().detach()
-                    memory_active_label_count = memory_active_label_mask.to(dtype=zero.dtype).sum().detach()
-                    diagnostics.update({
-                        "proto_evidence_memory_purity": memory_purity,
-                        "proto_evidence_memory_active_proto_ratio": memory_active_proto_ratio,
-                        "proto_evidence_memory_active_label_count": memory_active_label_count,
-                    })
-                    if (
-                        float(memory_purity.detach().item()) >= float(memory_min_purity)
-                        and float(memory_active_proto_ratio.detach().item()) >= float(memory_min_active_proto_ratio)
-                    ):
-                        blend = min(max(float(memory_blend), 0.0), 1.0)
-                        target_proto_label_mass = (1.0 - blend) * proto_label_mass + blend * memory
-                        memory_used = blend > 0.0
-                        diagnostics["proto_evidence_memory_blend"] = zero.new_tensor(blend)
-                        current_label_to_proto = proto_label_mass.t()
-                        current_label_to_proto = current_label_to_proto / current_label_to_proto.sum(
-                            dim=-1,
-                            keepdim=True,
-                        ).clamp_min(eps)
-                        memory_label_to_proto = memory.t()
-                        memory_label_to_proto = memory_label_to_proto / memory_label_to_proto.sum(
-                            dim=-1,
-                            keepdim=True,
-                        ).clamp_min(eps)
-                        shared_label_mask = active_label_mask & memory_active_label_mask
-                        if shared_label_mask.any():
-                            agreement = (
-                                current_label_to_proto[shared_label_mask]
-                                * memory_label_to_proto[shared_label_mask]
-                            ).sum(dim=-1).mean()
-                            diagnostics["proto_evidence_memory_target_agreement"] = agreement.to(dtype=zero.dtype).detach()
-
-            should_update_memory = (
-                float(batch_purity.detach().item()) >= float(memory_min_purity)
-                and float(batch_active_proto_ratio.detach().item()) >= float(memory_min_active_proto_ratio)
-            )
-            if should_update_memory and hasattr(prototype_bank, "update_evidence_memory"):
-                prototype_bank.update_evidence_memory(proto_label_mass, momentum=memory_momentum)
-                diagnostics["proto_evidence_memory_update"] = zero.new_tensor(1.0)
-
-        target_proto_mass = target_proto_label_mass.sum(dim=1)
-        target_active_proto_mask = target_proto_mass > eps
-        target_label_mass = target_proto_label_mass.sum(dim=0)
-        target_active_label_mask = target_label_mass > eps
-        if not target_active_proto_mask.any() or not target_active_label_mask.any():
-            return zero, evidence_probs, evidence_update_mask, diagnostics
-
-        label_to_proto = target_proto_label_mass.t()
+        label_to_proto = proto_label_mass.t()
         label_to_proto = label_to_proto / label_to_proto.sum(dim=-1, keepdim=True).clamp_min(eps)
 
-        query_mask = common_mask & target_active_label_mask[clamped_labels]
+        query_mask = common_mask & active_label_mask[clamped_labels]
         query_count = int(query_mask.sum().item())
         diagnostics["proto_evidence_query_ratio"] = query_mask.to(dtype=zero.dtype).mean().detach()
         if query_count == 0:
@@ -2185,11 +2099,6 @@ def loss_prototype_learning(
     evidence_boundary_weight_min=0.35,
     evidence_boundary_weight_gamma=1.0,
     evidence_boundary_high_thresh=0.50,
-    evidence_use_memory=False,
-    evidence_memory_momentum=0.95,
-    evidence_memory_blend=0.35,
-    evidence_memory_min_purity=0.65,
-    evidence_memory_min_active_proto_ratio=0.25,
     boundary_exposure_ignore_weight=0.3,
     ambiguity_thresh=0.05,
     ambiguity_boundary_thresh=0.2,
@@ -2585,7 +2494,6 @@ def loss_prototype_learning(
     )
 
     evidence_loss, evidence_probs, evidence_update_mask, evidence_diagnostics = _prototype_evidence_anchor_loss(
-        prototype_bank=prototype_bank,
         unique_probs=unique_probs,
         unique_proto_idx=unique_proto_idx,
         unique_entropy=unique_entropy,
@@ -2610,11 +2518,6 @@ def loss_prototype_learning(
         boundary_weight_min=evidence_boundary_weight_min,
         boundary_weight_gamma=evidence_boundary_weight_gamma,
         boundary_high_thresh=evidence_boundary_high_thresh,
-        use_memory=evidence_use_memory,
-        memory_momentum=evidence_memory_momentum,
-        memory_blend=evidence_memory_blend,
-        memory_min_purity=evidence_memory_min_purity,
-        memory_min_active_proto_ratio=evidence_memory_min_active_proto_ratio,
         zero=zero,
         eps=eps,
     )

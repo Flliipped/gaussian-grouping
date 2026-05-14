@@ -221,11 +221,6 @@ class OptimizationParams(ParamGroup):
         self.proto_evidence_boundary_weight_min = 0.35
         self.proto_evidence_boundary_weight_gamma = 1.0
         self.proto_evidence_boundary_high_thresh = 0.50
-        self.proto_evidence_use_memory = False
-        self.proto_evidence_memory_momentum = 0.95
-        self.proto_evidence_memory_blend = 0.35
-        self.proto_evidence_memory_min_purity = 0.65
-        self.proto_evidence_memory_min_active_proto_ratio = 0.25
         self.proto_boundary_exposure_ignore_weight = 0.3
         self.proto_ambiguity_thresh = 0.05
         self.proto_ambiguity_boundary_thresh = 0.2
